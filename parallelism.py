@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import math
 import os
+import torch.nn.functional as F
 
 def setup(rank, world_size):
     os.environ['MASTER_ADDR'] = 'localhost'
@@ -59,9 +60,64 @@ def collective_operations(rank, world_size):
 
     cleanup()
 
+def generate_sample_data():
+    batch_size = 128
+    num_dim = 1024
+    data = torch.randn(batch_size, num_dim)
+    return data
+
+def get_init_params(num_inputs: int, num_outputs: int, rank: int) -> nn.Parameter:
+    torch.random.manual_seed(0)  # For reproducibility
+    return nn.Parameter(torch.randn(num_inputs, num_outputs) / math.sqrt(num_outputs))
+
+def data_parallelism_main(rank: int, world_size: int, data: torch.Tensor, num_layers: int, num_steps: int):
+    setup(rank, world_size)
+
+    # get the data
+    data = generate_sample_data()
+    # get a slice of the data
+    batch_size = data.shape[0]
+    num_dim = data.shape[1]
+    local_batch_size = batch_size // world_size
+    local_data = data[rank * local_batch_size:(rank + 1) * local_batch_size]
+
+    # get the params
+    params = [get_init_params(num_dim, num_dim, rank) for _ in range(num_layers)]
+    optimizer = torch.optim.AdamW(params, lr=0.001)
+
+    for step in range(num_steps):
+        # forward pass
+        x = local_data
+        for layer in range(num_layers):
+            x = x @ params[layer]
+            x = F.relu(x)
+
+        loss = x.square().sum()
+
+        # backward pass
+        loss.backward()
+
+        # all-reduce all the gradients
+        for param in params:
+            dist.all_reduce(param.grad, op=dist.ReduceOp.AVG, async_op=False)
+
+        # update the params
+        optimizer.step()
+
+        dist.barrier()
+        print(f"[Step {step}] Rank {rank} has params {params[0][0][:3]}")
+        dist.barrier()
+        if rank == 0:
+            print("--------------------------------")
+        dist.barrier()
+
 def main():
     world_size = 4
-    mp.spawn(collective_operations, args=(world_size,), nprocs=world_size, join=True)
+    #mp.spawn(collective_operations, args=(world_size,), nprocs=world_size, join=True)
+    data = generate_sample_data()
+    num_layers = 2
+    num_steps = 10
+    mp.spawn(data_parallelism_main, args=(world_size, data, num_layers, num_steps), nprocs=world_size, join=True)
 
 if __name__ == "__main__":
     main()
