@@ -111,6 +111,40 @@ def data_parallelism_main(rank: int, world_size: int, data: torch.Tensor, num_la
             print("--------------------------------")
         dist.barrier()
 
+def tensor_parallelism_main(rank: int, world_size: int, data: torch.Tensor, num_layers: int, num_steps: int):
+    setup(rank, world_size)
+
+    # all the ranks have the same data
+    data = generate_sample_data()
+    batch_size = data.shape[0]
+    num_dim = data.shape[1]
+    
+    # lets do column-wise sharding
+    local_num_dim = num_dim // world_size
+    params = [get_init_params(local_num_dim, local_num_dim, rank) for _ in range(num_layers)]
+    
+    # lets only do one step for now
+    x = data
+
+    # forward pass
+    for layer in range(num_layers):
+        x = x @ params[layer]
+        x = F.relu(x)
+
+        # lets gather all the activations from all the ranks
+        activations = [torch.empty(batch_size, local_num_dim) for _ in range(world_size)]
+
+        # all-gather the activations
+        dist.all_gather(tensor_list=activations, tensor=x, async_op=False)
+
+        # concatenate the activations
+        x = torch.cat(activations, dim=1)
+
+    loss = x.square().sum()
+
+    # backward pass
+    
+
 def main():
     world_size = 4
     #mp.spawn(collective_operations, args=(world_size,), nprocs=world_size, join=True)
