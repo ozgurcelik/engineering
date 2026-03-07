@@ -114,44 +114,147 @@ def data_parallelism_main(rank: int, world_size: int, data: torch.Tensor, num_la
 def tensor_parallelism_main(rank: int, world_size: int, data: torch.Tensor, num_layers: int, num_steps: int):
     setup(rank, world_size)
 
-    # all the ranks have the same data
+    # All ranks have the same full data (unlike data parallelism, where data is sharded).
+    # In tensor parallelism, we shard the *model weights* instead.
     data = generate_sample_data()
     batch_size = data.shape[0]
     num_dim = data.shape[1]
-    
-    # lets do column-wise sharding
+
+    # Column-wise sharding: the full weight matrix for each layer is [num_dim, num_dim].
+    # We split it by columns across ranks, so each rank holds [num_dim, local_num_dim].
+    #
+    #   Full A [num_dim, num_dim] = [ A_rank0 | A_rank1 | A_rank2 | A_rank3 ]
+    #                                [num_dim, local] each
+    #
+    # Each rank stores a DIFFERENT column shard, so params will diverge across ranks.
+    # (Compare to data parallelism, where every rank has the same full weight matrix.)
     local_num_dim = num_dim // world_size
-    params = [get_init_params(local_num_dim, local_num_dim, rank) for _ in range(num_layers)]
-    
-    # lets only do one step for now
-    x = data
+    params = [get_init_params(num_dim, local_num_dim, rank) for _ in range(num_layers)]
+    optimizer = torch.optim.AdamW(params, lr=0.001)
 
-    # forward pass
-    for layer in range(num_layers):
-        x = x @ params[layer]
-        x = F.relu(x)
+    for step in range(num_steps):
+        optimizer.zero_grad()
 
-        # lets gather all the activations from all the ranks
-        activations = [torch.empty(batch_size, local_num_dim) for _ in range(world_size)]
+        # Forward pass
+        # We store layer_inputs[i] = the input to layer i (shape [batch, num_dim]).
+        # These are needed during the backward pass to reconstruct the computation graph.
+        # This is the same memory cost as standard autograd (which also stores activations
+        # internally). It could be reduced via activation checkpointing (recompute instead
+        # of store), but we skip that optimization here for clarity.
+        layer_inputs = []
 
-        # all-gather the activations
-        dist.all_gather(tensor_list=activations, tensor=x, async_op=False)
+        x = data
+        for layer in range(num_layers):
+            # Save the input to this layer for the backward pass.
+            layer_inputs.append(x.detach())
 
-        # concatenate the activations
-        x = torch.cat(activations, dim=1)
+            # Each rank computes its local output: x @ A_rank
+            #   x:            [batch, num_dim]      (same on all ranks)
+            #   params[layer]: [num_dim, local_num_dim]  (different on each rank)
+            #   result:        [batch, local_num_dim]    (different on each rank)
+            x = x @ params[layer]
+            x = F.relu(x)
 
-    loss = x.square().sum()
+            # All-gather: collect local outputs from every rank and concatenate them
+            # so that each rank has the full [batch, num_dim] tensor for the next layer.
+            #
+            # Forward communication pattern:
+            #   rank 0: [batch, local_dim] ──┐
+            #   rank 1: [batch, local_dim] ──┼──→ all_gather ──→ [batch, num_dim] (on every rank)
+            #   rank 2: [batch, local_dim] ──┤
+            #   rank 3: [batch, local_dim] ──┘
+            activations = [torch.empty(batch_size, local_num_dim) for _ in range(world_size)]
+            dist.all_gather(tensor_list=activations, tensor=x.detach(), async_op=False)
+            x = torch.cat(activations, dim=1)  # [batch, num_dim]
 
-    # backward pass
-    
+        loss = x.square().sum()
+
+        # Backward pass
+        #
+        # We iterate from the last layer to the first. At each step we hold `grad`:
+        # the gradient of the loss w.r.t. the gathered output of this layer [batch, num_dim].
+        #
+        # For each layer, we:
+        #   1. Reconstruct the local forward (inp -> matmul -> relu -> x)
+        #   2. Build a scalar `subloss` whose .backward() produces the correct gradients
+        #   3. Call subloss.backward() to get params[layer].grad and inp.grad via autograd
+        #   4. All-reduce inp.grad (partial -> full input gradient)
+        grad = None
+
+        for layer in range(num_layers - 1, -1, -1):
+
+            # Create an isolated computation graph for just this layer.
+            # detach() severs connection to any previous graph.
+            # requires_grad_(True) tells autograd we want dL/d(inp).
+            inp = layer_inputs[layer].detach().requires_grad_(True)
+            inp.retain_grad()
+
+            # Reconstruct the local forward pass for this layer.
+            # This builds a small autograd graph: inp -> matmul -> relu -> x
+            x = inp @ params[layer]  # [batch, num_dim] @ [num_dim, local_dim] -> [batch, local_dim]
+            x = F.relu(x)
+
+            if layer == num_layers - 1:
+                # Last layer: use the actual loss function.
+                # This works because loss = x_gathered.square().sum() decomposes over ranks:
+                #   loss = rank0_output.square().sum() + rank1_output.square().sum() + ...
+                # Each rank's output occupies a non-overlapping slice of the gathered tensor,
+                # so x.square().sum() on this rank gives the correct local gradients.
+                subloss = x.square().sum()
+            else:
+                # Intermediate layers: use the linear approximation trick.
+                #
+                # `grad` is dL/d(gathered output of this layer), shape [batch, num_dim].
+                # We slice it to get the gradient for this rank's local output (reverse of all_gather):
+                #   grad = [ grad_rank0 | grad_rank1 | grad_rank2 | grad_rank3 ]
+                #   grad_local = grad[:, rank*local_dim:(rank+1)*local_dim]
+                #
+                # Then subloss = (x * grad_local).sum() is a scalar whose gradient w.r.t.
+                # any variable v is: d/dv[sum(x * g)] = sum(g * dx/dv), which is exactly
+                # the chain rule: upstream gradient g dotted with the local Jacobian dx/dv.
+                # So subloss.backward() produces the same gradients as x.backward(gradient=grad_local).
+                grad_local = grad[:, rank * local_num_dim:(rank + 1) * local_num_dim]
+                subloss = (x * grad_local).sum()
+
+            # Autograd computes gradients through the local graph (relu and matmul).
+            # After this call:
+            #   - params[layer].grad is set: dL/d(A_rank) = inp^T @ grad_through_relu
+            #     This is the COMPLETE gradient for this rank's weight shard. No communication
+            #     needed because inp is the same on all ranks and grad_through_relu is local.
+            #     (A_rank only affects this rank's local output, so dL/dA_rank has one term.)
+            #
+            #   - inp.grad is set: dL/d(inp) = grad_through_relu @ A_rank^T
+            #     This is a PARTIAL gradient. The full gradient is a sum over all ranks:
+            #       dL/dX = grad_0 @ A_0^T + grad_1 @ A_1^T + ... + grad_3 @ A_3^T
+            #     Each rank computed one dense [batch, num_dim] term. We need all-reduce(SUM)
+            #     to get the total. (inp feeds into all ranks' matmuls, so dL/d(inp) has
+            #     one term per rank.)
+            subloss.backward()
+
+            # All-reduce: sum partial input gradients across ranks.
+            # After this, `grad` holds the full dL/d(layer input), which is also
+            # dL/d(previous layer's gathered output) -- used in the next iteration.
+            grad = inp.grad.clone()
+            dist.all_reduce(grad, op=dist.ReduceOp.SUM, async_op=False)
+
+        optimizer.step()
+
+        dist.barrier()
+        print(f"[Step {step}] Rank {rank} has params {params[0][0][:3]}")
+        dist.barrier()
+        if rank == 0:
+            print("--------------------------------")
+        dist.barrier()
+
+    cleanup()
 
 def main():
     world_size = 4
     #mp.spawn(collective_operations, args=(world_size,), nprocs=world_size, join=True)
     data = generate_sample_data()
     num_layers = 2
-    num_steps = 10
-    mp.spawn(data_parallelism_main, args=(world_size, data, num_layers, num_steps), nprocs=world_size, join=True)
+    num_steps = 2
+    mp.spawn(tensor_parallelism_main, args=(world_size, data, num_layers, num_steps), nprocs=world_size, join=True)
 
 if __name__ == "__main__":
     main()
