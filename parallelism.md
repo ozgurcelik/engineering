@@ -134,3 +134,73 @@ Y &= F + G = X A_0 + X A_1 \\
 $$
 
 Since the $A_0$ and $A_1$ are on the different ranks, we can do an all-reduce to calculate their sum.
+
+## Implementation details (column-wise sharding)
+
+### Communication pattern summary
+
+| Direction | Operation | Purpose |
+|-----------|-----------|---------|
+| Forward   | all-gather | Collect local outputs $[n, k/R]$ from each rank into full $[n, k]$ for the next layer |
+| Backward  | slice (local) | Reverse of all-gather: each rank takes its $[n, k/R]$ portion of the upstream gradient |
+| Backward  | all-reduce (sum) | Sum partial input gradients across ranks to get full $\frac{\partial l}{\partial X}$ |
+
+### Why param gradients are local (no communication)
+
+Each rank's weight shard $A_r$ only affects its own local output $Y_r = X A_r$. No other rank's computation depends on $A_r$. Therefore:
+
+$$
+\frac{\partial l}{\partial A_r} = X^T \cdot g_r
+$$
+
+where $g_r$ is the gradient flowing through rank $r$'s relu and matmul. Both $X$ (the layer input, same on all ranks after all-gather) and $g_r$ (local to this rank) are already available. No communication needed.
+
+### Why input gradients need all-reduce
+
+The layer input $X$ feeds into every rank's matmul. Each rank computes a partial gradient:
+
+$$
+\left(\frac{\partial l}{\partial X}\right)_r = g_r \cdot A_r^T \quad [n, m]
+$$
+
+This is a **dense** $[n, m]$ matrix (not sparse). The full gradient is the sum of all ranks' contributions:
+
+$$
+\frac{\partial l}{\partial X} = \sum_{r=0}^{R-1} g_r \cdot A_r^T
+$$
+
+Since each $A_r$ lives on a different rank, we all-reduce (sum) to compute the total.
+
+> **Contrast with row-wise sharding:** In row-wise sharding, each rank's partial input gradient fills a different, non-overlapping slice of columns (zeros elsewhere). The terms don't overlap, so the sum becomes a concatenation, and we use **all-gather** instead of all-reduce.
+
+### The subloss trick (per-layer backward with autograd)
+
+We cannot call `loss.backward()` end-to-end because `all_gather` breaks the autograd graph. Instead, we reconstruct the local computation for each layer and use autograd on that small graph.
+
+For each layer going backward, we have `grad`: the gradient of the loss w.r.t. the gathered output of this layer, shape $[n, k]$.
+
+**Last layer:** The loss $l = \| Y_{\text{gathered}} \|^2$ decomposes over ranks because each rank's output occupies a non-overlapping slice:
+
+$$
+l = \sum_{r} \| Y_r \|^2
+$$
+
+So `subloss = x.square().sum()` on each rank produces the correct local gradients.
+
+**Intermediate layers:** We use a linear approximation. Given the upstream gradient $g$ for this rank's local output:
+
+$$
+\text{subloss} = \sum_{ij} x_{ij} \cdot g_{ij}
+$$
+
+Differentiating w.r.t. any variable $v$:
+
+$$
+\frac{\partial \text{subloss}}{\partial v} = \sum_{ij} g_{ij} \cdot \frac{\partial x_{ij}}{\partial v}
+$$
+
+This is exactly the chain rule: $g$ acts as the upstream gradient flowing into $x$. So `subloss.backward()` produces the same result as `x.backward(gradient=g)`, letting autograd handle relu, matmul, or any other differentiable operation without manual gradient formulas.
+
+### Memory cost of storing activations
+
+The forward pass stores `layer_inputs[i]` (shape $[n, k]$) for each layer. This is the same memory cost as standard autograd, which also retains intermediate activations internally. It could be reduced with **activation checkpointing**: store only every $N$-th layer's input and recompute the rest during backward by replaying the forward from the nearest checkpoint. This trades compute for memory, but we skip it here for clarity.
