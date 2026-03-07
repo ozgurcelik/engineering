@@ -1,3 +1,4 @@
 # ignore the pdfs and images folder
 pdfs/
 images/
+.claude/
