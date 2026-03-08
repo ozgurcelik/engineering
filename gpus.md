@@ -68,4 +68,52 @@ This is called control divergence.
 
 ### Low precision computation
 
-If you have fewer bits, you have fewer to move around.
+#### Bits and bytes
+
+A **bit** is the smallest unit of data — a single 0 or 1. A **byte** is 8 bits grouped together. The relationship is always: **1 byte = 8 bits**.
+
+The number in a data type's name tells you how many **bits** it uses:
+- **float32** (FP32): 32 bits = 32 / 8 = **4 bytes** per number
+- **float16** (FP16): 16 bits = 16 / 8 = **2 bytes** per number
+- **bfloat16** (BF16): 16 bits = **2 bytes** per number (different exponent/mantissa split than FP16)
+- **int8**: 8 bits = **1 byte** per number
+
+Why does this matter for GPUs? Every number that a thread reads from or writes to memory costs bytes of bandwidth. A float32 value costs 4 bytes per read/write, while a float16 value costs only 2. So switching from float32 to float16 **halves your memory traffic** for the same operation, which directly helps in the memory-bound regime.
+
+Example from the lecture — elementwise ReLU (\(x = \max(0, x)\)) on a vector of size \(n\):
+- **Float32**: 1 read + 1 write = 8 bytes moved per element, 1 FLOP → 8 bytes/FLOP
+- **Float16**: 1 read + 1 write = 4 bytes moved per element, 1 FLOP → 4 bytes/FLOP
+
+Half the bytes means double the arithmetic intensity, pushing the operation closer to the compute-bound regime. Tensor cores (introduced in Volta/Turing) exploit this further — they perform matrix multiplications in low/mixed precision (e.g., FP16 inputs, FP32 accumulation), making matmuls >10x faster than standard floating point ops.
+
+#### FP16 vs BF16
+
+Both are 16-bit (2 bytes), but they split those 16 bits differently. A floating-point number is stored as three fields: **sign** (positive/negative), **exponent** (the scale/range), and **mantissa** (the precision/significant digits).
+
+- **FP16**: 1 sign + 5 exponent + 10 mantissa — more precision, smaller range (max ~65,504)
+- **BF16**: 1 sign + 8 exponent + 7 mantissa — less precision, much larger range (max ~3.4 × 10³⁸, same as FP32)
+
+BF16 keeps the same 8 exponent bits as FP32, so it can represent the same range of magnitudes. This matters for training because gradients and activations can span a huge dynamic range. FP16's narrow range causes values to overflow or underflow more easily, which is why FP16 training often requires loss scaling. BF16 avoids this — you can typically drop it in as a replacement for FP32 without any scaling tricks, at the cost of slightly less precision (7 vs 10 mantissa bits). In practice this precision loss rarely affects model quality, which is why BF16 has become the default for LLM training.
+
+### Operator fusion
+
+If we need to do multiple operations in a row, we can fuse them together to reduce the number of memory reads and writes.
+
+### Recomputation
+
+The idea is doing more compute instead of storing the intermediate results in memory.
+For example, in backward pass, we can store the activations and compute the jacobians.
+Instead, we can recompute the activations and jacobians in the backward pass.
+
+### Coalescing memory
+
+DRAM (global memory) is read in burst mode.
+Each address space is partitioned into burst sections.
+Whenever a location is accessed, the entire burst section that contains the location is read into the cache.
+
+Memory accesses are coalesced if all the threads in a warp fall into the same burst section.
+Only one DRAM request is made for the entire burst section.
+
+### Tiling
+
+Idea of grouping and ordering threads to minimize the number of global memory accesses.
