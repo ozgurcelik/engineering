@@ -276,12 +276,18 @@ def pipeline_parallelism_main(rank: int, world_size: int, data: torch.Tensor, nu
         micro_batches = [torch.empty(micro_batch_size, num_dim) for _ in range(num_micro_batches)]
 
     for step in range(num_steps):
+        optimizer.zero_grad()
+
+        # store the inputs for each stage for the backward pass
+        stage_inputs = [torch.empty(micro_batch_size, num_dim) for _ in range(num_micro_batches)]
 
         # forward pass
-        for x in micro_batches:
+        for i in range(num_micro_batches):
+            x = micro_batches[i]
             # if we are not in the first stage, get the output of the previous stage
             if rank != 0:
                 dist.recv(tensor=x, src=rank - 1)
+            stage_inputs[i] = x
 
             for layer in range(local_num_layers):
                 x = x @ params[layer]
@@ -291,9 +297,13 @@ def pipeline_parallelism_main(rank: int, world_size: int, data: torch.Tensor, nu
             if rank != world_size - 1:
                 dist.send(tensor=x, dst=rank + 1)
 
-        
         # backward pass
-        
+        if rank == world_size - 1:
+            loss = [stage_inputs[i].square().sum() for i in range(num_micro_batches)].sum()
+            loss.backward()
+
+
+            
 
     cleanup()
 
