@@ -248,13 +248,63 @@ def tensor_parallelism_main(rank: int, world_size: int, data: torch.Tensor, num_
 
     cleanup()
 
+
+def pipeline_parallelism_main(rank: int, world_size: int, data: torch.Tensor, num_layers: int, num_steps: int, num_micro_batches: int):
+
+    setup(rank, world_size)
+
+    # get the data
+    data = generate_sample_data()
+    batch_size = data.shape[0]
+    num_dim = data.shape[1]
+    
+    # all the ranks use all the data, so no need to shard the data
+    # params are sharded across ranks by layer
+
+    local_num_layers = num_layers // world_size
+    params = [get_init_params(num_dim, num_dim, rank) for _ in range(local_num_layers)]
+    optimizer = torch.optim.AdamW(params, lr=0.001)
+    
+    # data is actually split to micro-batches
+    micro_batch_size = batch_size // num_micro_batches
+    
+    # for the first stage, the data is the original data
+    # for the rest of the stages, the data is the output of the previous stage
+    if rank == 0:
+        micro_batches = [data[i * micro_batch_size:(i + 1) * micro_batch_size] for i in range(num_micro_batches)]
+    else:
+        micro_batches = [torch.empty(micro_batch_size, num_dim) for _ in range(num_micro_batches)]
+
+    for step in range(num_steps):
+
+        # forward pass
+        for x in micro_batches:
+            # if we are not in the first stage, get the output of the previous stage
+            if rank != 0:
+                dist.recv(tensor=x, src=rank - 1)
+
+            for layer in range(local_num_layers):
+                x = x @ params[layer]
+                x = F.relu(x)
+
+            # if we are not in the last stage, send the output to the next stage
+            if rank != world_size - 1:
+                dist.send(tensor=x, dst=rank + 1)
+
+        
+        # backward pass
+        
+
+    cleanup()
+
 def main():
-    world_size = 4
+    world_size = 2
     #mp.spawn(collective_operations, args=(world_size,), nprocs=world_size, join=True)
     data = generate_sample_data()
-    num_layers = 2
+    num_layers = 4
     num_steps = 2
-    mp.spawn(tensor_parallelism_main, args=(world_size, data, num_layers, num_steps), nprocs=world_size, join=True)
+    num_micro_batches = 4
+    mp.spawn(pipeline_parallelism_main, args=(world_size, data, num_layers, num_steps, num_micro_batches), nprocs=world_size, join=True)
 
 if __name__ == "__main__":
     main()
