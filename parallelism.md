@@ -225,3 +225,106 @@ After that, it send the output to the next stage.
 This would mean the device that holds a stage would wait for the previous stage to finish before it can start its computation, and would sit idle until its turn comes again (either in backpropagation or forward pass if inference) after sending the output to the next stage. With $n$ devices, the utilization would be $1/n$ which is very low.
 
 The solution to that is to process micro-batches and send them to the next stage immediately.
+
+## Forward pass
+
+Each rank owns a contiguous group of layers (a "stage"). The full batch is split into $M$ micro-batches. Each micro-batch flows through the pipeline via point-to-point `send`/`recv`:
+
+$$
+\text{rank 0} \xrightarrow{\text{send}} \text{rank 1} \xrightarrow{\text{send}} \cdots \xrightarrow{\text{send}} \text{rank } R{-}1
+$$
+
+For micro-batch $i$, stage $r$ receives an activation tensor $X_r^{(i)}$ from stage $r-1$ (or uses the original data if $r = 0$), runs it through its local layers, and sends the output to stage $r+1$:
+
+$$
+Y_r^{(i)} = f_r(X_r^{(i)}) = \text{relu}(\cdots \text{relu}(X_r^{(i)} W_r^{(1)}) \cdots W_r^{(L_r)})
+$$
+
+where $W_r^{(1)}, \ldots, W_r^{(L_r)}$ are the weight matrices for the $L_r$ layers owned by stage $r$.
+
+The output of stage $r$ becomes the input to stage $r+1$: $X_{r+1}^{(i)} = Y_r^{(i)}$.
+
+## Backward pass
+
+The loss is computed only on the last stage ($r = R-1$) as the sum of per-micro-batch losses:
+
+$$
+L = \sum_{i=0}^{M-1} L^{(i)} = \sum_{i=0}^{M-1} \| Y_{R-1}^{(i)} \|^2
+$$
+
+Gradients flow in reverse through the pipeline via point-to-point communication:
+
+$$
+\text{rank } R{-}1 \xrightarrow{\text{send grad}} \text{rank } R{-}2 \xrightarrow{\text{send grad}} \cdots \xrightarrow{\text{send grad}} \text{rank 0}
+$$
+
+For each micro-batch $i$, each stage $r$ needs to compute two things:
+
+### 1. Parameter gradients (local, no communication)
+
+Each stage's weights $W_r$ only affect its own local computation. Given the upstream gradient $G_r^{(i)} = \frac{\partial L^{(i)}}{\partial Y_r^{(i)}}$, autograd computes $\frac{\partial L^{(i)}}{\partial W_r}$ by backpropagating through the local layers (matmuls and relus). Since both the stage input $X_r^{(i)}$ and the upstream gradient $G_r^{(i)}$ are available locally, no communication is needed.
+
+Gradients accumulate across micro-batches:
+
+$$
+\frac{\partial L}{\partial W_r} = \sum_{i=0}^{M-1} \frac{\partial L^{(i)}}{\partial W_r}
+$$
+
+### 2. Input gradient (sent to previous stage)
+
+The input gradient is needed by the previous stage as its upstream gradient:
+
+$$
+\frac{\partial L^{(i)}}{\partial X_r^{(i)}} = \frac{\partial L^{(i)}}{\partial Y_r^{(i)}} \cdot \frac{\partial Y_r^{(i)}}{\partial X_r^{(i)}}
+$$
+
+This is computed by autograd as `inp.grad` and sent to stage $r-1$ via `dist.send`. Stage $r-1$ receives it via `dist.recv` and uses it as its upstream gradient $G_{r-1}^{(i)}$.
+
+### Communication pattern
+
+| Direction | Operation | Purpose |
+|-----------|-----------|---------|
+| Forward   | `send`/`recv` (point-to-point) | Pass micro-batch activations to the next stage |
+| Backward  | `send`/`recv` (point-to-point) | Pass upstream gradients to the previous stage |
+
+> **Contrast with tensor parallelism:** Tensor parallelism uses *collective* operations (all-gather, all-reduce) because every rank participates in computing each layer. Pipeline parallelism uses *point-to-point* operations because each layer lives entirely on one rank — communication only happens at stage boundaries.
+
+## Implementation details
+
+### The subloss trick (same as tensor parallelism)
+
+We cannot call `loss.backward()` end-to-end because `send`/`recv` breaks the autograd graph (just as `all_gather` does in tensor parallelism). Instead, for each micro-batch we reconstruct the local forward computation and use the subloss trick:
+
+**Last stage ($r = R-1$):** The loss decomposes over micro-batches, so `subloss = x.square().sum()` gives the correct local gradients.
+
+**Other stages:** Given upstream gradient $G_r^{(i)}$ received from stage $r+1$:
+
+$$
+\text{subloss} = \sum_{jk} x_{jk} \cdot G_{r,jk}^{(i)}
+$$
+
+This is the same linear proxy used in tensor parallelism. `subloss.backward()` produces the same result as `x.backward(gradient=G_r^{(i)})`.
+
+### Gradient accumulation across micro-batches
+
+`optimizer.zero_grad()` is called once per step. Each micro-batch's `subloss.backward()` call *accumulates* into `params[layer].grad`. After all micro-batches are processed, a single `optimizer.step()` applies the total gradient. This is mathematically equivalent to computing the loss over the full batch.
+
+### Synchronization via blocking send/recv
+
+All ranks enter the same `for i in range(num_micro_batches)` backward loop simultaneously. The blocking nature of `send`/`recv` creates the correct execution order without explicit scheduling:
+
+1. Non-last ranks immediately block on `dist.recv(src=rank+1)`
+2. The last rank computes its subloss backward and calls `dist.send(dst=rank-1)`
+3. Rank $R-2$ unblocks, computes, sends to rank $R-3$, etc.
+
+Within each micro-batch, execution is sequential from last rank to first. There is no cross-micro-batch overlap in this schedule.
+
+### Pipeline bubble
+
+In the F-then-B schedule, each rank is idle while waiting for activations (forward) or gradients (backward) from adjacent stages. With $R$ stages and $M$ micro-batches, the "bubble" — the fraction of time a device is idle — is roughly:
+
+$$
+\text{bubble} \approx \frac{R - 1}{R - 1 + M}
+$$
+
+Increasing $M$ (more micro-batches) shrinks the bubble but increases memory usage (more stored activations). More advanced schedules like 1F1B (one-forward-one-backward) interleave forward and backward passes to reduce peak memory while maintaining the same bubble ratio.

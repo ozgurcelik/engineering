@@ -250,26 +250,48 @@ def tensor_parallelism_main(rank: int, world_size: int, data: torch.Tensor, num_
 
 
 def pipeline_parallelism_main(rank: int, world_size: int, data: torch.Tensor, num_layers: int, num_steps: int, num_micro_batches: int):
+    """
+    Pipeline parallelism: shard the model by *layers* across ranks.
+
+    Each rank owns a contiguous group of layers (a "stage"). Data flows through
+    stages via point-to-point send/recv:
+
+        rank 0          rank 1          rank 2          rank 3
+      [layers 0-1]  → [layers 2-3]  → [layers 4-5]  → [layers 6-7]
+         stage 0        stage 1         stage 2         stage 3
+
+    Unlike data parallelism (same model, different data) or tensor parallelism
+    (same data, sharded weights per layer), pipeline parallelism keeps the full
+    weight matrices but assigns different layers to different ranks.
+
+    Schedule: "all-forward-then-all-backward" (F-then-B).
+    All micro-batches complete the forward pass before any backward pass begins.
+    This is the simplest schedule but has a large "pipeline bubble" (idle time).
+    More advanced schedules like 1F1B interleave forward and backward to reduce
+    the bubble, but are not implemented here.
+    """
 
     setup(rank, world_size)
 
-    # get the data
     data = generate_sample_data()
     batch_size = data.shape[0]
     num_dim = data.shape[1]
-    
-    # all the ranks use all the data, so no need to shard the data
-    # params are sharded across ranks by layer
 
+    # Layer sharding: total layers are divided evenly across ranks.
+    # Each rank holds full [num_dim, num_dim] weight matrices, but only for its layers.
+    # (Compare: data parallelism has ALL layers on every rank; tensor parallelism
+    # shards each layer's weights across ranks.)
     local_num_layers = num_layers // world_size
     params = [get_init_params(num_dim, num_dim, rank) for _ in range(local_num_layers)]
     optimizer = torch.optim.AdamW(params, lr=0.001)
-    
-    # data is actually split to micro-batches
+
+    # Split the full batch into micro-batches. Micro-batches allow pipelining:
+    # rank 0 can send micro-batch 0 to rank 1 and immediately start processing
+    # micro-batch 1, rather than waiting for the full batch to propagate.
     micro_batch_size = batch_size // num_micro_batches
-    
-    # for the first stage, the data is the original data
-    # for the rest of the stages, the data is the output of the previous stage
+
+    # Rank 0 holds the actual input data; other ranks allocate empty buffers
+    # that will be filled by recv() during the forward pass.
     if rank == 0:
         micro_batches = [data[i * micro_batch_size:(i + 1) * micro_batch_size] for i in range(num_micro_batches)]
     else:
@@ -278,32 +300,98 @@ def pipeline_parallelism_main(rank: int, world_size: int, data: torch.Tensor, nu
     for step in range(num_steps):
         optimizer.zero_grad()
 
-        # store the inputs for each stage for the backward pass
+        # Store the input to this stage for each micro-batch.
+        # Needed during backward to reconstruct the local forward computation.
         stage_inputs = [torch.empty(micro_batch_size, num_dim) for _ in range(num_micro_batches)]
 
-        # forward pass
+        # ---- Forward pass ----
+        # Each micro-batch flows through the pipeline: rank 0 → rank 1 → ... → rank N-1.
+        # Communication is point-to-point (send/recv), not collective (all-reduce/all-gather).
+        #
+        # Timeline (4 micro-batches, 2 ranks):
+        #   rank 0: [fwd mb0] [fwd mb1] [fwd mb2] [fwd mb3]  (idle...)
+        #   rank 1:  (idle)   [fwd mb0] [fwd mb1] [fwd mb2] [fwd mb3]
+        #
+        # The blocking send/recv means rank 1 can start mb0 as soon as rank 0
+        # finishes it. But within this simple loop, rank 0 waits for rank 1 to
+        # recv before sending the next micro-batch, so overlap is limited.
         for i in range(num_micro_batches):
             x = micro_batches[i]
-            # if we are not in the first stage, get the output of the previous stage
             if rank != 0:
+                # Receive this micro-batch's activation from the previous stage.
                 dist.recv(tensor=x, src=rank - 1)
             stage_inputs[i] = x
 
+            # Run through this stage's local layers.
             for layer in range(local_num_layers):
                 x = x @ params[layer]
                 x = F.relu(x)
 
-            # if we are not in the last stage, send the output to the next stage
             if rank != world_size - 1:
+                # Send this micro-batch's output to the next stage.
                 dist.send(tensor=x, dst=rank + 1)
 
-        # backward pass
-        if rank == world_size - 1:
-            loss = [stage_inputs[i].square().sum() for i in range(num_micro_batches)].sum()
-            loss.backward()
+        # ---- Backward pass ----
+        # Gradients flow in reverse: last rank → ... → rank 0.
+        # For each micro-batch, we:
+        #   1. Reconstruct the local forward pass (to build an autograd graph)
+        #   2. Compute a subloss whose .backward() gives the correct gradients
+        #   3. Send inp.grad to the previous stage
+        #
+        # The subloss trick is the same as in tensor parallelism (see parallelism.md):
+        #   - Last stage: subloss = x.square().sum()  (actual loss)
+        #   - Other stages: subloss = (x * grad).sum()  (linear proxy for chain rule)
+        #
+        # Blocking send/recv naturally serializes ranks within each micro-batch:
+        #   rank N-1 computes & sends → rank N-2 recvs & computes & sends → ... → rank 0
+        #
+        # Gradient accumulation: since optimizer.zero_grad() was called once per step,
+        # subloss.backward() accumulates param.grad across all micro-batches before
+        # the single optimizer.step() at the end.
+        for i in range(num_micro_batches):
+            # Reconstruct local forward pass for this micro-batch.
+            # detach() severs any prior graph; requires_grad_(True) lets us get inp.grad.
+            inp = stage_inputs[i].detach().requires_grad_(True)
+            x = inp
+            for layer in range(local_num_layers):
+                x = x @ params[layer]
+                x = F.relu(x)
 
+            if rank == world_size - 1:
+                # Last stage: compute actual loss.
+                # The total loss is the sum of per-micro-batch losses. Since gradients
+                # accumulate across iterations, this is equivalent to computing
+                # loss = sum_i x_i.square().sum() and calling loss.backward() once.
+                subloss = x.square().sum()
+            else:
+                # Non-last stage: receive the upstream gradient from the next stage.
+                # This grad is dL/d(output of this stage) for this micro-batch,
+                # sent by the next rank's `dist.send(tensor=inp.grad, ...)` below.
+                grad = torch.empty_like(x)
+                dist.recv(tensor=grad, src=rank + 1)
+                # The subloss trick: subloss = (x * grad).sum() is a scalar whose
+                # gradient w.r.t. any variable v equals sum(grad * dx/dv), which is
+                # exactly the chain rule with `grad` as the upstream gradient.
+                subloss = (x * grad).sum()
 
-            
+            # Autograd computes:
+            #   - params[layer].grad += dL/d(params[layer])  (accumulated across micro-batches)
+            #   - inp.grad = dL/d(stage input) for this micro-batch
+            subloss.backward()
+
+            if rank != 0:
+                # Send the input gradient to the previous stage.
+                # This becomes the `grad` that the previous rank receives above.
+                dist.send(tensor=inp.grad, dst=rank - 1)
+
+        optimizer.step()
+
+        dist.barrier()
+        print(f"[Step {step}] Rank {rank} has params {params[0][0][:3]}")
+        dist.barrier()
+        if rank == 0:
+            print("--------------------------------")
+        dist.barrier()
 
     cleanup()
 
