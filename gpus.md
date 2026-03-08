@@ -114,6 +114,33 @@ Whenever a location is accessed, the entire burst section that contains the loca
 Memory accesses are coalesced if all the threads in a warp fall into the same burst section.
 Only one DRAM request is made for the entire burst section.
 
+#### Row-major layout
+
+A 2D matrix is stored in memory as a flat 1D array. In **row-major** order (the default in C/CUDA), rows are stored one after another:
+```
+Matrix:          Memory (flat):
+| 1  2  3 |      [1, 2, 3, 4, 5, 6, 7, 8, 9]
+| 4  5  6 |       ^row 0^  ^row 1^  ^row 2^
+| 7  8  9 |
+```
+Elements in the same row are adjacent in memory. Elements in the same column are separated by the row width.
+
+#### Coalescing for matrix multiplication
+
+Coalescing is about what all 32 threads in a warp access **simultaneously**, not what a single thread does over time.
+
+Consider \(C = A \times B\), where each thread computes one element of \(C\). Each element \(C[i][j]\) is the dot product of row \(i\) of \(A\) and column \(j\) of \(B\), computed over steps \(k = 0, 1, 2, \ldots\). At each step, every thread reads one element from \(A\) and one from \(B\). Whether those reads are coalesced depends on how threads are assigned.
+
+**Bad: threads along a column of C** (thread 0 does `C[0][0]`, thread 1 does `C[1][0]`, etc.):
+- **A**: each thread reads from a different row — `A[0][k]`, `A[1][k]`, `A[2][k]`, ... These addresses are each \(N\) apart, scattered across memory. **Not coalesced.**
+- **B**: all threads compute the same column, so they all read `B[k][0]` — the exact same address. This is a **broadcast** (one read serves all threads, fine).
+
+**Good: threads along a row of C** (thread 0 does `C[0][0]`, thread 1 does `C[0][1]`, etc.):
+- **A**: all threads compute the same row, so they all read `A[0][k]` — a **broadcast** (fine).
+- **B**: each thread reads an adjacent column — `B[k][0]`, `B[k][1]`, `B[k][2]`, ... These addresses are contiguous in row-major memory. One DRAM burst serves the whole warp. **Coalesced.**
+
+In both cases one matrix is broadcast (all threads read the same address) and the other is read by all 32 threads at different addresses. The question is whether those 32 addresses are contiguous (coalesced) or strided (not coalesced).
+
 ### Tiling
 
 Idea of grouping and ordering threads to minimize the number of global memory accesses.
