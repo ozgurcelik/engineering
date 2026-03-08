@@ -145,6 +145,16 @@ Since the $A_0$ and $A_1$ are on the different ranks, we can do an all-reduce to
 | Backward  | slice (local) | Reverse of all-gather: each rank takes its $[n, k/R]$ portion of the upstream gradient |
 | Backward  | all-reduce (sum) | Sum partial input gradients across ranks to get full $\frac{\partial l}{\partial X}$ |
 
+### Definition of $g_r$
+
+The forward pass on rank $r$ for a single layer computes $Y_r = X A_r$ (matmul) followed by $\text{relu}(Y_r)$ (activation). $g_r$ is the gradient of the loss w.r.t. the matmul output $Y_r$:
+
+$$
+g_r = \frac{\partial l}{\partial Y_r} = \frac{\partial l}{\partial \text{relu}(Y_r)} \odot \text{relu}'(Y_r)
+$$
+
+where $\frac{\partial l}{\partial \text{relu}(Y_r)}$ is the upstream gradient for rank $r$'s post-relu output and $\odot$ is element-wise multiplication. Since $\text{relu}'(Y_r) = \mathbb{1}[Y_r > 0]$, this zeros out entries where the relu was inactive.
+
 ### Why param gradients are local (no communication)
 
 Each rank's weight shard $A_r$ only affects its own local output $Y_r = X A_r$. No other rank's computation depends on $A_r$. Therefore:
@@ -153,7 +163,7 @@ $$
 \frac{\partial l}{\partial A_r} = X^T \cdot g_r
 $$
 
-where $g_r$ is the gradient flowing through rank $r$'s relu and matmul. Both $X$ (the layer input, same on all ranks after all-gather) and $g_r$ (local to this rank) are already available. No communication needed.
+Both $X$ (the layer input, same on all ranks after all-gather) and $g_r$ (local to this rank) are already available. No communication needed.
 
 ### Why input gradients need all-reduce
 
@@ -204,3 +214,14 @@ This is exactly the chain rule: $g$ acts as the upstream gradient flowing into $
 ### Memory cost of storing activations
 
 The forward pass stores `layer_inputs[i]` (shape $[n, k]$) for each layer. This is the same memory cost as standard autograd, which also retains intermediate activations internally. It could be reduced with **activation checkpointing**: store only every $N$-th layer's input and recompute the rest during backward by replaying the forward from the nearest checkpoint. This trades compute for memory, but we skip it here for clarity.
+
+# Pipeline Parallelism
+
+Pipeline parallelism is a technique where we split the model into multiple stages, and each stage is run on a different device.
+
+Each stage takes the entire input tensor and passes it through its own set of weights.
+After that, it send the output to the next stage.
+
+This would mean the device that holds a stage would wait for the previous stage to finish before it can start its computation, and would sit idle until its turn comes again (either in backpropagation or forward pass if inference) after sending the output to the next stage. With $n$ devices, the utilization would be $1/n$ which is very low.
+
+The solution to that is to process micro-batches and send them to the next stage immediately.
