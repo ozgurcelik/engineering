@@ -18,7 +18,9 @@ L2 cache is on the die, and global memory chips next to the GPU.
 ## Execution model of a GPU
 
 Threads: Threads do the work in parallel. All threads execute the same instructions but on different data (SIMT).
+
 Blocks: Groups of threads. Each block runs on a single SM with its own shared memory.
+
 Warp: Threads always execute in groups of 32 called a **warp**. Threads in a warp are contiguous in memory.
 
 So, blocks are assigned to SMs, and each block is divided into warps. Each warp contains 32 threads.
@@ -39,6 +41,8 @@ While in the compute-bound regime, the throughput does not increase as we increa
 We want to be on the compute-bound regime where we are utilizing our compute units to the fullest.
 
 ## How Do We Make a GPU Fast?
+
+Additional source: https://www.thonking.ai/p/what-shapes-do-matrix-multiplications
 
 There are 6 main techniques to make a GPU fast:
 - Control divergence (not a memory bottleneck)
@@ -81,8 +85,8 @@ The number in a data type's name tells you how many **bits** it uses:
 Why does this matter for GPUs? Every number that a thread reads from or writes to memory costs bytes of bandwidth. A float32 value costs 4 bytes per read/write, while a float16 value costs only 2. So switching from float32 to float16 **halves your memory traffic** for the same operation, which directly helps in the memory-bound regime.
 
 Example from the lecture — elementwise ReLU (\(x = \max(0, x)\)) on a vector of size \(n\):
-- **Float32**: 1 read + 1 write = 8 bytes moved per element, 1 FLOP → 8 bytes/FLOP
-- **Float16**: 1 read + 1 write = 4 bytes moved per element, 1 FLOP → 4 bytes/FLOP
+- **Float32**: 1 read + 1 write = 8 bytes moved per element, 1 FLOP → 1/8 FLOP/byte
+- **Float16**: 1 read + 1 write = 4 bytes moved per element, 1 FLOP → 1/4 FLOP/byte
 
 Half the bytes means double the arithmetic intensity, pushing the operation closer to the compute-bound regime. Tensor cores (introduced in Volta/Turing) exploit this further — they perform matrix multiplications in low/mixed precision (e.g., FP16 inputs, FP32 accumulation), making matmuls >10x faster than standard floating point ops.
 
@@ -144,3 +148,13 @@ In both cases one matrix is broadcast (all threads read the same address) and th
 ### Tiling
 
 Idea of grouping and ordering threads to minimize the number of global memory accesses.
+Cut the matrix into smaller tiles and load them into the shared memory.
+
+Non-tiled matrix multiplication: each input is read $N$ times from global memory.
+Tiled matrix multiplication: each input is read $\frac{N}{T}$ times from global memory, and $T$ times from shared memory within each tile. This is a factor of $T$ reduction in global memory accesses.
+
+#### Complexities of tiling
+
+Tile sizes may not divide the matrix size and lead to low utilization.
+
+Loading tiles are fast if burst align with the matrix.
