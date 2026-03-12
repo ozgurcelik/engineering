@@ -151,6 +151,7 @@ Idea of grouping and ordering threads to minimize the number of global memory ac
 Cut the matrix into smaller tiles and load them into the shared memory.
 
 Non-tiled matrix multiplication: each input is read $N$ times from global memory.
+
 Tiled matrix multiplication: each input is read $\frac{N}{T}$ times from global memory, and $T$ times from shared memory within each tile. This is a factor of $T$ reduction in global memory accesses.
 
 #### Complexities of tiling
@@ -158,3 +159,23 @@ Tiled matrix multiplication: each input is read $\frac{N}{T}$ times from global 
 Tile sizes may not divide the matrix size and lead to low utilization.
 
 Loading tiles are fast if burst align with the matrix.
+
+### Wave Quantization
+
+Imagine a matrix of size 1792x1792. Using tile sizes of 256x128, we get
+
+$$
+\frac{1792}{256} \times \frac{1792}{128} = 7 \times 14 = 98
+$$
+
+tiles.
+
+But if the matrix is 1793x1793, we get
+
+$$
+8 \times 15 = 120
+$$
+
+tiles.
+
+An A100 has 108 SMs, so we can handle 108 tiles in one go. With 120 tiles, we need to do another cycle where tiles are very sparse to begin with. This is quite inefficient.
