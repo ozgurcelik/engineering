@@ -12,38 +12,40 @@ if torch.cuda.is_available():
     print(torch.cuda.get_device_name(0))
 else:
     print("No GPU available")
+
+max_threads_per_block = torch.cuda.get_device_properties(0).max_threads_per_block  # 1024
+print(f"## max_threads_per_block {max_threads_per_block}")
 # %%
 
-class MLP(nn.Module):
-    """Simple MLP: linear -> GeLU -> linear -> GeLU -> ... -> linear -> GeLU"""
-    def __init__(self, dim: int, num_layers: int):
-        super().__init__()
-        self.layers = nn.ModuleList([nn.Linear(dim, dim) for _ in range(num_layers)])
+def check_equal(f1, f2):
+    x = torch.randn(2048, device=get_device())
+    y1 = f1(x)
+    y2 = f2(x)
+    assert torch.allclose(y1, y2, atol=1e-6)
 
-    def forward(self, x: torch.Tensor):
-        for layer in self.layers:
-            x = layer(x)
-            x = torch.nn.functional.gelu(x)
-        return x
+def benchmark(description: str, run: Callable, num_warmups: int = 1, num_trials: int = 3):
+    """Benchmark `func` by running it `num_trials`, and return all the times."""
+    # Warmup: first times might be slower due to compilation, things not cached.
+    # Since we will run the kernel multiple times, the timing that matters is steady state.
+    for _ in range(num_warmups):
+        run()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()  # Wait for CUDA threads to finish (important!)
 
+    # Time it for real now!
+    times: list[float] = [] # @inspect times, @inspect description
+    for trial in range(num_trials):  # Do it multiple times to capture variance
+        start_time = time.time()
 
-def run_mlp(dim: int, num_layers: int, batch_size: int, num_steps: int) -> Callable:
-    # Define a model (with random weights)
-    model = MLP(dim, num_layers).to(get_device())
+        run()  # Actually perform computation
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()  # Wait for CUDA threads to finish (important!)
 
-    # Define an input (random)
-    x = torch.randn(batch_size, dim, device=get_device())
+        end_time = time.time()
+        times.append((end_time - start_time) * 1000) # @inspect times
 
-    def run():
-        # Run the model `num_steps` times (note: no optimizer updates)
-        for step in range(num_steps):
-            # Forward
-            y = model(x).mean()
-
-            # Backward
-            y.backward()
-
-    return run
+    mean_time = mean(times) # @inspect mean_time
+    return mean_time
 
 
 def run_operation1(dim: int, operation: Callable) -> Callable:
@@ -100,45 +102,104 @@ def profile(description: str, run: Callable, num_warmups: int = 1, with_stack: b
         create_flame_graph(text_path, svg_path)
         image(svg_path, width=1, pop_stack=True)
 # %%
-def profiling():
-    # note("While benchmarking looks at end-to-end time, profiling looks at where time is spent.")
-    # note("Obvious: profiling helps you understand where time is being spent.")
-    # note("Deeper: profiling helps you understand (what is being called).")
+def pytorch_gelu(x: torch.Tensor):
+    # Use the tanh approximation to match our implementation
+    return torch.nn.functional.gelu(x, approximate="tanh")
 
-    # note("PyTorch has a nice built-in profiler"), see("https://pytorch.org/tutorials/recipes/recipes/profiler_recipe.html")
+def manual_gelu(x: torch.Tensor):
+    return 0.5 * x * (1 + torch.tanh(0.79788456 * (x + 0.044715 * x * x * x)))
 
-    # note("Let's profile some code to see what is going on under the hood.")
-    # profile("sleep", lambda : time.sleep(50 / 1000))  # Dummy function
+def create_cuda_gelu():
+    # Set CUDA_LAUNCH_BLOCKING so that if there are errors, CUDA will tell you what went wrong.
+    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+    # Read the CUDA kernel source code
+    cuda_gelu_src = open("cuda_kernels/gelu.cu").read()
 
-    # note("Let's start with some basic operations.")
-    # profile("add", run_operation2(dim=2048, operation=lambda a, b: a + b))
-    # profile("matmul", run_operation2(dim=2048, operation=lambda a, b: a @ b))
-    # profile("matmul(dim=128)", run_operation2(dim=128, operation=lambda a, b: a @ b))
+    # C++ code: defines the gelu function
+    cpp_gelu_src = "torch::Tensor gelu(torch::Tensor x);"
 
-    # note("Observations")
-    # note("- You can see what CUDA kernels are actually being called.")
-    # note("- Different CUDA kernels are invoked depending on the tensor dimensions.")
+    # Compile the CUDA code and bind it to a Python module.
+    ensure_directory_exists("var/cuda_gelu")
+    if not torch.cuda.is_available():
+        return None
+    module = load_inline(
+        cuda_sources=[cuda_gelu_src],
+        cpp_sources=[cpp_gelu_src],
+        functions=["gelu"],
+        extra_cflags=["-O2"],
+        verbose=True,
+        name="inline_gelu",
+        build_directory="var/cuda_gelu",
+    )
 
-    # note("Name of CUDA kernel tells us something about the implementation.")
-    # note("Example: cutlass_80_simt_sgemm_256x128_8x4_nn_align1")
-    # note("- cutlass: NVIDIA's CUDA library for linear algebra")
-    # note("- 256x128: tile size")
+    cuda_gelu = getattr(module, "gelu")
+    return cuda_gelu
 
-    # note("Let's now look at some composite operations.")
-    # profile("cdist", run_operation2(dim=2048, operation=lambda a, b: torch.cdist(a, b)))
-    # profile("gelu", run_operation2(dim=2048, operation=lambda a, b: torch.nn.functional.gelu(a + b)))
-    # profile("softmax", run_operation2(dim=2048, operation=lambda a, b: torch.nn.functional.softmax(a + b)))
+def kernel_fusion_motivation():
 
-    # note("Now let's profile our MLP.")
-    # note("We will also visualize our stack trace using a flame graph, which reveals where time is being spent.")
-    if torch.cuda.is_available():
-        note("Profiling MLP with dimensions 2048x2048 and 64 layers, batch size 1024, and 2 steps.")
-        profile("mlp", run_mlp(dim=2048, num_layers=64, batch_size=1024, num_steps=2), with_stack=True)
+    print("Let's consider two ways to compute GeLU:")
+    x = torch.tensor([1.])  # @inspect x
+
+    print("1. The default PyTorch implementation (fused):")
+    y1 = pytorch_gelu(x)  # @inspect y1
+
+    print("2. We can also write our own by hand (not fused):")
+    y2 = manual_gelu(x)  # @inspect y2
+
+    # Check that the implementations match
+    assert torch.allclose(y1, y2)
+
+    # Check more systematically
+    check_equal(pytorch_gelu, manual_gelu)
+
+    print("Let's benchmark.")
+    manual_time = benchmark("manual_gelu", run_operation1(dim=16384, operation=manual_gelu)) # @inspect manual_time
+    pytorch_time = benchmark("pytorch_gelu", run_operation1(dim=16384, operation=pytorch_gelu)) # @inspect pytorch_time
+    if manual_time is not None and pytorch_time is not None:
+        print(f"The fused version is significantly faster: {manual_time:.2f} ms, {pytorch_time:.2f} ms")
     else:
-        note("Profiling MLP with dimensions 128x128 and 16 layers, batch size 128, and 2 steps.")
-        profile("mlp", run_mlp(dim=128, num_layers=16, batch_size=128, num_steps=2), with_stack=True)
+        print("Could not compare times - benchmark results were None")
+
+    print("Let's look under the hood.")
+    manual_gelu_profile = profile("manual_gelu", run_operation1(dim=16384, operation=manual_gelu))
+    print(f"## manual_gelu")
+    print(manual_gelu_profile)
+    pytorch_gelu_profile = profile("pytorch_gelu", run_operation1(dim=16384, operation=pytorch_gelu))
+    print(f"## pytorch_gelu")
+    print(pytorch_gelu_profile)
+    print("The PyTorch just calls one kernel whereas the others are atomic (remember the warehouse/factory) ")
+
+    print(f"## Look at Nsight profiler for MLP   ")
+
+def cuda_kernels():
+    print("Now let's open the box to understand what's going on inside a CUDA kernel by writing our own.")
+
+    print("Let's write the GeLU function in CUDA.")
+    cuda_gelu = create_cuda_gelu() # @inspect cuda_gelu
+    x = manual_gelu # @inspect x
+
+    print("Check correctness of our implementation.")
+    if cuda_gelu is not None:
+        check_equal(cuda_gelu, manual_gelu)
+
+    print("Benchmark our CUDA version.")
+    pytorch_time = benchmark("pytorch_gelu", run_operation1(dim=16384, operation=pytorch_gelu)) # @inspect pytorch_time
+    manual_time = benchmark("manual_gelu", run_operation1(dim=16384, operation=manual_gelu)) # @inspect manual_time
+    print(f"## pytorch_gelu time {pytorch_time}")
+    print(f"## manual_gelu time {manual_time}")
+    if cuda_gelu is not None:
+        cuda_time = benchmark("cuda_gelu", run_operation1(dim=16384, operation=cuda_gelu)) # @inspect cuda_time 
+        cuda_gelu_profile = profile("cuda_gelu", run_operation1(dim=16384, operation=cuda_gelu))
+        print(f"## cuda_gelu")
+        print(cuda_gelu_profile)
+    print("Our CUDA implementation is faster than manual, but not as good as PyTorch.")
+
+    print("Elementwise operations are easy in CUDA (though you can still be smarter).")
+    print("But most interesting operations (e.g., matmul, softmax, RMSNorm) require reading multiple values.")
+    print("For that, you have to think about managing shared memory, etc.")
+
 # %%
 ensure_directory_exists("var")
 init_content("var/gpus.js")
-profiling()
-# %%
+# kernel_fusion_motivation()
+cuda_kernels()
