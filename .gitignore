@@ -2,3 +2,7 @@
 pdfs/
 images/
 .claude/
+var/
+FlameGraph/
+results/
+__pycache__/
