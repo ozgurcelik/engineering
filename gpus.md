@@ -72,6 +72,8 @@ This is called control divergence.
 
 ### Low precision computation
 
+Arithmetic intensity: #FLOPs / #bytes moved.
+
 #### Bits and bytes
 
 A **bit** is the smallest unit of data — a single 0 or 1. A **byte** is 8 bits grouped together. The relationship is always: **1 byte = 8 bits**.
