@@ -7,6 +7,8 @@ from torch.profiler import ProfilerActivity
 from torch.utils.cpp_extension import load_inline
 import os
 from util import *
+import triton
+import triton.language as tl
 # %%
 if torch.cuda.is_available():
     print(torch.cuda.get_device_name(0))
@@ -198,8 +200,120 @@ def cuda_kernels():
     print("But most interesting operations (e.g., matmul, softmax, RMSNorm) require reading multiple values.")
     print("For that, you have to think about managing shared memory, etc.")
 
+def triton_gelu(x: torch.Tensor):
+    assert x.is_cuda
+    assert x.is_contiguous()
+
+    # Allocate output tensor
+    y = torch.empty_like(x)
+
+    # Determine grid (elements divided into blocks)
+    num_elements = x.numel()
+    block_size = 1024  # Number of threads
+    num_blocks = triton.cdiv(num_elements, block_size)
+
+    triton_gelu_kernel[(num_blocks,)](x, y, num_elements, BLOCK_SIZE=block_size)
+
+    return y
+
+
+@triton.jit
+def triton_gelu_kernel(x_ptr, y_ptr, num_elements, BLOCK_SIZE: tl.constexpr):
+    # Input is at `x_ptr` and output is at `y_ptr`
+    #     |        Block 0            |          Block 1          |      ...      |
+    #                            BLOCK_SIZE                                 num_elements
+
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+
+    # Indices where this thread block should operate
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+
+    # Handle boundary
+    mask = offsets < num_elements
+
+    # Read
+    x = tl.load(x_ptr + offsets, mask=mask)
+
+    # Approx gelu is 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    # Compute (tl.tanh doesn't exist, use tanh(a) = (exp(2a) - 1) / (exp(2a) + 1)
+    a = 0.79788456 * (x + 0.044715 * x * x * x)
+    exp = tl.exp(2 * a)
+    tanh = (exp - 1) / (exp + 1)
+    y = 0.5 * x * (1 + tanh)
+
+    # Store
+    tl.store(y_ptr + offsets, y, mask=mask)
+
+def triton_gelu_main():
+    if not torch.cuda.is_available():
+        return
+
+    print("One big advantage of Triton is that you can step through the Python code.")
+
+    print("Let's step through a Triton kernel.")
+    x = torch.randn(8192, device=get_device())
+    y1 = triton_gelu(x)
+
+    print("Check that it's correct.")
+    check_equal(triton_gelu, manual_gelu)
+
+    print("Let's now benchmark it compared to the PyTorch and CUDA implementations.")
+    print("Remember to set TRITON_INTERPRET=0 for good performance.")
+    manual_time = benchmark("manual_gelu", run_operation1(dim=16384, operation=manual_gelu)) # @inspect manual_time
+    pytorch_time = benchmark("pytorch_gelu", run_operation1(dim=16384, operation=pytorch_gelu)) # @inspect pytorch_time
+    cuda_time = benchmark("cuda_gelu", run_operation1(dim=16384, operation=create_cuda_gelu())) # @inspect cuda_time
+    triton_time = benchmark("triton_gelu", run_operation1(dim=16384, operation=triton_gelu)) # @inspect triton_time
+    print(f"## manual_gelu time {manual_time}")
+    print(f"## pytorch_gelu time {pytorch_time}")
+    print(f"## cuda_gelu time {cuda_time}")
+    print(f"## triton_gelu time {triton_time}")
+
+    triton_gelu_profile = profile("triton_gelu", run_operation1(dim=16384, operation=triton_gelu))
+    print(f"## triton_gelu")
+    print(triton_gelu_profile)
+
+    print("Our Triton implementation (triton_gelu):")
+    print("- is almost as good as the PyTorch implementation (pytorch_gelu).")
+    print("- is actually slower than our naive CUDA implementation (cuda_gelu).")
+
+    print("Triton operates on blocks, CUDA operates on threads.")
+    print("Blocks allows Triton compiler to do other optimizations (e.g., thread coarsening).")
+
+    print("Everything is way faster than the manual implementation (manual_gelu).")
+
+def pytorch_compilation():
+
+    print("- Write it in Python and compile it into Triton")
+    compiled_gelu = torch.compile(manual_gelu)
+
+    print("Check correctness of our implementation.")
+    check_equal(compiled_gelu, manual_gelu)
+
+    if not torch.cuda.is_available():
+        return
+
+    print("Let's benchmark and profile it!")
+    manual_time = benchmark("manual_gelu", run_operation1(dim=16384, operation=manual_gelu)) # @inspect manual_time
+    pytorch_time = benchmark("pytorch_gelu", run_operation1(dim=16384, operation=pytorch_gelu)) # @inspect pytorch_time
+    cuda_time = benchmark("cuda_gelu", run_operation1(dim=16384, operation=create_cuda_gelu())) # @inspect cuda_time
+    triton_time = benchmark("triton_gelu", run_operation1(dim=16384, operation=triton_gelu)) # @inspect triton_time
+    compiled_time = benchmark("compiled_gelu", run_operation1(dim=16384, operation=compiled_gelu)) # @inspect compiled_time
+
+    print(f"## manual_gelu time {manual_time}")
+    print(f"## pytorch_gelu time {pytorch_time}")
+    print(f"## cuda_gelu time {cuda_time}")
+    print(f"## triton_gelu time {triton_time}")
+    print(f"## compiled_gelu time {compiled_time}")
+
+    print("Let's look under the hood")
+    compiled_gelu_profile = profile("compiled_gelu", run_operation1(dim=16384, operation=compiled_gelu))
+    print(f"## compiled_gelu")
+    print(compiled_gelu_profile)
 # %%
 ensure_directory_exists("var")
 init_content("var/gpus.js")
 # kernel_fusion_motivation()
-cuda_kernels()
+# cuda_kernels()
+# triton_gelu_main()
+pytorch_compilation()
