@@ -310,10 +310,67 @@ def pytorch_compilation():
     compiled_gelu_profile = profile("compiled_gelu", run_operation1(dim=16384, operation=compiled_gelu))
     print(f"## compiled_gelu")
     print(compiled_gelu_profile)
+
+def triton_softmax(x: torch.Tensor):
+
+    y = torch.empty_like(x)
+
+    M, N = x.shape # M = number of rows, N = number of columns
+    # Lets fit each row into a block, so each row is a block
+    block_size = triton.next_power_of_2(N)
+    num_blocks = M
+
+    triton_softmax_kernel[(num_blocks,)](
+        x_ptr=x,
+        y_ptr=y,
+        x_row_stride=x.stride(0),
+        y_row_stride=y.stride(0),
+        num_cols=N,
+        BLOCK_SIZE=block_size,
+    )
+
+    return y
+
+@triton.jit
+def triton_softmax_kernel(x_ptr, y_ptr, x_row_stride, y_row_stride, num_cols, BLOCK_SIZE: tl.constexpr):
+    
+    assert num_cols <= BLOCK_SIZE
+
+    # process each row independently
+    row_idx = tl.program_id(axis=0)
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+
+    # read from the global memory
+    x_start_ptr = x_ptr + row_idx * x_row_stride
+    x_ptrs = x_start_ptr + col_offsets
+    mask = col_offsets < num_cols
+    x_row = tl.load(x_ptrs, mask=mask, other=float('-inf'))
+
+    # Compute
+    x_row = x_row - tl.max(x_row, axis=0)
+    numerator = tl.exp(x_row)
+    denominator = tl.sum(numerator, axis=0)
+    y_row = numerator / denominator
+
+    # Write back to global memory
+    y_start_ptr = y_ptr + row_idx * y_row_stride
+    y_ptrs = y_start_ptr + col_offsets
+    tl.store(y_ptrs, y_row, mask=col_offsets < num_cols)
+
+def triton_softmax_main():
+
+    triton_time = benchmark("triton_softmax", run_operation1(dim=16384, operation=triton_softmax)) # @inspect triton_time
+
+    print(f"## triton_softmax time {triton_time}")
+    print("Let's look under the hood")
+    triton_softmax_profile = profile("triton_softmax", run_operation1(dim=16384, operation=triton_softmax))
+    print(f"## triton_softmax")
+    print(triton_softmax_profile)
 # %%
 ensure_directory_exists("var")
 init_content("var/gpus.js")
 # kernel_fusion_motivation()
 # cuda_kernels()
 # triton_gelu_main()
-pytorch_compilation()
+# pytorch_compilation()
+triton_softmax_main()
