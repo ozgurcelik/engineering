@@ -88,7 +88,10 @@ def softmax(x):
     kernel._init_handles()
     n_regs = kernel.n_regs
     size_smem = kernel.metadata.shared
+    # each program uses n_regs * (WARP_SIZE * num_warps) registers total (registers per thread × threads per program). 
+    # NUM_REGS is the SM's register file size. Dividing gives how many programs fit per SM based on registers.
     occupancy = NUM_REGS // (n_regs * WARP_SIZE * num_warps)
+    # if each program needs size_smem bytes of shared memory and the SM has SIZE_SMEM bytes total, only SIZE_SMEM // size_smem fit 
     occupancy = min(occupancy, SIZE_SMEM // size_smem)
     num_programs = NUM_SM * occupancy
 
@@ -132,3 +135,53 @@ def benchmark(M, N, provider):
 
 benchmark.run(show_plots=True, print_data=True)
 # %%
+## Comments
+
+# Q1: Where do we set how many warps per program?
+# --------------------------------------------------
+# Via the `num_warps` kwarg on the kernel launch (see line 77 and line 87).
+# It's a compile-time launch attribute, baked into the PTX during `.warmup(...)`.
+# Triton's equivalent of CUDA's blockDim, but expressed in warps instead of threads:
+#   num_warps=8  ->  8 warps * 32 threads = 256 threads per program.
+# Changing it requires a recompile; that's why it's passed alongside BLOCK_SIZE
+# and num_stages.
+
+# Q2: How does `num_warps` affect the kernel body (lines 37-56)?
+# --------------------------------------------------------------
+# It doesn't appear in the source at all -- that's the point of Triton's tile
+# abstraction. `col_offsets = tl.arange(0, BLOCK_SIZE)` and `row = tl.load(...)`
+# describe a BLOCK_SIZE-wide tile that belongs to the whole program. The compiler
+# then distributes tile-wide ops across `num_warps * 32` threads however it likes.
+# Block-wide reductions like `tl.max` / `tl.sum` are lowered to a tree: each warp
+# first reduces its own 32 lanes via warp shuffles, then the per-warp partials
+# are combined through shared memory to produce the final scalar.
+#
+# Example with BLOCK_SIZE=1024:
+#   num_warps=8  (256 threads):  each thread handles 4 tile elements; reduction
+#                                tree has 8 warps collaborating via warp shuffles.
+#   num_warps=4  (128 threads):  each thread handles 8 tile elements; 4-warp
+#                                reduction, more registers per thread.
+#
+# So `num_warps` changes codegen and performance, never correctness:
+#   - more warps  -> more parallelism per block, but fewer registers/thread and
+#                    fewer blocks fit per SM (see line 93 occupancy formula).
+#   - fewer warps -> more register budget per thread, less parallelism in the
+#                    reduction, potentially slower loads/stores.
+
+# Q3: What if BLOCK_SIZE < n_cols?
+# --------------------------------
+# The kernel silently produces WRONG output. It only ever loads the first
+# BLOCK_SIZE elements of each row:
+#   - tl.max / tl.sum compute over a truncated row -> wrong normalizer.
+#   - tl.store only writes the first BLOCK_SIZE output columns; the rest stay
+#     as uninitialized garbage from `torch.empty_like(x)`.
+# The mask only protects the BLOCK_SIZE > n_cols case (overshoot). There's no
+# outer loop to advance past BLOCK_SIZE columns, so undershoot is unprotected.
+#
+# That's why the launcher picks BLOCK_SIZE = next_power_of_2(n_cols) at line 71
+# -- it guarantees BLOCK_SIZE >= n_cols always holds.
+#
+# Implicit limit: the full row must fit in registers. Fine for hidden dims up to
+# a few thousand (BERT, small LLMs), breaks down for 100K+ vocab softmax. The
+# industrial fix is "online softmax" (streaming chunks with running max + sum,
+# the trick behind FlashAttention), which is outside this tutorial's scope.

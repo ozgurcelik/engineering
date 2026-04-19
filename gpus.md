@@ -240,6 +240,29 @@ Group of threads guaranteed to run on the sane SM.
 
 Collection of programs launced for a kernel
 
+### Occupancy
+
+The ratio of active warps on an SM to the maximum possible warps on that SM.
+
+### Stride
+
+The number of elements (not bytes) you need to skip in memory to advance by one unit along a given tensor dimension. For a contiguous (M, N) float tensor, stride(0) = N (advance one row = skip N elements) and stride(1) = 1 (advance one column = skip 1 element).
+
+### Software Pipelining
+
+A compiler transformation that rewrites a loop so that multiple iterations overlap in time. Instead of load → compute → store; load → compute → store; ..., the compiler emits something like:
+
+load iteration 0
+load iteration 1 | compute iteration 0
+load iteration 2 | compute iteration 1 | store iteration 0
+load iteration 3 | compute iteration 2 | store iteration 1
+...
+So at any given moment, memory loads, arithmetic, and stores are all running concurrently on different hardware units for different iterations. This hides DRAM latency. The cost is that you now need register/SRAM space to hold num_stages iterations' worth of live data simultaneously.
+
+### Persistent Kernel
+
+A kernel launch strategy where you launch just enough CTAs to fill the GPU (NUM_SM × occupancy) and have each CTA loop over many chunks of work, rather than launching one CTA per chunk. Benefits: (1) avoids the fixed cost of launching thousands of tiny CTAs; (2) keeps caches warm across iterations; (3) lets software pipelining span across chunks of work.
+
 #### Example
 
 Every SM has a fixed budget of four things:
