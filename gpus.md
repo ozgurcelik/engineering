@@ -181,3 +181,82 @@ $$
 tiles.
 
 An A100 has 108 SMs, so we can handle 108 tiles in one go. With 120 tiles, we need to do another cycle where tiles are very sparse to begin with. This is quite inefficient.
+
+
+## More Notes
+
+### Registers
+
+Smallest, fastest storage, physically inside the GPU core.
+The read/write happens in the same cycle arithmetic instruction that uses it.
+
+Only the thread that owns it can see it.
+Threads cannot access each other's registers directly:
+They must go through the shared memory or warp shuffles.
+
+### Register File
+
+Physical block of storage on each SM that holds all the registers for all the threads currently running on that SM.
+
+### SRAM (Static RAM)/Shared Memory/L1 Cache
+
+Static means it holds its value as long as it has power - no refresh needed.
+Its fast but expensive per byte.
+
+On a GPU, SRAM shows up as:
+- Shared memory: A small pool on each SM that all threads in a program can read/write.
+Programmer managed, so you can put things there deliberately.
+- L1 Cache: Managed automatically by the hardware to cache recent DRAM accesses.
+
+All threads within the same program can see it.
+Different programs cannnot access each other's shared memory.
+
+### SM (Streaming Multiprocessor)
+
+Fundemental execution unit on an NVIDIA GPU.
+Each SM has its own register file, shared memory, warp schedulers,
+arithmetic units (FP32, INT ...).
+Basically mini GPI core that runs thousands of threads concurrently.
+
+### Thread
+
+The smallest unit of execution.
+No OS involvement, instance context switch, no stack.
+A thread owns a slice of the register file and executes the kernel code once.
+
+### Warp
+
+A group of 32 threads that execute same instruction at the same time but on different data.
+
+### Warp Shuffle
+
+A hardware instruction that lets threads within the same warp directly read each others registers without going through the shared memory.
+
+### CTA/Block/Program
+
+Group of threads guaranteed to run on the sane SM.
+
+### Grid
+
+Collection of programs launced for a kernel
+
+#### Example
+
+Every SM has a fixed budget of four things:
+Register file, shared memory, warp slots, and block slots
+
+| Resource | Example: H100 SM | Consumed by one program based on… |
+| --- | --- | --- |
+| Register file | 65,536 × 32-bit regs | registers_per_thread × threads_per_block |
+| Shared memory | ~228 KB configurable | shared_memory_per_block (explicitly allocated in the kernel) |
+| Warp slots | 64 warps = 2048 threads | threads_per_block / 32 |
+| Block slots | 32 blocks | 1 per block |
+
+The number of resident programs is whatever is permitted by the tightest of these four constraints. Formally:
+
+max_blocks_per_SM = min(
+    register_file_size      // registers_per_block,
+    shared_memory_size      // shared_memory_per_block,
+    max_warps_per_SM        // warps_per_block,
+    hard_block_limit        // always 1 per block
+)

@@ -7,14 +7,6 @@ from triton.runtime import driver
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 # %%
-def is_hip():
-    return triton.runtime.driver.active.get_current_target().backend == "hip"
-
-def is_cdna():
-    return is_hip() and triton.runtime.driver.active.get_current_target().arch in ('gfx940', 'gfx941', 'gfx942',
-                                                                                   'gfx90a', 'gfx908')
-
-# %%
 def naive_softmax(x: torch.Tensor):
     """Compute row-wise softmax of X using native pytorch
 
@@ -96,26 +88,7 @@ def softmax(x):
     kernel._init_handles()
     n_regs = kernel.n_regs
     size_smem = kernel.metadata.shared
-    if is_hip():
-        # NUM_REGS represents the number of regular purpose registers. On CDNA architectures this is half of all registers available.
-        # However, this is not always the case. In most cases all registers can be used as regular purpose registers.
-        # ISA SECTION (3.6.4 for CDNA3)
-        # VGPRs are allocated out of two pools: regular VGPRs and accumulation VGPRs. Accumulation VGPRs are used
-        # with matrix VALU instructions, and can also be loaded directly from memory. A wave may have up to 512 total
-        # VGPRs, 256 of each type. When a wave has fewer than 512 total VGPRs, the number of each type is flexible - it is
-        # not required to be equal numbers of both types.
-        NUM_GPRS = NUM_REGS
-        if is_cdna():
-            NUM_GPRS = NUM_REGS * 2
-
-        # MAX_NUM_THREADS represents maximum number of resident threads per multi-processor.
-        # When we divide this number with WARP_SIZE we get maximum number of waves that can
-        # execute on a CU (multi-processor)  in parallel.
-        MAX_NUM_THREADS = properties["max_threads_per_sm"]
-        max_num_waves = MAX_NUM_THREADS // WARP_SIZE
-        occupancy = min(NUM_GPRS // WARP_SIZE // n_regs, max_num_waves) // num_warps
-    else:
-        occupancy = NUM_REGS // (n_regs * WARP_SIZE * num_warps)
+    occupancy = NUM_REGS // (n_regs * WARP_SIZE * num_warps)
     occupancy = min(occupancy, SIZE_SMEM // size_smem)
     num_programs = NUM_SM * occupancy
 
