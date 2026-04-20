@@ -185,3 +185,40 @@ benchmark.run(show_plots=True, print_data=True)
 # a few thousand (BERT, small LLMs), breaks down for 100K+ vocab softmax. The
 # industrial fix is "online softmax" (streaming chunks with running max + sum,
 # the trick behind FlashAttention), which is outside this tutorial's scope.
+
+# Q4: How is `n_regs` (line 89) calculated, and how does it relate to BLOCK_SIZE?
+# --------------------------------------------------------------------------------
+# `n_regs` is the per-thread register count chosen by `ptxas` during register
+# allocation. `.warmup(...)` runs the full compile pipeline
+#   Triton IR -> TritonGPU IR -> LLVM IR -> PTX -> SASS (ptxas allocates regs)
+# without launching, and the final count is exposed as `kernel.n_regs`. It's the
+# same number you'd see from `ptxas -v` or `cuobjdump --dump-resource-usage`.
+#
+# For a tile-heavy kernel like this one it scales roughly as:
+#   n_regs ~ c0 + c1 * num_stages * (BLOCK_SIZE / (num_warps * 32))
+# i.e. linear in elements-per-thread. c0 (~20-30) is scalar overhead (pointers,
+# loop counter, reduced max/sum); c1 (~2-4) is how many live tiles the compiler
+# can't fuse away (`row`, `row_minus_max`, `numerator`, etc).
+
+# Q5: Register spilling -- what is it and why does it kill performance?
+# ---------------------------------------------------------------------
+# Every thread has a hard cap of 255 registers on modern NVIDIA GPUs. If the
+# compiler decides a thread needs more live values than that, the overflow
+# "spills" to local memory -- which is a per-thread slice of GLOBAL DRAM,
+# cached in L1/L2. Rough latencies: register ~1 cycle, L1 ~30, L2 ~200,
+# DRAM ~500-800. A spilled access is 30-800x slower than a register.
+#
+# Even without spilling, high n_regs crushes occupancy via the formula at
+# line 93: on an H100 with 65536 regs/SM and num_warps=8 (256 threads/program),
+#   n_regs=32  -> 8 programs/SM
+#   n_regs=64  -> 4 programs/SM
+#   n_regs=128 -> 2 programs/SM
+#   n_regs=255 -> 1 program/SM
+# Fewer resident programs means less latency hiding, which matters a lot for
+# memory-bound kernels like softmax.
+#
+# Concrete spill scenario: BLOCK_SIZE=16384, num_warps=4 (128 threads) gives
+# 128 elts/thread. With ~3 live tiles that's ~384 tile regs alone -> well over
+# 255 -> ptxas spills. Fix: bump num_warps to 16 or 32, so elts/thread drops
+# to 16 or 8 and n_regs stays comfortably under the cap. This is exactly the
+# tradeoff space the autotuner sweeps in the next tutorial.
