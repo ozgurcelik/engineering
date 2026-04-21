@@ -86,13 +86,13 @@ def matrix_multiplication_kernel_naive_row_major(
     a_start_ptr = a_ptr + row * a_row_stride
     b_start_ptr = b_ptr
 
-    acc = tl.zeros([N], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_SIZE_N], dtype=tl.float32)
     for k in range(0, K, BLOCK_SIZE_K):
         k_offsets = tl.arange(0, BLOCK_SIZE_K) + k
         k_mask = k_offsets < K
 
         a_offsets = k_offsets
-        b_offsets = k_offsets * b_row_stride + tl.arange(0, N)
+        b_offsets = k_offsets * b_row_stride + tl.arange(0, BLOCK_SIZE_N)
 
         a_ptrs = a_start_ptr + a_offsets
         b_ptrs = b_start_ptr + b_offsets
@@ -101,13 +101,13 @@ def matrix_multiplication_kernel_naive_row_major(
         b_vals = tl.load(b_ptrs, mask=k_mask)
 
         acc += a_vals * b_vals
-    c_m_n_ptr = c_ptr + row * c_row_stride
+    c_m_n_ptr = c_ptr + row * c_row_stride + tl.arange(0, BLOCK_SIZE_N)
     tl.store(c_m_n_ptr, acc)
 
 def matrix_multiplication_naive_row_major(a: torch.Tensor, b: torch.Tensor):
     M, K = a.shape
     K, N = b.shape
-    BLOCK_SIZE_N = 128
+    BLOCK_SIZE_N = N
     BLOCK_SIZE_K = 128
     c = torch.empty(M, N, device=DEVICE)
     matrix_multiplication_kernel_naive_row_major[(M, N)](a, b, c, M, N, K, a.stride(0), b.stride(0), c.stride(0), BLOCK_SIZE_N, BLOCK_SIZE_K)
