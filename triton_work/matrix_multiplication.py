@@ -72,15 +72,57 @@ def matrix_multiplication_naive_blocked(a: torch.Tensor, b: torch.Tensor):
     matrix_multiplication_kernel_naive_blocked[(M, N)](a, b, c, M, N, K, a.stride(0), b.stride(0), c.stride(0), BLOCK_SIZE_K)
     return c
 
+
+# do it row major. load a row of A once in a kernel and calculate the entire row of the result matrix in one kernel
+@triton.jit
+def matrix_multiplication_kernel_naive_row_major(
+    a_ptr, b_ptr, c_ptr,
+    M, N, K, # a is MxK, b is KxN, c is MxN
+    a_row_stride, b_row_stride, c_row_stride,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    row = tl.program_id(0)
+    a_start_ptr = a_ptr + row * a_row_stride
+    b_start_ptr = b_ptr
+
+    acc = tl.zeros([N], dtype=tl.float32)
+    for k in range(0, K, BLOCK_SIZE_K):
+        k_offsets = tl.arange(0, BLOCK_SIZE_K) + k
+        k_mask = k_offsets < K
+
+        a_offsets = k_offsets
+        b_offsets = k_offsets * b_row_stride + tl.arange(0, N)
+
+        a_ptrs = a_start_ptr + a_offsets
+        b_ptrs = b_start_ptr + b_offsets
+
+        a_vals = tl.load(a_ptrs, mask=k_mask)
+        b_vals = tl.load(b_ptrs, mask=k_mask)
+
+        acc += a_vals * b_vals
+    c_m_n_ptr = c_ptr + row * c_row_stride
+    tl.store(c_m_n_ptr, acc)
+
+def matrix_multiplication_naive_row_major(a: torch.Tensor, b: torch.Tensor):
+    M, K = a.shape
+    K, N = b.shape
+    BLOCK_SIZE_N = 128
+    BLOCK_SIZE_K = 128
+    c = torch.empty(M, N, device=DEVICE)
+    matrix_multiplication_kernel_naive_row_major[(M, N)](a, b, c, M, N, K, a.stride(0), b.stride(0), c.stride(0), BLOCK_SIZE_N, BLOCK_SIZE_K)
+    return c
 # %%
 torch.manual_seed(0)
 a = torch.randn((512, 192), device=DEVICE, dtype=torch.float32)
 b = torch.randn((192, 128), device=DEVICE, dtype=torch.float32)
 c_triton = matrix_multiplication_naive(a, b)
 c_triton_blocked = matrix_multiplication_naive_blocked(a, b)
+c_triton_row_major = matrix_multiplication_naive_row_major(a, b)
 c_torch = torch.matmul(a, b)
 assert torch.allclose(c_triton, c_torch, atol=1e-2, rtol=1e-2), (c_triton, c_torch)
 assert torch.allclose(c_triton_blocked, c_torch, atol=1e-2, rtol=1e-2), (c_triton_blocked, c_torch)
+assert torch.allclose(c_triton_row_major, c_torch, atol=1e-2, rtol=1e-2), (c_triton_row_major, c_torch)
 # %%
 @triton.testing.perf_report(
     triton.testing.Benchmark(
