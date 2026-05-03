@@ -379,28 +379,28 @@ DOES SUPERGROUPING ACTUALLY HELP? (fp16, 64x64x64 blocks, no tuning)
 
 Run the benchmark below (sweep N from 256 to 16384) and you get:
 
-    N        Tiled (2D)   Sg verbose   Sg lean    Torch    Sg lean / Tiled
-     4096      240.5        241.8       241.9     373.4      1.01x
-     6144      238.8        240.0       240.8     363.4      1.01x
-     8192      235.2        234.9       236.9     396.8      1.01x
-     9216      218.9        230.8       233.2     395.7      1.07x
-    10240      212.0        230.6       232.6     379.8      1.10x
-    12288      210.8        231.2       233.8     394.8      1.11x
-    14336      188.6        229.9       232.7     393.7      1.23x
-    15360      184.2        230.8       233.2     393.6      1.27x
-    16384      172.3        232.4       234.8     393.7      1.36x
+    N         Tiled (2D)    Supergrouped (1D)    Torch     Sg / Tiled
+     4096       240.5            241.8           373.4       1.01x
+     6144       238.8            240.0           363.4       1.01x
+     8192       235.2            234.9           396.8       1.00x
+     9216       218.9            230.8           395.7       1.05x
+    10240       212.0            230.6           379.8       1.09x
+    12288       210.8            231.2           394.8       1.10x
+    14336       188.6            229.9           393.7       1.22x
+    15360       184.2            230.8           393.6       1.25x
+    16384       172.3            232.4           393.7       1.35x
 
 Two regimes, separated almost exactly at N=8192:
 
 1. N <= 8192: both schedules sit at ~235 TFLOPS. Supergrouping does
-   nothing visible. The kernel is HMMA-issue / load-latency bound at the
-   blocks/stages we picked, not L2-traffic bound, so reordering pids
+   nothing visible. The kernel is HMMA-issue / load-latency bound at
+   the blocks we picked, not L2-traffic bound, so reordering pids
    can't move the needle.
 
 2. N >= 9216: the plain 2D-tiled curve falls off a cliff -- 240 -> 172
-   TFLOPS by 16384 -- while the supergroup curve stays flat at ~233.
+   TFLOPS by 16384 -- while the supergroup curve stays flat at ~232.
    That's L2 thrashing on the 2D-tiled side, exactly the situation
-   supergrouping was designed for. The pid reordering buys back ~36%
+   supergrouping was designed for. The pid reordering buys back ~35%
    on this GPU with nothing else touched.
 
 Why the cliff is at 8192-9216
@@ -413,124 +413,28 @@ In fp16 the L2 footprint of A+B = 4*N^2 bytes. The L2 on this card is
     N=9216  -> 324 MB     (2.5x L2)
     N=16384 -> 1 GB       (8x L2)
 
-Up through ~8192, the 2D grid's natural row-major schedule still gets a
-lot of L2 hits because consecutive waves have enough overlap. Past
+Up through ~8192, the 2D grid's natural row-major schedule still gets
+a lot of L2 hits because consecutive waves have enough overlap. Past
 9216, A row-strips touched by wave i are no longer in L2 by the time
 wave j needs them again, so each wave starts paying the full HBM load.
 
-Supergrouping fixes this by traversing groups of GROUP_SIZE_M=8 row-tiles
-in column-major order WITHIN each group. A single wave (188 SMs on a
-Blackwell PRO 6000) covers ~8 distinct A row-strips and ~24 distinct B
-col-strips at a time -- a working set that comfortably fits in L2 even
-at 16384. So the schedule never has to re-stream A from HBM.
-
-The K-loop body story (orthogonal, still real)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-The earlier fp32-IEEE finding -- that the verbose K-loop body
-interacts badly with 1D launch grids -- is still true, just buried
-under the L2 effect once we're on tensor cores:
-
-       for k in range(0, K, BLOCK_SIZE_K):
-           # NEW each iteration:
-           k_offsets = tl.arange(0, BLOCK_SIZE_K) + k
-           a_offsets = m_offsets[:, None] * a_rs + k_offsets[None, :] * a_cs
-           b_offsets = k_offsets[:, None] * b_rs + n_offsets[None, :] * b_cs
-           a_mask    = m_mask[:, None] & k_mask[None, :]
-           b_mask    = k_mask[:, None] & n_mask[None, :]
-           ...
-           acc = tl.dot(a_vals, b_vals, acc)
-
-`m_offsets * a_rs` is loop-invariant; the compiler should hoist it.
-Whether it actually does depends on what it can prove about pid_m /
-pid_n. With a 2D launch grid those are intrinsics with tight bounds;
-with a 1D grid they come from `pid // X` / `pid % X` for runtime X and
-Triton can fail to fold the arithmetic. The lean body (build pointers
-ONCE, advance with += inside the loop, mask only along K) sidesteps
-this entirely. In fp32-IEEE that gap was ~17%; in fp16 it shrinks to
-~1-2% (compare the verbose and lean supergroup columns above) because
-the integer recomputation runs in parallel with HMMA on different
-execution units.
+Supergrouping fixes this by traversing groups of GROUP_SIZE_M=8 row
+tiles in column-major order WITHIN each group. A single wave (188 SMs
+on a Blackwell PRO 6000) covers ~8 distinct A row-strips and ~24
+distinct B col-strips at a time -- a working set that comfortably fits
+in L2 even at 16384. So the schedule never has to re-stream A from
+HBM.
 
 What this benchmark does NOT show
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-We're at ~235 TFLOPS at the upper end; cuBLAS is at ~394 TFLOPS. The
+We're at ~232 TFLOPS at the upper end; cuBLAS is at ~394 TFLOPS. The
 remaining ~40% gap is not a scheduling problem, it's a configuration
 problem: bigger blocks (e.g. 128x128x32), num_stages > 1 (software
 pipelining), num_warps = 8, and shape-specific autotune. Those
 optimizations are what would close the gap to cuBLAS, but they belong
 in a separate exercise.
 """
-
-
-@triton.jit
-def matrix_multiplication_tiled_kernel_supergrouped_lean(
-    a_ptr, b_ptr, c_ptr,
-    M, N, K,
-    a_row_stride, b_row_stride, c_row_stride,
-    a_col_stride, b_col_stride, c_col_stride,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
-):
-    pid = tl.program_id(0)
-
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
-
-    # Build initial pointers ONCE before the K-loop. Apply `% M` / `% N` to
-    # the row/col offsets so we can drop the m/n masks inside the loop --
-    # any threads in a partial last tile harmlessly reload the wrap-around
-    # row/column, which gets masked out at the final store.
-    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-    a_ptrs = a_ptr + (offs_am[:, None] * a_row_stride + offs_k[None, :] * a_col_stride)
-    b_ptrs = b_ptr + (offs_k[:, None] * b_row_stride + offs_bn[None, :] * b_col_stride)
-
-    acc = tl.zeros([BLOCK_SIZE_M, BLOCK_SIZE_N], dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        # Mask only along K; the address arithmetic in the loop body collapses
-        # to a fused pointer-bump, which is what lets the hot path be just
-        # "load tiles, MMA, advance pointers".
-        a_vals = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
-        b_vals = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
-        acc = tl.dot(a_vals, b_vals, acc)
-        a_ptrs += BLOCK_SIZE_K * a_col_stride
-        b_ptrs += BLOCK_SIZE_K * b_row_stride
-
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = c_ptr + offs_cm[:, None] * c_row_stride + offs_cn[None, :] * c_col_stride
-    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, acc.to(tl.float16), mask=c_mask)
-
-
-def matrix_multiplication_tiled_supergrouped_lean(a: torch.Tensor, b: torch.Tensor):
-    M, K = a.shape
-    K, N = b.shape
-    BLOCK_SIZE_M = 64
-    BLOCK_SIZE_N = 64
-    BLOCK_SIZE_K = 64
-    GROUP_SIZE_M = 8
-    grid_size = (triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),)
-    c = torch.empty(M, N, device=DEVICE, dtype=a.dtype)
-    matrix_multiplication_tiled_kernel_supergrouped_lean[grid_size](
-        a, b, c, M, N, K,
-        a.stride(0), b.stride(0), c.stride(0),
-        a.stride(1), b.stride(1), c.stride(1),
-        BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M,
-    )
-    return c
 
 
 # %%
@@ -546,18 +450,15 @@ c_triton_blocked = matrix_multiplication_naive_blocked(a, b)
 c_triton_row_major = matrix_multiplication_naive_row_major(a, b)
 c_triton_tiled = matrix_multiplication_tiled(a, b)
 c_triton_tiled_supergrouped = matrix_multiplication_tiled_supergrouped(a, b)
-c_triton_tiled_supergrouped_lean = matrix_multiplication_tiled_supergrouped_lean(a, b)
 c_torch = torch.matmul(a.to(torch.float32), b.to(torch.float32)).to(torch.float16)
 assert torch.allclose(c_triton, c_torch, atol=1e-2, rtol=1e-2), (c_triton, c_torch)
 assert torch.allclose(c_triton_blocked, c_torch, atol=1e-2, rtol=1e-2), (c_triton_blocked, c_torch)
 assert torch.allclose(c_triton_row_major, c_torch, atol=1e-2, rtol=1e-2), (c_triton_row_major, c_torch)
 assert torch.allclose(c_triton_tiled, c_torch, atol=1e-1, rtol=1e-1), (c_triton_tiled, c_torch)
 assert torch.allclose(c_triton_tiled_supergrouped, c_torch, atol=1e-1, rtol=1e-1), (c_triton_tiled_supergrouped, c_torch)
-assert torch.allclose(c_triton_tiled_supergrouped_lean, c_torch, atol=1e-1, rtol=1e-1), (c_triton_tiled_supergrouped_lean, c_torch)
 # %%
-# Benchmark in fp16: plain tiled (2D grid) vs supergrouped (1D grid) vs the
-# lean-body supergrouped (1D grid, hoisted address arithmetic) vs torch.
-# All Triton variants use the same block sizes (64x64x64) and Triton's
+# Benchmark in fp16: plain tiled (2D grid) vs supergrouped (1D grid) vs torch.
+# Both Triton kernels use the same block sizes (64x64x64) and Triton's
 # default num_stages / num_warps -- nothing else is tuned. The only
 # question is whether the pid -> (pid_m, pid_n) reordering buys us anything
 # on its own.
@@ -591,16 +492,14 @@ assert torch.allclose(c_triton_tiled_supergrouped_lean, c_torch, atol=1e-1, rtol
         line_vals=[
             'triton_tiled',
             'triton_tiled_supergrouped',
-            'triton_tiled_supergrouped_lean',
             'torch',
         ],
         line_names=[
-            "Triton Tiled (2D grid, verbose K-loop)",
-            "Triton Supergrouped (1D grid, verbose K-loop)",
-            "Triton Supergrouped (1D grid, lean K-loop)",
+            "Triton Tiled (2D grid)",
+            "Triton Supergrouped (1D grid)",
             "Torch (fp16, cuBLAS)",
         ],
-        styles=[('orange', '-'), ('red', '-'), ('blue', '-'), ('green', '-')],
+        styles=[('orange', '-'), ('blue', '-'), ('green', '-')],
         ylabel="TFLOPS",
         plot_name="matmul-performance-fp16",
         args={},
@@ -616,8 +515,6 @@ def benchmark(M, N, K, provider):
         ms = triton.testing.do_bench(lambda: matrix_multiplication_tiled(a, b))
     if provider == 'triton_tiled_supergrouped':
         ms = triton.testing.do_bench(lambda: matrix_multiplication_tiled_supergrouped(a, b))
-    if provider == 'triton_tiled_supergrouped_lean':
-        ms = triton.testing.do_bench(lambda: matrix_multiplication_tiled_supergrouped_lean(a, b))
     # FLOPs for matmul: 2 * M * N * K (one multiply + one add per output element per K dim)
     tflops = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)
     return tflops(ms)
