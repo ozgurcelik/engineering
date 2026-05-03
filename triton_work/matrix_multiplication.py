@@ -194,14 +194,19 @@ assert torch.allclose(c_triton_blocked, c_torch, atol=1e-2, rtol=1e-2), (c_trito
 assert torch.allclose(c_triton_row_major, c_torch, atol=1e-2, rtol=1e-2), (c_triton_row_major, c_torch)
 assert torch.allclose(c_triton_tiled, c_torch, atol=1e-1, rtol=1e-1), (c_triton_tiled, c_torch)
 # %%
+# Sweep up to 4096 so the working set of A/B blocks across in-flight programs
+# overflows L2 and the grouped-pid optimization has something to actually win on.
+# The element-wise `triton`, `triton_blocked`, and `triton_row_major` kernels are dropped here: at
+# 4096^3 they would launch 16M programs each doing a long scalar K-loop and take
+# many minutes per data point. They are still covered by the correctness checks above.
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=['M', 'N', 'K'],  # argument names to use as an x-axis for the plot
-        x_vals=[128 * i for i in range(2, 18)],  # different possible values for `x_name`
+        x_vals=[128 * i for i in range(2, 33)],  # 256 .. 4096
         line_arg='provider',  # argument name whose value corresponds to a different line in the plot
-        line_vals=['triton', 'triton_blocked', 'triton_row_major', 'triton_tiled', 'torch'],  # possible values for `line_arg`
-        line_names=["Triton", "Triton Blocked", "Triton Row Major", "Triton Tiled", "Torch"],  # label name for the lines
-        styles=[('blue', '-'), ('red', '-'), ('purple', '-'), ('orange', '-'), ('green', '-')],  # line styles
+        line_vals=['triton_tiled', 'torch'],  # possible values for `line_arg`
+        line_names=["Triton Tiled", "Torch"],  # label name for the lines
+        styles=[('purple', '-'), ('orange', '-'), ('green', '-')],  # line styles
         ylabel="TFLOPS",  # label name for the y-axis
         plot_name="matmul-performance",  # name for the plot. Used also as a file name for saving the plot.
         args={},  # values for function arguments not in `x_names` and `y_name`
@@ -213,12 +218,6 @@ def benchmark(M, N, K, provider):
     getattr(torch, DEVICE.type).set_stream(stream)
     if provider == 'torch':
         ms = triton.testing.do_bench(lambda: torch.matmul(a, b))
-    if provider == 'triton':
-        ms = triton.testing.do_bench(lambda: matrix_multiplication_naive(a, b))
-    if provider == 'triton_blocked':
-        ms = triton.testing.do_bench(lambda: matrix_multiplication_naive_blocked(a, b))
-    if provider == 'triton_row_major':
-        ms = triton.testing.do_bench(lambda: matrix_multiplication_naive_row_major(a, b))
     if provider == 'triton_tiled':
         ms = triton.testing.do_bench(lambda: matrix_multiplication_tiled(a, b))
     # FLOPs for matmul: 2 * M * N * K (one multiply + one add per output element per K dim)
