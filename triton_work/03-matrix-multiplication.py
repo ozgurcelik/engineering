@@ -1,3 +1,4 @@
+# %%
 """
 Matrix Multiplication
 =====================
@@ -440,3 +441,5 @@ def benchmark(M, N, K, provider, fp8_inputs):
 
 
 benchmark.run(show_plots=True, print_data=True)
+
+# %%

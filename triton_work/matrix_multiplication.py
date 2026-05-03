@@ -202,14 +202,84 @@ def matrix_multiplication_tiled_kernel_supergrouped(
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
-    SUPERGROUP_SIZE: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
 ):
     pid = tl.program_id(0)
 
+    # Let us see how many blocks we have in each dimension
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
     
-    
+    # Groups are horizontal strips of programs, so they cover entire column space of C
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+
+    group_id = pid // num_pid_in_group # which group this program is in
+    first_pid_m = group_id * GROUP_SIZE_M # where does this group start
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M) # if the num_pid_m is not a multiple of GROUP_SIZE_M, then the last group will have fewer than GROUP_SIZE_M programs
+
+    local_pid = pid % num_pid_in_group # 0 ... num_pid_in_group - 1
+    pid_m = first_pid_m + (local_pid % group_size_m) 
+    pid_n = local_pid // group_size_m
+
+    """
+    Within a group, local_pid ranges over group_size_m x num_pid_n positions.
+    We traverse those positions in column-major order.
+    - local_pid % group_size_m is which row inside the group
+    - local_pid // group_size_m is which column inside the group
+    """
+
+    # From here on, the computation is identical to matrix_multiplication_tiled_kernel.
+    # Only the (pid_m, pid_n) -> output-tile mapping changes. Same work, different order.
+    row = pid_m * BLOCK_SIZE_M
+    col = pid_n * BLOCK_SIZE_N
+
+    m_offsets = tl.arange(0, BLOCK_SIZE_M) + row
+    m_mask = m_offsets < M
+
+    n_offsets = tl.arange(0, BLOCK_SIZE_N) + col
+    n_mask = n_offsets < N
+
+    acc = tl.zeros([BLOCK_SIZE_M, BLOCK_SIZE_N], dtype=tl.float32)
+    for k in range(0, K, BLOCK_SIZE_K):
+        k_offsets = tl.arange(0, BLOCK_SIZE_K) + k
+        k_mask = k_offsets < K
+
+        a_offsets = m_offsets[:, None] * a_row_stride + k_offsets[None, :] * a_col_stride
+        b_offsets = k_offsets[:, None] * b_row_stride + n_offsets[None, :] * b_col_stride
+
+        a_ptrs = a_ptr + a_offsets
+        b_ptrs = b_ptr + b_offsets
+
+        a_mask = m_mask[:, None] & k_mask[None, :]
+        b_mask = k_mask[:, None] & n_mask[None, :]
+
+        a_vals = tl.load(a_ptrs, mask=a_mask)
+        b_vals = tl.load(b_ptrs, mask=b_mask)
+
+        acc = tl.dot(a_vals, b_vals, acc, input_precision="ieee")
+
+    c_offsets = m_offsets[:, None] * c_row_stride + n_offsets[None, :] * c_col_stride
+    c_mask = m_mask[:, None] & n_mask[None, :]
+    tl.store(c_ptr + c_offsets, acc, mask=c_mask)
+
+
+def matrix_multiplication_tiled_supergrouped(a: torch.Tensor, b: torch.Tensor):
+    M, K = a.shape
+    K, N = b.shape
+    BLOCK_SIZE_M = 64
+    BLOCK_SIZE_N = 64
+    BLOCK_SIZE_K = 64
+    GROUP_SIZE_M = 8
+    # 1D launch grid is required for the supergrouped pid -> (pid_m, pid_n) mapping
+    grid_size = (triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),)
+    c = torch.empty(M, N, device=DEVICE)
+    matrix_multiplication_tiled_kernel_supergrouped[grid_size](
+        a, b, c, M, N, K,
+        a.stride(0), b.stride(0), c.stride(0),
+        a.stride(1), b.stride(1), c.stride(1),
+        BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M,
+    )
+    return c
 
 
 # %%
@@ -220,11 +290,13 @@ c_triton = matrix_multiplication_naive(a, b)
 c_triton_blocked = matrix_multiplication_naive_blocked(a, b)
 c_triton_row_major = matrix_multiplication_naive_row_major(a, b)
 c_triton_tiled = matrix_multiplication_tiled(a, b)
+c_triton_tiled_supergrouped = matrix_multiplication_tiled_supergrouped(a, b)
 c_torch = torch.matmul(a, b)
 assert torch.allclose(c_triton, c_torch, atol=1e-2, rtol=1e-2), (c_triton, c_torch)
 assert torch.allclose(c_triton_blocked, c_torch, atol=1e-2, rtol=1e-2), (c_triton_blocked, c_torch)
 assert torch.allclose(c_triton_row_major, c_torch, atol=1e-2, rtol=1e-2), (c_triton_row_major, c_torch)
 assert torch.allclose(c_triton_tiled, c_torch, atol=1e-1, rtol=1e-1), (c_triton_tiled, c_torch)
+assert torch.allclose(c_triton_tiled_supergrouped, c_torch, atol=1e-1, rtol=1e-1), (c_triton_tiled_supergrouped, c_torch)
 # %%
 # Sweep up to 4096 so the working set of A/B blocks across in-flight programs
 # overflows L2 and the grouped-pid optimization has something to actually win on.
@@ -236,9 +308,9 @@ assert torch.allclose(c_triton_tiled, c_torch, atol=1e-1, rtol=1e-1), (c_triton_
         x_names=['M', 'N', 'K'],  # argument names to use as an x-axis for the plot
         x_vals=[128 * i for i in range(2, 33)],  # 256 .. 4096
         line_arg='provider',  # argument name whose value corresponds to a different line in the plot
-        line_vals=['triton_tiled', 'torch'],  # possible values for `line_arg`
-        line_names=["Triton Tiled", "Torch"],  # label name for the lines
-        styles=[('purple', '-'), ('orange', '-'), ('green', '-')],  # line styles
+        line_vals=['triton_tiled', 'triton_tiled_supergrouped', 'torch'],  # possible values for `line_arg`
+        line_names=["Triton Tiled", "Triton Tiled Supergrouped", "Torch"],  # label name for the lines
+        styles=[('orange', '-'), ('red', '-'), ('green', '-')],  # line styles
         ylabel="TFLOPS",  # label name for the y-axis
         plot_name="matmul-performance",  # name for the plot. Used also as a file name for saving the plot.
         args={},  # values for function arguments not in `x_names` and `y_name`
@@ -252,6 +324,8 @@ def benchmark(M, N, K, provider):
         ms = triton.testing.do_bench(lambda: torch.matmul(a, b))
     if provider == 'triton_tiled':
         ms = triton.testing.do_bench(lambda: matrix_multiplication_tiled(a, b))
+    if provider == 'triton_tiled_supergrouped':
+        ms = triton.testing.do_bench(lambda: matrix_multiplication_tiled_supergrouped(a, b))
     # FLOPs for matmul: 2 * M * N * K (one multiply + one add per output element per K dim)
     tflops = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)
     return tflops(ms)
