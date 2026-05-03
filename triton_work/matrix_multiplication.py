@@ -180,6 +180,38 @@ def matrix_multiplication_tiled(a: torch.Tensor, b: torch.Tensor):
     return c
 
 
+"""
+In tile matmul, each program computes one output tile C[m_tile, n_tile] of size BLOCK_SIZE_M x BLOCK_SIZE_N.
+To compute this, the program reads
+- One row strip of A: rows m_tile * BLOCK_SIZE_M to m_tile * BLOCK_SIZE_M + BLOCK_SIZE_M - 1, all K columns. Call this A_m
+- One column strip of B: columns n_tile * BLOCK_SIZE_N to n_tile * BLOCK_SIZE_N + BLOCK_SIZE_N - 1, all K rows. Call this B_n
+
+Two programs that share the same m_tile reads the same A_m, and two programs that share the same n_tile reads the same B_n.
+L2 reuse comes from arranging programs so that ones close in time (close in pid) share A_m or B_n.
+
+
+"""
+
+
+@triton.jit
+def matrix_multiplication_tiled_kernel_supergrouped(
+    a_ptr, b_ptr, c_ptr,
+    M, N, K, # a is MxK, b is KxN, c is MxN
+    a_row_stride, b_row_stride, c_row_stride,
+    a_col_stride, b_col_stride, c_col_stride,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    SUPERGROUP_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    
+    
+
+
 # %%
 torch.manual_seed(0)
 a = torch.randn((512, 192), device=DEVICE, dtype=torch.float32)
