@@ -252,9 +252,8 @@ SUPERGROUPED (GROUP_SIZE_M=2):
   group 0 done -> 10 HBM loads. Groups 1 and 2 mirror this.
   TOTAL: ~30 HBM loads
 
-Same 48 output tiles, ~45% less HBM traffic. Tensor cores spend less
-time stalled waiting for inputs -- that's where the TFLOPS gain comes
-from.
+Same 48 output tiles, ~45% less HBM (High-Bandwidth Memory, GPUs main DRAM) traffic. 
+Tensor cores spend less time stalled waiting for inputs -- that's where the TFLOPS gain comes from.
 
 
 ====================================================================
@@ -403,6 +402,16 @@ Two regimes, separated almost exactly at N=8192:
    supergrouping was designed for. The pid reordering buys back ~35%
    on this GPU with nothing else touched.
 
+Aside: tensor-core MMA instruction families
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The "MMA" family of SASS instructions all execute one tile of
+D = A*B + C on the tensor cores; they differ only in operand dtype:
+- HMMA: half-precision (FP16/BF16) matrix multiply-accumulate. This
+  is what a Triton tl.dot on FP16 inputs lowers to on Ampere/Hopper.
+- IMMA: integer (INT8/INT4) variant.
+- DMMA: double-precision (FP64) variant.
+- QMMA: FP8 variant on Hopper.
+
 Why the cliff is at 8192-9216
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -418,12 +427,40 @@ a lot of L2 hits because consecutive waves have enough overlap. Past
 9216, A row-strips touched by wave i are no longer in L2 by the time
 wave j needs them again, so each wave starts paying the full HBM load.
 
+Note the cliff lines up with 2x L2, not 1x. The reuse-critical quantity
+is B alone (= 2*N^2 bytes), not A+B. In row-major, every B col-strip's
+reuse distance is one full sweep across N -- i.e. all of B -- because
+row r+1 of C revisits the same col-strips that row r just streamed in.
+For B to survive that distance in L2 we need 2*N^2 <= 128 MB, i.e.
+N <= 8192. Since A and B are the same size, "B alone hits L2" and
+"A+B hits 2x L2" are the same point. Above N=8192, B can't survive
+cross-row reuse, every C-row re-streams B from HBM, and the ~376 MB of
+B traffic during one C-row also evicts the in-use A row-strip mid-row.
+
 Supergrouping fixes this by traversing groups of GROUP_SIZE_M=8 row
 tiles in column-major order WITHIN each group. A single wave (188 SMs
 on a Blackwell PRO 6000) covers ~8 distinct A row-strips and ~24
 distinct B col-strips at a time -- a working set that comfortably fits
 in L2 even at 16384. So the schedule never has to re-stream A from
 HBM.
+
+Where 8 and 24 come from:
+- 8 = GROUP_SIZE_M, set literally in the launcher. Inside a group,
+  pids are laid out column-major, so 8 consecutive pids form one
+  vertical column of C-tiles -> 8 distinct A row-strips, 1 B col-strip.
+- 24 ~= 188 SMs / 8-tall-column = 23.5. A wave of 188 concurrent
+  programs therefore spans ~24 such columns side by side, sharing the
+  same 8 A row-strips across all of them.
+
+Working set at N=16384: each strip is 64 * N * 2 = 2 MB, so
+8 A + 24 B = (8+24) * 2 MB = 64 MB -- half of the 128 MB L2. The plain
+row-major wave at the same N would touch 1 A row-strip + 188 B
+col-strips ~= 378 MB, ~3x oversubscribed. Supergrouping trades a
+slightly wider A footprint (1 -> 8) for a much narrower B footprint
+(188 -> 24); each B col-strip a program loads is reused 7 more times
+by the rest of its column before being allowed to leave L2. Larger N
+benefits from larger GROUP_SIZE_M for the same reason -- see autotune
+section below.
 
 What this benchmark does NOT show
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
