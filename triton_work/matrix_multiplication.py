@@ -437,6 +437,182 @@ in a separate exercise.
 """
 
 
+"""
+====================================================================
+AUTOTUNING
+====================================================================
+
+The supergrouped kernel above hard-codes BLOCK_SIZE_M = BLOCK_SIZE_N =
+BLOCK_SIZE_K = 64, GROUP_SIZE_M = 8, and inherits Triton's defaults
+for num_warps and num_stages (num_warps=4, num_stages=1 here). None of
+those choices are optimal across all shapes:
+
+- Small/medium N is compute-bound. The bottleneck is keeping the
+  tensor cores fed without bubbles. Bigger output tiles (more work per
+  program) and num_stages >= 3 (software-pipelined K-loop -- load
+  stage k+1 while computing stage k) help most.
+- Large N is L2-bound (the regime the supergrouping fixed). Smaller
+  blocks plus a larger GROUP_SIZE_M can shrink the per-wave working
+  set even further.
+
+There is no single (BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K,
+GROUP_SIZE_M, num_warps, num_stages) that wins both regimes. So we
+hand Triton a list of plausible configurations and let it benchmark
+each one on the actual shape:
+
+@triton.autotune(configs=[...], key=['M', 'N', 'K'])
+@triton.jit
+def kernel(...): ...
+
+Mechanics:
+- Each triton.Config bundles tl.constexpr values (block sizes,
+  GROUP_SIZE_M) with compilation knobs (num_warps, num_stages).
+- The `key` argument names runtime arguments whose values, when
+  changed, invalidate the cache and trigger a fresh search. (M,N,K)
+  is correct here: a new shape gets re-tuned once, then cached.
+- The launch grid becomes a callable `lambda META: ...` because the
+  caller no longer knows BLOCK_SIZE_*. Triton invokes the lambda with
+  the chosen Config's constexpr dict.
+- First call with a new (M,N,K) compiles and times every config;
+  expect tens of seconds of warm-up. Subsequent calls reuse the cached
+  winner and pay no overhead.
+
+Caveats:
+- Not every (BLOCK_SIZE_M, BLOCK_SIZE_N, num_warps) is legal for
+  tl.dot; illegal combinations are pruned by the autotuner rather
+  than crashing.
+- A long config list multiplies first-call latency. Keep it focused.
+- `tl.assume(...)` is a free perf hint: it tells the integer analysis
+  pass that ids/strides are non-negative so address arithmetic can
+  drop sign handling.
+"""
+
+
+def get_autotune_configs():
+    # The two compilation knobs that aren't constexprs in the kernel signature:
+    # - num_warps: how many warps of 32 threads share one program/output tile.
+    #   More warps spreads tl.dot across more tensor-core lanes and hides
+    #   instruction latency, at the cost of registers per warp.
+    # - num_stages: how many K-loop iterations are software-pipelined.
+    #   num_stages=3 means while the tensor cores compute on stage k, the loads
+    #   for k+1 are issued and k+2's loads are arriving in shared memory. This
+    #   is the single biggest reason the default-config kernel above sits at
+    #   ~232 TFLOPS vs cuBLAS at ~394.
+    return [
+        # Compute-bound regime: large output tiles + deep pipelining.
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        # Memory-bound regime (large N): smaller tiles with a wider GROUP_SIZE_M
+        # shrink the per-wave L2 working set further than the supergrouped
+        # default could.
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 16}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 16}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 16}, num_stages=3, num_warps=8),
+    ]
+
+
+# Two decorators, in this order: triton.autotune wraps triton.jit. The
+# outer decorator is what the call site actually invokes; it picks a
+# Config, then forwards into the JIT'd inner kernel with the constexprs
+# from that Config injected.
+@triton.autotune(
+    configs=get_autotune_configs(),
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def matrix_multiplication_autotuned_kernel(
+    a_ptr, b_ptr, c_ptr,
+    M, N, K,
+    a_row_stride, b_row_stride, c_row_stride,
+    a_col_stride, b_col_stride, c_col_stride,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+
+    local_pid = pid % num_pid_in_group
+    pid_m = first_pid_m + (local_pid % group_size_m)
+    pid_n = local_pid // group_size_m
+
+    # Free perf hints: the integer-analysis pass uses these to drop sign
+    # handling on address arithmetic.
+    tl.assume(pid_m >= 0)
+    tl.assume(pid_n >= 0)
+    tl.assume(a_row_stride > 0)
+    tl.assume(a_col_stride > 0)
+    tl.assume(b_row_stride > 0)
+    tl.assume(b_col_stride > 0)
+    tl.assume(c_row_stride > 0)
+    tl.assume(c_col_stride > 0)
+
+    row = pid_m * BLOCK_SIZE_M
+    col = pid_n * BLOCK_SIZE_N
+
+    m_offsets = tl.arange(0, BLOCK_SIZE_M) + row
+    m_mask = m_offsets < M
+
+    n_offsets = tl.arange(0, BLOCK_SIZE_N) + col
+    n_mask = n_offsets < N
+
+    acc = tl.zeros([BLOCK_SIZE_M, BLOCK_SIZE_N], dtype=tl.float32)
+    for k in range(0, K, BLOCK_SIZE_K):
+        k_offsets = tl.arange(0, BLOCK_SIZE_K) + k
+        k_mask = k_offsets < K
+
+        a_offsets = m_offsets[:, None] * a_row_stride + k_offsets[None, :] * a_col_stride
+        b_offsets = k_offsets[:, None] * b_row_stride + n_offsets[None, :] * b_col_stride
+
+        a_ptrs = a_ptr + a_offsets
+        b_ptrs = b_ptr + b_offsets
+
+        a_mask = m_mask[:, None] & k_mask[None, :]
+        b_mask = k_mask[:, None] & n_mask[None, :]
+
+        a_vals = tl.load(a_ptrs, mask=a_mask)
+        b_vals = tl.load(b_ptrs, mask=b_mask)
+
+        acc = tl.dot(a_vals, b_vals, acc)
+
+    c_offsets = m_offsets[:, None] * c_row_stride + n_offsets[None, :] * c_col_stride
+    c_mask = m_mask[:, None] & n_mask[None, :]
+    tl.store(c_ptr + c_offsets, acc.to(tl.float16), mask=c_mask)
+
+
+def matrix_multiplication_autotuned(a: torch.Tensor, b: torch.Tensor):
+    M, K = a.shape
+    K, N = b.shape
+    c = torch.empty(M, N, device=DEVICE, dtype=a.dtype)
+    # The grid depends on BLOCK_SIZE_M and BLOCK_SIZE_N, which the autotuner
+    # picks. So the grid is a callable that receives the chosen Config's
+    # constexpr dict as `META` and returns the actual launch shape.
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']),)
+    # Note: BLOCK_SIZE_*, GROUP_SIZE_M are NOT passed here -- the autotuner
+    # injects them from the winning Config.
+    matrix_multiplication_autotuned_kernel[grid](
+        a, b, c, M, N, K,
+        a.stride(0), b.stride(0), c.stride(0),
+        a.stride(1), b.stride(1), c.stride(1),
+    )
+    return c
+
+
 # %%
 # Correctness check, in fp16. We compare against an fp32 reference so the
 # tolerances bound rounding from accumulating fp16 products into fp32 and
@@ -450,12 +626,14 @@ c_triton_blocked = matrix_multiplication_naive_blocked(a, b)
 c_triton_row_major = matrix_multiplication_naive_row_major(a, b)
 c_triton_tiled = matrix_multiplication_tiled(a, b)
 c_triton_tiled_supergrouped = matrix_multiplication_tiled_supergrouped(a, b)
+c_triton_autotuned = matrix_multiplication_autotuned(a, b)
 c_torch = torch.matmul(a.to(torch.float32), b.to(torch.float32)).to(torch.float16)
 assert torch.allclose(c_triton, c_torch, atol=1e-2, rtol=1e-2), (c_triton, c_torch)
 assert torch.allclose(c_triton_blocked, c_torch, atol=1e-2, rtol=1e-2), (c_triton_blocked, c_torch)
 assert torch.allclose(c_triton_row_major, c_torch, atol=1e-2, rtol=1e-2), (c_triton_row_major, c_torch)
 assert torch.allclose(c_triton_tiled, c_torch, atol=1e-1, rtol=1e-1), (c_triton_tiled, c_torch)
 assert torch.allclose(c_triton_tiled_supergrouped, c_torch, atol=1e-1, rtol=1e-1), (c_triton_tiled_supergrouped, c_torch)
+assert torch.allclose(c_triton_autotuned, c_torch, atol=1e-1, rtol=1e-1), (c_triton_autotuned, c_torch)
 # %%
 # Benchmark in fp16: plain tiled (2D grid) vs supergrouped (1D grid) vs torch.
 # Both Triton kernels use the same block sizes (64x64x64) and Triton's
@@ -492,14 +670,16 @@ assert torch.allclose(c_triton_tiled_supergrouped, c_torch, atol=1e-1, rtol=1e-1
         line_vals=[
             'triton_tiled',
             'triton_tiled_supergrouped',
+            'triton_autotuned',
             'torch',
         ],
         line_names=[
             "Triton Tiled (2D grid)",
             "Triton Supergrouped (1D grid)",
+            "Triton Autotuned (supergrouped + autotune)",
             "Torch (fp16, cuBLAS)",
         ],
-        styles=[('orange', '-'), ('blue', '-'), ('green', '-')],
+        styles=[('orange', '-'), ('blue', '-'), ('red', '-'), ('green', '-')],
         ylabel="TFLOPS",
         plot_name="matmul-performance-fp16",
         args={},
@@ -515,6 +695,8 @@ def benchmark(M, N, K, provider):
         ms = triton.testing.do_bench(lambda: matrix_multiplication_tiled(a, b))
     if provider == 'triton_tiled_supergrouped':
         ms = triton.testing.do_bench(lambda: matrix_multiplication_tiled_supergrouped(a, b))
+    if provider == 'triton_autotuned':
+        ms = triton.testing.do_bench(lambda: matrix_multiplication_autotuned(a, b))
     # FLOPs for matmul: 2 * M * N * K (one multiply + one add per output element per K dim)
     tflops = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)
     return tflops(ms)
