@@ -743,31 +743,46 @@ def matrix_multiplication_pointer_kernel(
     # loaded for those positions is garbage from the math's POV, but the
     # corresponding output positions are discarded by the c_mask at the
     # final tl.store -- so the computed garbage never escapes the kernel.
+    # Maps to old's `m_offsets`/`n_offsets` + `m_mask`/`n_mask`, but the
+    # mask is replaced by the wrap and hoisted out of the K loop entirely.
     offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    # Note: NO `+ k` here. Old version did `k_offsets = tl.arange(BSK) + k`
+    # inside the loop; the `+ k` shift now lives in the pointer advance below.
     offs_k = tl.arange(0, BLOCK_SIZE_K)
 
     # Initial pointer blocks. Built once; then we only ever ADVANCE them.
+    # Old version rebuilt this 2D outer product (m_offsets[:,None]*stride +
+    # k_offsets[None,:]*stride) on every K iteration -- we do it just once.
     a_ptrs = a_ptr + (offs_am[:, None] * a_row_stride + offs_k[None, :] * a_col_stride)
     b_ptrs = b_ptr + (offs_k[:, None] * b_row_stride + offs_bn[None, :] * b_col_stride)
 
     acc = tl.zeros([BLOCK_SIZE_M, BLOCK_SIZE_N], dtype=tl.float32)
+    # k is now an iteration counter (0, 1, 2, ...), not an element offset
+    # like old's `range(0, K, BLOCK_SIZE_K)`. Iteration count is identical.
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         # Only the K dimension is masked. K out-of-bounds elements WOULD
         # corrupt valid output rows/cols if accumulated, so we zero them
         # via `other=0.0`. The mask is 1D in K, evaluated against the
         # per-iteration tail size K - k * BLOCK_SIZE_K.
+        # Equivalent to old's `k_offsets < K`: that's `(k*BSK + j) < K`,
+        # i.e. `j < K - k*BSK`, i.e. `offs_k < K - k*BSK`. Only the LAST
+        # iteration ever has any element masked off.
         a_vals = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
         b_vals = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
 
         acc = tl.dot(a_vals, b_vals, acc)
 
         # Advance the entire pointer block by one K-tile. No 2D recompute.
+        # This scalar add reproduces old's per-iter shift: at iter n, old's
+        # a_offsets equalled iter-0's plus n*BSK*a_col_stride. Same for B,
+        # but along K's row axis (b_row_stride), since K is rows in B.
         a_ptrs += BLOCK_SIZE_K * a_col_stride
         b_ptrs += BLOCK_SIZE_K * b_row_stride
 
     # Final store uses the REAL M/N bounds, discarding any wrap-around
-    # output positions produced by the modulo trick.
+    # output positions produced by the modulo trick. This is the ONE place
+    # the M/N boundary check is paid -- the old kernel paid it every K iter.
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = c_ptr + offs_cm[:, None] * c_row_stride + offs_cn[None, :] * c_col_stride
