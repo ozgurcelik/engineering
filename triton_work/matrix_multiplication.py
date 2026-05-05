@@ -415,27 +415,32 @@ D = A*B + C on the tensor cores; they differ only in operand dtype:
 Why the cliff is at 8192-9216
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-In fp16 the L2 footprint of A+B = 4*N^2 bytes. The L2 on this card is
-128 MB:
-    N=5760  -> 128 MB     (= L2)
-    N=8192  -> 256 MB     (2x L2)
-    N=9216  -> 324 MB     (2.5x L2)
-    N=16384 -> 1 GB       (8x L2)
+The reuse-critical quantity is B alone. Under the natural row-major
+schedule, B's reuse distance is one full sweep across N: tile (r, j)
+loads B[:, j*BN:(j+1)*BN], and the same col-strip is needed again at
+tile (r+1, j) -- after ~2*N^2 bytes of intervening B traffic (one full
+sweep loads every B col-strip exactly once = sizeof(B)). For B to
+survive that distance in L2 we need
 
-Up through ~8192, the 2D grid's natural row-major schedule still gets
-a lot of L2 hits because consecutive waves have enough overlap. Past
-9216, A row-strips touched by wave i are no longer in L2 by the time
-wave j needs them again, so each wave starts paying the full HBM load.
+    sizeof(B) = 2*N^2 bytes  <=  L2
 
-Note the cliff lines up with 2x L2, not 1x. The reuse-critical quantity
-is B alone (= 2*N^2 bytes), not A+B. In row-major, every B col-strip's
-reuse distance is one full sweep across N -- i.e. all of B -- because
-row r+1 of C revisits the same col-strips that row r just streamed in.
-For B to survive that distance in L2 we need 2*N^2 <= 128 MB, i.e.
-N <= 8192. Since A and B are the same size, "B alone hits L2" and
-"A+B hits 2x L2" are the same point. Above N=8192, B can't survive
-cross-row reuse, every C-row re-streams B from HBM, and the ~376 MB of
-B traffic during one C-row also evicts the in-use A row-strip mid-row.
+The L2 on this card is 128 MB, so the threshold is N <= 8192:
+
+    N=4096  -> sizeof(B) =  32 MB    (0.25x L2)
+    N=8192  -> sizeof(B) = 128 MB    (1.0x L2)
+    N=9216  -> sizeof(B) = 162 MB    (1.27x L2)
+    N=16384 -> sizeof(B) = 512 MB    (4.0x L2)
+
+A doesn't enter the criterion. Its row-strip is loaded once and reused
+by every column tile of one C-row back-to-back, then never touched
+again -- short reuse interval, and the strip itself is small
+(BLOCK_M*N*2 = 2 MB at N=16384). It fits trivially.
+
+Above N=8192, B can't survive cross-row reuse, so every new C-row
+re-streams all of B from HBM. As a side effect, the ~512 MB of B
+streaming traffic during one C-row at N=16384 also evicts the in-use
+A row-strip mid-row, so A starts re-fetching too -- but the trigger
+is purely B no longer fitting.
 
 Supergrouping fixes this by traversing groups of GROUP_SIZE_M=8 row
 tiles in column-major order WITHIN each group. A single wave (188 SMs
