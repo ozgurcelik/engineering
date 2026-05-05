@@ -6,6 +6,11 @@ import triton.language as tl
 from triton.runtime import driver
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
+# Number of SMs on the active GPU. The persistent kernel below caps its
+# launch grid at this value: launching more programs than SMs only adds
+# scheduling overhead, since the persistent loop already lets each
+# program walk through as many output tiles as it needs.
+NUM_SMS = torch.cuda.get_device_properties(DEVICE).multi_processor_count
 # %%
 # calculate each element of the result matrix separately by loading each element of A and B once
 @triton.jit
@@ -808,6 +813,101 @@ def matrix_multiplication_pointer(a: torch.Tensor, b: torch.Tensor):
     return c
 
 
+
+@triton.autotune(
+    configs=get_autotune_configs(),
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def matrix_multiplication_persistent_kernel(
+    a_ptr, b_ptr, c_ptr,
+    M, N, K,
+    a_row_stride, b_row_stride, c_row_stride,
+    a_col_stride, b_col_stride, c_col_stride,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    pid_start = tl.program_id(0)
+    p_count = tl.num_programs(0)
+
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_total = num_pid_m * num_pid_n
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+
+    # Loop-invariant stride assumes hoisted out of the persistent loop.
+    tl.assume(a_row_stride > 0)
+    tl.assume(a_col_stride > 0)
+    tl.assume(b_row_stride > 0)
+    tl.assume(b_col_stride > 0)
+    tl.assume(c_row_stride > 0)
+    tl.assume(c_col_stride > 0)
+
+    # Persistent loop: each of the p_count launched programs sweeps every
+    # `p_count`-th tile of the output. The launcher caps p_count at NUM_SMS,
+    # which is the entire point -- otherwise this degenerates to one tile
+    # per program and the loop wrapper buys nothing.
+    for pid in range(pid_start, num_pid_total, p_count):
+
+        group_id = pid // num_pid_in_group
+        first_pid_m = group_id * GROUP_SIZE_M
+        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+
+        local_pid = pid % num_pid_in_group
+        pid_m = first_pid_m + (local_pid % group_size_m)
+        pid_n = local_pid // group_size_m
+
+        tl.assume(pid_m >= 0)
+        tl.assume(pid_n >= 0)
+
+        offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+        offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+        offs_k = tl.arange(0, BLOCK_SIZE_K)
+
+
+        a_ptrs = a_ptr + (offs_am[:, None] * a_row_stride + offs_k[None, :] * a_col_stride)
+        b_ptrs = b_ptr + (offs_k[:, None] * b_row_stride + offs_bn[None, :] * b_col_stride)
+
+        acc = tl.zeros([BLOCK_SIZE_M, BLOCK_SIZE_N], dtype=tl.float32)
+        for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+            a_vals = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
+            b_vals = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+
+            acc = tl.dot(a_vals, b_vals, acc)
+
+            a_ptrs += BLOCK_SIZE_K * a_col_stride
+            b_ptrs += BLOCK_SIZE_K * b_row_stride
+
+        offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        c_ptrs = c_ptr + offs_cm[:, None] * c_row_stride + offs_cn[None, :] * c_col_stride
+        c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+        tl.store(c_ptrs, acc.to(tl.float16), mask=c_mask)
+
+
+def matrix_multiplication_persistent(a: torch.Tensor, b: torch.Tensor):
+    M, K = a.shape
+    K, N = b.shape
+    c = torch.empty(M, N, device=DEVICE, dtype=a.dtype)
+    # Cap the grid at NUM_SMS. If the workload is tiny enough that there are
+    # fewer output tiles than SMs, drop to that smaller number so we don't
+    # launch programs whose persistent loop would execute zero iterations.
+    grid = lambda META: (
+        min(
+            NUM_SMS,
+            triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']),
+        ),
+    )
+    matrix_multiplication_persistent_kernel[grid](
+        a, b, c, M, N, K,
+        a.stride(0), b.stride(0), c.stride(0),
+        a.stride(1), b.stride(1), c.stride(1),
+    )
+    return c
+
+
 # %%
 # Correctness check, in fp16. We compare against an fp32 reference so the
 # tolerances bound rounding from accumulating fp16 products into fp32 and
@@ -823,6 +923,7 @@ c_triton_tiled = matrix_multiplication_tiled(a, b)
 c_triton_tiled_supergrouped = matrix_multiplication_tiled_supergrouped(a, b)
 c_triton_autotuned = matrix_multiplication_autotuned(a, b)
 c_triton_pointer = matrix_multiplication_pointer(a, b)
+c_triton_persistent = matrix_multiplication_persistent(a, b)
 c_torch = torch.matmul(a.to(torch.float32), b.to(torch.float32)).to(torch.float16)
 assert torch.allclose(c_triton, c_torch, atol=1e-2, rtol=1e-2), (c_triton, c_torch)
 assert torch.allclose(c_triton_blocked, c_torch, atol=1e-2, rtol=1e-2), (c_triton_blocked, c_torch)
@@ -831,6 +932,7 @@ assert torch.allclose(c_triton_tiled, c_torch, atol=1e-1, rtol=1e-1), (c_triton_
 assert torch.allclose(c_triton_tiled_supergrouped, c_torch, atol=1e-1, rtol=1e-1), (c_triton_tiled_supergrouped, c_torch)
 assert torch.allclose(c_triton_autotuned, c_torch, atol=1e-1, rtol=1e-1), (c_triton_autotuned, c_torch)
 assert torch.allclose(c_triton_pointer, c_torch, atol=1e-1, rtol=1e-1), (c_triton_pointer, c_torch)
+assert torch.allclose(c_triton_persistent, c_torch, atol=1e-1, rtol=1e-1), (c_triton_persistent, c_torch)
 # %%
 # Benchmark in fp16: plain tiled (2D grid) vs supergrouped (1D grid) vs torch.
 # Both Triton kernels use the same block sizes (64x64x64) and Triton's
@@ -869,6 +971,7 @@ assert torch.allclose(c_triton_pointer, c_torch, atol=1e-1, rtol=1e-1), (c_trito
             'triton_tiled_supergrouped',
             'triton_autotuned',
             'triton_pointer',
+            'triton_persistent',
             'torch',
         ],
         line_names=[
@@ -876,9 +979,10 @@ assert torch.allclose(c_triton_pointer, c_torch, atol=1e-1, rtol=1e-1), (c_trito
             "Triton Supergrouped (1D grid)",
             "Triton Autotuned (supergrouped + autotune)",
             "Triton Pointer (autotuned + ptr-advance + modulo mask)",
+            "Triton Persistent (pointer + persistent NUM_SMS-grid)",
             "Torch (fp16, cuBLAS)",
         ],
-        styles=[('orange', '-'), ('blue', '-'), ('red', '-'), ('purple', '-'), ('green', '-')],
+        styles=[('orange', '-'), ('blue', '-'), ('red', '-'), ('purple', '-'), ('brown', '-'), ('green', '-')],
         ylabel="TFLOPS",
         plot_name="matmul-performance-fp16",
         args={},
@@ -898,6 +1002,8 @@ def benchmark(M, N, K, provider):
         ms = triton.testing.do_bench(lambda: matrix_multiplication_autotuned(a, b))
     if provider == 'triton_pointer':
         ms = triton.testing.do_bench(lambda: matrix_multiplication_pointer(a, b))
+    if provider == 'triton_persistent':
+        ms = triton.testing.do_bench(lambda: matrix_multiplication_persistent(a, b))
     # FLOPs for matmul: 2 * M * N * K (one multiply + one add per output element per K dim)
     tflops = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)
     return tflops(ms)
