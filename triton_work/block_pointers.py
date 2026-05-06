@@ -27,6 +27,7 @@ def weighted_sum_fwd(
     # - The ND coordinates of the starting block, i.e., "offsets"
     # - The block shape to use load/store at a time
     # - The order of the dimensions in memory from major to minor
+    # (1,0) means row major. meaning for a 2D MxN matrix, the strides are (N,1)
     # axes (= np.argsort(strides)) for optimizations, especially useful on H100
     x_block_ptr = tl.make_block_ptr(
         x_ptr,
