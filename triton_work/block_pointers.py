@@ -485,6 +485,129 @@ def matrix_multiply_fwd(
 
     tl.store(output_block_ptr, acc.to(tl.float16), boundary_check=(0, 1))
 
+"""
+Backwards pass for matrix-matrix multiply
+=========================================
+
+Forward op:
+
+    f : R^{m x d} x R^{d x n}  ->  R^{m x n}
+    f(A, B) = A B = C
+    c_{ij} = sum_{k=1..d} a_{ik} b_{kj}
+
+Upstream gradient handed to us by autograd:
+
+    g_{ij} := dL / dc_{ij},      so  G in R^{m x n}  has the same shape as C.
+
+Goal: compute  grad_A L  in R^{m x d}  and  grad_B L  in R^{d x n}.
+
+----------------------------------------------------------------------
+Gradient w.r.t. A   (shape m x d, same as A)
+----------------------------------------------------------------------
+L depends on a_{ij} only through C, so the chain rule sums over every
+entry of C:
+
+    dL / da_{ij} = sum_{k=1..m} sum_{l=1..n} g_{kl} * (dc_{kl} / da_{ij})
+
+To find dc_{kl} / da_{ij}, write c_{kl} explicitly and differentiate:
+
+    c_{kl} = sum_{p=1..d} a_{kp} b_{pl}
+
+    dc_{kl} / da_{ij} = sum_p (da_{kp} / da_{ij}) * b_{pl}
+                     = sum_p delta_{ki} delta_{pj} * b_{pl}
+                     = delta_{ki} * b_{jl}
+
+Two things to notice:
+  * k is pinned to i (delta_{ki}). Row i of A only contributes to row i
+    of C, so the outer sum over k collapses.
+  * l is NOT pinned. a_{ij} appears in every column l of row i of C
+    (with coefficient b_{jl}), so a sum over l survives.
+
+Plugging back in:
+
+    dL / da_{ij} = sum_l g_{il} * b_{jl}
+
+----------------------------------------------------------------------
+Gradient w.r.t. B   (shape d x n, same as B)
+----------------------------------------------------------------------
+Same recipe, differentiating w.r.t. b_{ij} this time:
+
+    dc_{kl} / db_{ij} = sum_p a_{kp} * (db_{pl} / db_{ij})
+                     = sum_p a_{kp} * delta_{pi} delta_{lj}
+                     = a_{ki} * delta_{lj}
+
+Now l is pinned (to j) and k stays free, exactly mirroring the A case:
+
+    dL / db_{ij} = sum_k g_{kj} * a_{ki}
+
+The asymmetry between the two pinned indices (k pinned for grad_A,
+l pinned for grad_B) is exactly why grad_A reduces over n while
+grad_B reduces over m.
+
+----------------------------------------------------------------------
+Turning indexed sums into matrix products
+----------------------------------------------------------------------
+The matrix product convention is
+
+    (X Y)_{ij} = sum_l X_{il} Y_{lj}
+
+i.e., the SUMMED index sits in the second slot of the left factor and
+the first slot of the right factor; free index i is far left, free
+index j is far right. To rewrite an indexed sum as a matrix product,
+transpose any factor whose summed index is in the wrong slot.
+
+Case A:  dL / da_{ij} = sum_l g_{il} * b_{jl}
+  * g_{il}: summed index l is in slot 2  -> already correct.
+  * b_{jl}: summed index l is in slot 2, but as the right factor we
+            need l in slot 1. Transpose: b_{jl} = (B^T)_{lj}.
+  * Result: sum_l g_{il} (B^T)_{lj} = (G B^T)_{ij}.
+
+Case B:  dL / db_{ij} = sum_k g_{kj} * a_{ki}
+  Reorder for clarity:  sum_k a_{ki} * g_{kj}.
+  * a_{ki}: summed index k is in slot 1, but as the left factor we
+            need k in slot 2. Transpose: a_{ki} = (A^T)_{ik}.
+  * g_{kj}: summed index k is in slot 1 -> already correct.
+  * Result: sum_k (A^T)_{ik} g_{kj} = (A^T G)_{ij}.
+
+----------------------------------------------------------------------
+Final formulas
+----------------------------------------------------------------------
+    grad_A L  =  G B^T          # (m, n) @ (n, d) -> (m, d)
+    grad_B L  =  A^T G          # (d, m) @ (m, n) -> (d, n)
+
+Shape-based shortcut: once you know it must be a product of two of
+{G, A, B} (with optional transpose) producing the right shape, there
+is only one such combination for each gradient. This is how most
+people remember the formulas in practice -- but the index derivation
+above is what justifies it.
+
+----------------------------------------------------------------------
+Implementation notes for the Triton kernels
+----------------------------------------------------------------------
+Both backwards are themselves matmuls, so the tl.dot skeleton from
+matrix_multiply_fwd carries over almost unchanged. Two important
+asymmetries to plan around:
+
+  * grad_A = G B^T  has output shape (m, d) and reduces over n.
+    Tile (m, d), inner loop over n.
+
+  * grad_B = A^T G  has output shape (d, n) and reduces over m.
+    Tile (d, n), inner loop over m.
+
+Because the reduction axes differ, the optimal tile shapes and grid
+launches differ, and production code typically uses TWO separate
+kernels rather than trying to compute both in one launch. Each
+program writes a disjoint output tile, so neither needs atomics or
+partial buffers (unlike the grad_w case in weighted_sum_backward,
+where every program contributed to every entry of grad_w).
+"""
+
+@triton.jit
+def matrix_multiply_backward(
+    a_ptr, b_ptr,
+    grad_output_ptr,
+    
+
 # %%
 class MatrixMultiplyFunc(torch.autograd.Function):
     @staticmethod
