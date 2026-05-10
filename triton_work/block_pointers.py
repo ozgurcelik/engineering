@@ -419,3 +419,154 @@ if __name__ == "__main__":
     print("OK: Triton weighted sum backward matches torch reference.")
 
 # %%
+@triton.jit
+def matrix_multiply_fwd(
+    a_ptr, b_ptr,
+    output_ptr,
+    a_stride_row, a_stride_col,
+    b_stride_row, b_stride_col,
+    output_stride_row, output_stride_col,
+    M, N, K,
+    M_TILE_SIZE: tl.constexpr, N_TILE_SIZE: tl.constexpr, K_TILE_SIZE: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    row_program_count = tl.cdiv(M, M_TILE_SIZE)
+    col_program_count = tl.cdiv(N, N_TILE_SIZE)
+    total_program_count = row_program_count * col_program_count
+    total_program_count_in_group = GROUP_SIZE_M * col_program_count
+
+    local_group_id = pid // total_program_count_in_group    
+    local_group_start_row = local_group_id * GROUP_SIZE_M
+    local_group_size = min(GROUP_SIZE_M, row_program_count - local_group_start_row)
+
+    local_pid = pid % total_program_count_in_group
+    local_pid_m = local_group_start_row + (local_pid % local_group_size)
+    local_pid_n = (local_pid // local_group_size)
+
+    a_block_ptr = tl.make_block_ptr(
+        a_ptr,
+        shape=(M, K),
+        strides=(a_stride_row, a_stride_col),
+        offsets=(local_pid_m * M_TILE_SIZE, 0),
+        block_shape=(M_TILE_SIZE, K_TILE_SIZE),
+        order=(1,0),
+    )
+
+    b_block_ptr = tl.make_block_ptr(
+        b_ptr,
+        shape=(K, N),
+        strides=(b_stride_row, b_stride_col),
+        offsets=(0, local_pid_n * N_TILE_SIZE),
+        block_shape=(K_TILE_SIZE, N_TILE_SIZE),
+        order=(1,0),
+    )
+
+    output_block_ptr = tl.make_block_ptr(
+        output_ptr,
+        shape=(M, N),
+        strides=(output_stride_row, output_stride_col),
+        offsets=(local_pid_m * M_TILE_SIZE, local_pid_n * N_TILE_SIZE),
+        block_shape=(M_TILE_SIZE, N_TILE_SIZE),
+        order=(1,0),
+    )
+
+    acc = tl.zeros((M_TILE_SIZE, N_TILE_SIZE), dtype=tl.float32)
+
+    for k in range(0, tl.cdiv(K, K_TILE_SIZE)):
+        a_vals = tl.load(a_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        b_vals = tl.load(b_block_ptr, boundary_check=(0, 1), padding_option="zero")
+
+        acc = tl.dot(a_vals, b_vals, acc)
+
+        a_block_ptr = tl.advance(a_block_ptr, (0, K_TILE_SIZE))
+        b_block_ptr = tl.advance(b_block_ptr, (K_TILE_SIZE, 0))
+
+    tl.store(output_block_ptr, acc.to(tl.float16), boundary_check=(0, 1))
+
+# %%
+class MatrixMultiplyFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, a, b):
+        M, K = a.shape
+        K, N = b.shape
+
+        ctx.save_for_backward(a, b)
+
+        assert len(a.shape) == 2 and len(b.shape) == 2, "Expected 2D tensors"
+        assert a.shape[1] == b.shape[0], "Dimension mismatch"
+        assert a.is_cuda and b.is_cuda, "Expected CUDA tensors"
+        assert a.is_contiguous() and b.is_contiguous(), "Expected contiguous tensors"
+
+        ctx.M_TILE_SIZE = 16
+        ctx.N_TILE_SIZE = 16
+        ctx.K_TILE_SIZE = 16
+        ctx.GROUP_SIZE_M = 2
+
+        ctx.M = M
+        ctx.N = N
+        ctx.K = K
+
+        output = torch.empty((M, N), device=a.device, dtype=a.dtype)
+
+        grid = triton.cdiv(M, ctx.M_TILE_SIZE) * triton.cdiv(N, ctx.N_TILE_SIZE)
+        matrix_multiply_fwd[(grid,)](
+            a, b,
+            output,
+            a.stride(0), a.stride(1),
+            b.stride(0), b.stride(1),
+            output.stride(0), output.stride(1),
+            M=M, N=N, K=K,
+            M_TILE_SIZE=ctx.M_TILE_SIZE, N_TILE_SIZE=ctx.N_TILE_SIZE, K_TILE_SIZE=ctx.K_TILE_SIZE,
+            GROUP_SIZE_M=ctx.GROUP_SIZE_M,
+        )
+
+        return output
+
+
+# %%
+# Correctness check for the MatrixMultiplyFunc forward pass.
+# The kernel uses tl.dot (which prefers fp16/bf16 inputs) and casts the
+# fp32 accumulator down to fp16 on store, so we test against fp16 inputs.
+if __name__ == "__main__":
+    torch.manual_seed(0)
+
+    shapes = [
+        (64, 64, 64),       # all dims aligned to tile sizes (16)
+        (128, 256, 64),     # rectangular, all aligned
+        (67, 129, 73),      # all dims unaligned -> exercises boundary checks
+        (16, 16, 16),       # single tile
+    ]
+
+    for M, K, N in shapes:
+        a = torch.randn(M, K, device="cuda", dtype=torch.float16)
+        b = torch.randn(K, N, device="cuda", dtype=torch.float16)
+
+        out_triton = MatrixMultiplyFunc.apply(a, b)
+        out_torch = (a.float() @ b.float()).to(torch.float16)
+
+        assert out_triton.shape == out_torch.shape, (
+            f"shape mismatch for ({M},{K})x({K},{N}): "
+            f"{out_triton.shape} vs {out_torch.shape}"
+        )
+        assert out_triton.dtype == torch.float16, f"dtype mismatch: {out_triton.dtype}"
+
+        max_abs_err = (out_triton.float() - out_torch.float()).abs().max().item()
+        denom = out_torch.float().abs().clamp(min=1e-3)
+        max_rel_err = ((out_triton.float() - out_torch.float()).abs() / denom).max().item()
+        print(
+            f"matmul ({M:>4},{K:>4})x({K:>4},{N:>4})  "
+            f"max abs err: {max_abs_err:.3e}  max rel err: {max_rel_err:.3e}"
+        )
+
+        # fp16 accumulation tolerance scales with K (more terms summed).
+        atol = 1e-2 * max(1.0, K / 64)
+        rtol = 1e-2
+        torch.testing.assert_close(
+            out_triton.float(), out_torch.float(), atol=atol, rtol=rtol
+        )
+
+    print("OK: MatrixMultiplyFunc forward matches torch reference.")
+
+# %%
