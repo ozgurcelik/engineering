@@ -600,13 +600,224 @@ kernels rather than trying to compute both in one launch. Each
 program writes a disjoint output tile, so neither needs atomics or
 partial buffers (unlike the grad_w case in weighted_sum_backward,
 where every program contributed to every entry of grad_w).
+
+----------------------------------------------------------------------
+Implementation Details
+----------------------------------------------------------------------
+Both backward kernels reuse the SAME skeleton as matrix_multiply_fwd:
+
+  1. Identify the two FREE axes of the output (those that index a
+     distinct output cell) and the ONE REDUCTION axis (the index being
+     summed over inside one program).
+  2. Launch a 2D grid over the free axes. Each program owns one tile
+     of the output and writes it exactly once -- no atomics, no
+     partial buffers.
+  3. Inside one program, loop along the reduction axis. Each iteration
+     loads a tile from each operand, runs tl.dot into a register-
+     resident accumulator, and advances both operand block pointers
+     along the reduction axis.
+  4. After the loop, store the accumulator once.
+
+Mapping that template onto the two backward matmuls:
+
+    grad_A = G B^T          output (M, K)    reduction over N
+    grad_B = A^T G          output (K, N)    reduction over M
+
+So grad_A_backward launches a (cdiv(M, M_TILE), cdiv(K, K_TILE)) grid
+with an inner loop over N, and grad_B_backward launches a
+(cdiv(K, K_TILE), cdiv(N, N_TILE)) grid with an inner loop over M.
+
+----------------------------------------------------------------------
+Picking offsets: the "free vs reduction" rule
+----------------------------------------------------------------------
+Every axis of every block pointer in these kernels is either a FREE
+axis of the output (the program owns one tile of it) or the REDUCTION
+axis (the loop sweeps it). The offset rule follows immediately:
+
+    free axis       -> offset = pid_? * TILE_SIZE
+                       (this program owns a specific tile of that axis)
+    reduction axis  -> offset = 0
+                       (the loop starts at the beginning and walks
+                        down via tl.advance)
+
+You never have to "compute" an offset -- classify each axis and read
+the rule off. block_shape always uses the TILE_SIZE for both axes;
+the offset just says where the tile starts.
+
+----------------------------------------------------------------------
+Transposes WITHOUT copying: the "logical view" trick
+----------------------------------------------------------------------
+grad_A wants B^T and grad_B wants A^T. Materializing either as a new
+tensor would double the memory traffic. Instead, we describe a
+transposed *view* of the existing memory by swapping the (shape,
+strides) pair handed to tl.make_block_ptr.
+
+The key abstraction: tl.make_block_ptr's (shape, strides) tuple
+defines a LOGICAL VIEW over the underlying pointer. Every OTHER
+argument -- offsets, block_shape, order, and the tuple passed to
+tl.advance -- is then expressed in the LOGICAL coordinates of that
+view, NOT in the physical layout of the source tensor.
+
+Concretely, if B has shape (K, N) with strides (s_row, s_col), to
+view it as B^T of shape (N, K) you write:
+
+    shape   = (N, K)            # logical: B^T has rows = N, cols = K
+    strides = (s_col, s_row)    # logical axis 0 (N) walks B's columns;
+                                # logical axis 1 (K) walks B's rows
+    order   = argsort(strides)  # which logical axis is most contiguous
+
+After that, every offset / block_shape / advance is in the (n, k)
+coordinates of B^T, and you can ignore the physical (k, n) layout of
+B entirely. The block pointer translates each logical (n, k) coord
+into the address  base + n*s_col + k*s_row, which equals B[k, n].
+
+`order` is the small subtlety. Triton expects axes listed from most
+contiguous (smallest stride) to least contiguous (largest stride),
+so order = np.argsort(strides) on whatever strides tuple you just
+wrote. For row-major B with physical strides (N, 1), the transposed
+view has logical strides (1, N) -> order = (0, 1). For B itself the
+strides are (N, 1) -> order = (1, 0). Same rule, applied to whichever
+strides tuple you handed to make_block_ptr.
+
+----------------------------------------------------------------------
+Side-by-side: how the offset rule plays out
+----------------------------------------------------------------------
+With grid convention "pid_0 indexes the first free axis of the
+output, pid_1 indexes the second":
+
+                   | view shape | axis 0 off | axis 1 off
+  -----------------+------------+------------+------------
+  grad_A_backward:
+    g_block_ptr    | (M, N)     | pid_0*M_T  | 0  (reduce)
+    b_block_ptr ^T | (N, K)     | 0 (reduce) | pid_1*K_T
+    grad_a_block   | (M, K)     | pid_0*M_T  | pid_1*K_T
+  -----------------+------------+------------+------------
+  grad_B_backward:
+    a_block_ptr ^T | (K, M)     | pid_0*K_T  | 0  (reduce)
+    g_block_ptr    | (M, N)     | 0 (reduce) | pid_1*N_T
+    grad_b_block   | (K, N)     | pid_0*K_T  | pid_1*N_T
+
+Notice the symmetry: every operand block pointer has exactly ONE
+"pid*TILE" entry (its free axis, owned by the program) and ONE "0"
+entry (its reduction axis, which the loop sweeps). The output block
+pointer always has TWO "pid*TILE" entries because both axes are free.
+
+The corresponding tl.advance calls walk only the reduction axis:
+
+    grad_A:  g_block_ptr  advance (0,      N_TILE)   # N is axis 1 of G
+             b_block_ptr  advance (N_TILE, 0)        # N is axis 0 of B^T
+    grad_B:  a_block_ptr  advance (0,      M_TILE)   # M is axis 1 of A^T
+             g_block_ptr  advance (M_TILE, 0)        # M is axis 0 of G
+
+Output block pointers are written once at the end of the loop and
+never advanced.
 """
 
 @triton.jit
-def matrix_multiply_backward(
-    a_ptr, b_ptr,
-    grad_output_ptr,
-    
+def grad_A_backward(
+    g_ptr, b_ptr, # g_ptr is (M, N) and b_ptr is (K, N)
+    grad_a_ptr, # grad_a_ptr is (M, K)
+    g_stride_row, g_stride_col,
+    b_stride_row, b_stride_col,
+    grad_a_stride_row, grad_a_stride_col,
+    M, N, K,
+    M_TILE_SIZE: tl.constexpr, N_TILE_SIZE: tl.constexpr, K_TILE_SIZE: tl.constexpr,
+):
+    pid_0 = tl.program_id(0)
+    pid_1 = tl.program_id(1)
+
+    g_block_ptr = tl.make_block_ptr(
+        g_ptr,
+        shape=(M, N),
+        strides=(g_stride_row, g_stride_col),
+        offsets=(pid_0 * M_TILE_SIZE, 0),
+        block_shape=(M_TILE_SIZE, N_TILE_SIZE),
+        order=(1,0),
+    )
+
+    b_block_ptr = tl.make_block_ptr(
+        b_ptr,
+        shape=(N,K),
+        strides=(b_stride_col, b_stride_row),
+        offsets=(0, pid_1 * K_TILE_SIZE),
+        block_shape=(N_TILE_SIZE, K_TILE_SIZE),
+        order=(0,1),
+    )
+
+    grad_a_block_ptr = tl.make_block_ptr(
+        grad_a_ptr,
+        shape=(M, K),
+        strides=(grad_a_stride_row, grad_a_stride_col),
+        offsets=(pid_0 * M_TILE_SIZE, pid_1 * K_TILE_SIZE),
+        block_shape=(M_TILE_SIZE, K_TILE_SIZE),
+        order=(1,0),
+    )
+
+    acc = tl.zeros((M_TILE_SIZE, K_TILE_SIZE), dtype=tl.float32)
+
+    for n in range(0, tl.cdiv(N, N_TILE_SIZE)):
+        g_vals = tl.load(g_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        b_vals = tl.load(b_block_ptr, boundary_check=(0, 1), padding_option="zero")
+
+        acc = tl.dot(g_vals, b_vals, acc)
+
+        g_block_ptr = tl.advance(g_block_ptr, (0, N_TILE_SIZE))
+        b_block_ptr = tl.advance(b_block_ptr, (N_TILE_SIZE, 0))
+
+    tl.store(grad_a_block_ptr, acc.to(tl.float16), boundary_check=(0, 1))
+        
+@triton.jit
+def grad_B_backward(
+    a_ptr, g_ptr, # a_ptr is (M, K) and g_ptr is (M, N)
+    grad_b_ptr, # grad_b_ptr is (K, N)
+    a_stride_row, a_stride_col,
+    g_stride_row, g_stride_col,
+    grad_b_stride_row, grad_b_stride_col,
+    M, N, K,
+    M_TILE_SIZE: tl.constexpr, N_TILE_SIZE: tl.constexpr, K_TILE_SIZE: tl.constexpr,
+):
+    pid_0 = tl.program_id(0)
+    pid_1 = tl.program_id(1)
+
+    a_block_ptr = tl.make_block_ptr(
+        a_ptr,
+        shape=(K, M),
+        strides=(a_stride_col, a_stride_row),
+        offsets=(pid_0 * K_TILE_SIZE, 0),
+        block_shape=(K_TILE_SIZE, M_TILE_SIZE),
+        order=(0,1),
+    )
+
+    g_block_ptr = tl.make_block_ptr(
+        g_ptr,
+        shape=(M, N),
+        strides=(g_stride_row, g_stride_col),
+        offsets=(0, pid_1 * N_TILE_SIZE),
+        block_shape=(M_TILE_SIZE, N_TILE_SIZE),
+        order=(1,0),
+    )
+
+    grad_b_block_ptr = tl.make_block_ptr(
+        grad_b_ptr,
+        shape=(K, N),
+        strides=(grad_b_stride_row, grad_b_stride_col),
+        offsets=(pid_0 * K_TILE_SIZE, pid_1 * N_TILE_SIZE),
+        block_shape=(K_TILE_SIZE, N_TILE_SIZE),
+        order=(1,0),
+    )
+
+    acc = tl.zeros((K_TILE_SIZE, N_TILE_SIZE), dtype=tl.float32)
+
+    for m in range(0, tl.cdiv(M, M_TILE_SIZE)):
+        a_vals = tl.load(a_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        g_vals = tl.load(g_block_ptr, boundary_check=(0, 1), padding_option="zero")
+
+        acc = tl.dot(a_vals, g_vals, acc)
+
+        a_block_ptr = tl.advance(a_block_ptr, (0, M_TILE_SIZE))
+        g_block_ptr = tl.advance(g_block_ptr, (M_TILE_SIZE, 0))
+
+    tl.store(grad_b_block_ptr, acc.to(tl.float16), boundary_check=(0, 1))
 
 # %%
 class MatrixMultiplyFunc(torch.autograd.Function):
@@ -646,6 +857,48 @@ class MatrixMultiplyFunc(torch.autograd.Function):
         )
 
         return output
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        a, b = ctx.saved_tensors
+        M, N, K = ctx.M, ctx.N, ctx.K
+        M_TILE_SIZE = ctx.M_TILE_SIZE
+        N_TILE_SIZE = ctx.N_TILE_SIZE
+        K_TILE_SIZE = ctx.K_TILE_SIZE
+
+        # The kernels assume contiguous, row-major (M, N) layout for G.
+        grad_out = grad_out.contiguous()
+
+        grad_a = torch.empty_like(a)
+        grad_b = torch.empty_like(b)
+
+        # grad_A = G @ B^T   : output (M, K), reduce over N
+        # Grid is over the free axes (M, K); inner loop walks N.
+        grid_a = (triton.cdiv(M, M_TILE_SIZE), triton.cdiv(K, K_TILE_SIZE))
+        grad_A_backward[grid_a](
+            grad_out, b,
+            grad_a,
+            grad_out.stride(0), grad_out.stride(1),
+            b.stride(0), b.stride(1),
+            grad_a.stride(0), grad_a.stride(1),
+            M=M, N=N, K=K,
+            M_TILE_SIZE=M_TILE_SIZE, N_TILE_SIZE=N_TILE_SIZE, K_TILE_SIZE=K_TILE_SIZE,
+        )
+
+        # grad_B = A^T @ G   : output (K, N), reduce over M
+        # Grid is over the free axes (K, N); inner loop walks M.
+        grid_b = (triton.cdiv(K, K_TILE_SIZE), triton.cdiv(N, N_TILE_SIZE))
+        grad_B_backward[grid_b](
+            a, grad_out,
+            grad_b,
+            a.stride(0), a.stride(1),
+            grad_out.stride(0), grad_out.stride(1),
+            grad_b.stride(0), grad_b.stride(1),
+            M=M, N=N, K=K,
+            M_TILE_SIZE=M_TILE_SIZE, N_TILE_SIZE=N_TILE_SIZE, K_TILE_SIZE=K_TILE_SIZE,
+        )
+
+        return grad_a, grad_b
 
 
 # %%
@@ -691,5 +944,54 @@ if __name__ == "__main__":
         )
 
     print("OK: MatrixMultiplyFunc forward matches torch reference.")
+
+# %%
+# Correctness check for the MatrixMultiplyFunc backward pass.
+# Compares grad_A and grad_B from the Triton kernels against an autograd
+# reference. Both backward kernels accumulate in fp32 and cast the result
+# to fp16 on store, mirroring the forward kernel.
+if __name__ == "__main__":
+    torch.manual_seed(0)
+
+    for M, K, N in shapes:
+        a = torch.randn(M, K, device="cuda", dtype=torch.float16, requires_grad=True)
+        b = torch.randn(K, N, device="cuda", dtype=torch.float16, requires_grad=True)
+
+        # Independent leaf tensors for the reference graph; same values, fresh autograd state.
+        a_ref = a.detach().clone().requires_grad_(True)
+        b_ref = b.detach().clone().requires_grad_(True)
+
+        out_triton = MatrixMultiplyFunc.apply(a, b)
+        out_ref = a_ref @ b_ref
+
+        g = torch.randn_like(out_triton)
+
+        (ga_triton, gb_triton) = torch.autograd.grad(out_triton, (a, b), grad_outputs=g)
+        (ga_ref, gb_ref) = torch.autograd.grad(out_ref, (a_ref, b_ref), grad_outputs=g)
+
+        assert ga_triton.shape == ga_ref.shape == (M, K)
+        assert gb_triton.shape == gb_ref.shape == (K, N)
+        assert ga_triton.dtype == torch.float16 and gb_triton.dtype == torch.float16
+
+        ga_abs = (ga_triton.float() - ga_ref.float()).abs().max().item()
+        gb_abs = (gb_triton.float() - gb_ref.float()).abs().max().item()
+        print(
+            f"matmul backward ({M:>4},{K:>4})x({K:>4},{N:>4})  "
+            f"grad_a abs: {ga_abs:.3e}  grad_b abs: {gb_abs:.3e}"
+        )
+
+        # Tolerance scales with the reduction length: grad_a reduces over N,
+        # grad_b reduces over M. Longer reductions accumulate more fp16 error.
+        rtol = 1e-2
+        atol_a = 1e-2 * max(1.0, N / 64)
+        atol_b = 1e-2 * max(1.0, M / 64)
+        torch.testing.assert_close(
+            ga_triton.float(), ga_ref.float(), atol=atol_a, rtol=rtol
+        )
+        torch.testing.assert_close(
+            gb_triton.float(), gb_ref.float(), atol=atol_b, rtol=rtol
+        )
+
+    print("OK: MatrixMultiplyFunc backward matches torch reference.")
 
 # %%
