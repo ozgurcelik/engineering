@@ -79,6 +79,66 @@ def matrix_multiplication_naive_blocked(a: torch.Tensor, b: torch.Tensor):
     matrix_multiplication_kernel_naive_blocked[(M, N)](a, b, c, M, N, K, a.stride(0), b.stride(0), c.stride(0), BLOCK_SIZE_K)
     return c
 
+"""
+====================================================================
+MEMORY COALESCING
+====================================================================
+
+Coalescing means: when the 32 lanes of a warp issue a load, the
+addresses they touch fall in the same (or a small number of) 128-byte
+cache lines, so the hardware can satisfy the warp with one wide
+transaction instead of 32 separate ones. The unit of coalescing is
+THE PROGRAM, not the grid -- different programs are different warps,
+so spatial locality across `program_id` does not buy coalescing.
+What does buy coalescing is: inside one program, the innermost axis
+of the tile you build with `tl.arange` / `make_block_ptr` should have
+stride 1 in memory. Triton maps the innermost tile axis to lane id,
+so stride-1 along that axis => one LDG.128 per warp.
+
+Why the two earlier kernels are NOT coalesced
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+matrix_multiplication_kernel_naive (single-element):
+    Loads are scalar (no `tl.arange`), one element per program. There
+    is no within-program vector to coalesce in the first place; the
+    warp issues 32 independent narrow loads. Maximally uncoalesced
+    by construction.
+
+matrix_multiplication_kernel_naive_blocked (1D K-block):
+    A is fine, B is the problem.
+    - a_ptrs = a_start_ptr + k_offsets
+        Stride 1 along K (row-major A) -> 128 contiguous fp16 elements
+        per warp = 256 B = 2 sectors. COALESCED.
+    - b_ptrs = b_start_ptr + k_offsets * b_row_stride
+        Walks DOWN a column of B with stride N. 128 lanes hit 128
+        different cache lines. FULLY UNCOALESCED gather on B.
+    This is the real reason the next kernel is faster, not "loading
+    blocks instead of scalars" -- it's flipping B's access from a
+    stride-N column gather to a stride-1 row-contiguous read.
+
+Why every kernel from naive_row_major onward IS coalesced
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Starting with matrix_multiplication_kernel_naive_row_major, every
+load and store is built so that its INNERMOST tile axis is the
+contiguous memory axis (stride 1) for row-major inputs:
+- A's inner tile axis is K, with a_col_stride == 1.
+- B's inner tile axis is N, with b_col_stride == 1.
+- C's inner tile axis is N, with c_col_stride == 1.
+Triton lays the innermost axis along lane id, so each warp emits one
+wide LDG / STG per tile row. Coalesced.
+
+The block-pointer kernel makes this intent explicit via order=(1, 0)
+on every make_block_ptr -- "axis 1 is the fastest-varying dim in
+memory" -- which is the canonical way to declare the coalescing
+contract to the compiler.
+
+Caveat: strides are runtime args, so the compiler can't prove
+a_col_stride == 1 at compile time. A free hint where you know the
+input is contiguous is `tl.assume(a_col_stride == 1)` (and similarly
+for B, C); it lets Triton commit to the widest vectorized load
+form rather than a more conservative fallback.
+"""
 
 # do it row major. load a row of A once in a kernel and calculate the entire row of the result matrix in one kernel
 @triton.jit
