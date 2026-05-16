@@ -1,5 +1,7 @@
 # %%
 import torch
+import triton
+import triton.language as tl
 
 def naive_softmax(x: torch.Tensor) -> torch.Tensor:
     """
@@ -31,6 +33,61 @@ def online_softmax_torch(x: torch.Tensor) -> torch.Tensor:
         y[:, i:i+1] = torch.exp(x[:, i:i+1] - z_max) / exp_sum
 
     return y
+
+"""
+Imagine z vector. Then softmax(z_i) = exp(z_i) / sum(exp(z_j)) for j = 1 to N.
+But, this can be unstablized due to overflow. So, we write it as:
+
+softmax(z_i) = exp(z_i - max_z) / sum(exp(z_j - max_z)) for j = 1 to N.
+
+where max_z is the maximum element in the vector.
+
+This is stable because the exp(z_j - max_z) terms are all less than 1, so the sum of the exp(z_j - max_z) terms is less than N.
+
+Now, say that m_i is the maximum element in the vector from start to i.
+And d_i is the sum of the exp(z_j - max_i) for j = 1 to i.
+So, d_N = sum(exp(z_j - max_N)) for j = 1 to N which is the denominator of the softmax function.
+
+d_i = \sum_{j=1}^{i} exp(z_j - max_i)
+= \sum_{j=1}^{i-1} exp(z_j - max_i) + exp(z_i - max_i)
+= \sum_{j=1}^{i-1} exp(z_j - max_i-1) * exp(max_i-1 - max_i) + exp(z_i - max_i)
+= d_{i-1} * exp(max_i-1 - max_i) + exp(z_i - max_i)
+
+"""
+
+@triton.jit
+def online_softmax_kernel(
+    x_ptr, y_ptr, # Input and output pointers. Both input and output are (M, N) matrices.
+    x_stride_row, x_stride_col,
+    y_stride_row, y_stride_col,
+    M, N,
+    BLOCK_SIZE_N: tl.constexpr,
+):
+    pid_start = tl.program_id(0)
+
+    x_block_ptr = tl.make_block_ptr(
+        x_ptr,
+        shape=(M, N),
+        strides=(x_stride_row, x_stride_col),
+        offsets=(pid_start, 0),
+        block_shape=(1, BLOCK_SIZE_N),
+        order=(1,0),
+    )
+
+    y_block_ptr = tl.make_block_ptr(
+        y_ptr,
+        shape=(M, N),
+        strides=(y_stride_row, y_stride_col),
+        offsets=(pid_start, 0),
+        block_shape=(1, BLOCK_SIZE_N),
+        order=(1,0),
+    )
+
+    d = 0.0
+    m = -float('inf')
+    
+
+    
 
 # %%
 if __name__ == "__main__":
