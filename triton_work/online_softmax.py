@@ -38,57 +38,99 @@ def online_softmax_fwd_kernel(
 ):
     pid_start = tl.program_id(0)
 
-    x_block_ptr = tl.make_block_ptr(
-        x_ptr,
-        shape=(M, N),
-        strides=(x_stride_row, x_stride_col),
-        offsets=(pid_start * BLOCK_SIZE_M, 0),
-        block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N),
-        order=(1,0),
-    )
-
-    y_block_ptr = tl.make_block_ptr(
-        y_ptr,
-        shape=(M, N),
-        strides=(y_stride_row, y_stride_col),
-        offsets=(pid_start * BLOCK_SIZE_M, 0),
-        block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N),
-        order=(1,0),
-    )
+    row_start = pid_start * BLOCK_SIZE_M
+    
+    m_offsets = tl.arange(0, BLOCK_SIZE_M) + row_start
+    m_mask = m_offsets < M
 
     d = tl.zeros((BLOCK_SIZE_M, 1), dtype=tl.float32)
     m = tl.full((BLOCK_SIZE_M, 1), -float('inf'), dtype=tl.float32)
     
     for i in range(tl.cdiv(N, BLOCK_SIZE_N)):
-        x_block = tl.load(x_block_ptr, boundary_check=(0, 1), padding_option="zero")
-        # Per-row max of this tile -> shape (BLOCK_SIZE_M, 1). `tl.max` is a
-        # reduction; `tl.maximum` is elementwise (no axis arg).
-        m_block = tl.max(x_block, axis=1, keep_dims=True)
-        # New running max across [tile so far, current tile].
-        m_new = tl.maximum(m, m_block)
-        # Rescale the running denominator into the new max, then add the
-        # contribution from the current tile (reduced to (BLOCK_SIZE_M, 1)).
-        d = d * tl.exp(m - m_new) + tl.sum(tl.exp(x_block - m_new), axis=1, keep_dims=True)
+        n_offsets = tl.arange(0, BLOCK_SIZE_N) + i * BLOCK_SIZE_N
+        n_mask = n_offsets < N
+
+        x_offsets = m_offsets[:, None] * x_stride_row + n_offsets[None, :] * x_stride_col # [BLOCK_SIZE_M, BLOCK_SIZE_N]
+
+        x_ptrs = x_ptr + x_offsets
+
+        shared_mask = m_mask[:, None] & n_mask[None, :]
+        
+        x_block = tl.load(x_ptrs, mask=shared_mask, other=-float('inf')) # [BLOCK_SIZE_M, BLOCK_SIZE_N]
+
+        m_block = tl.max(x_block, axis=1, keep_dims=True) # [BLOCK_SIZE_M, 1]
+        m_new = tl.maximum(m, m_block) # [BLOCK_SIZE_M, 1]
+        d = d * tl.exp(m - m_new) + tl.sum(tl.exp(x_block - m_new), axis=1, keep_dims=True) # [BLOCK_SIZE_M, 1]
         m = m_new
 
-        x_block_ptr = tl.advance(x_block_ptr, (0, BLOCK_SIZE_N))
-    
-    x_block_ptr = tl.make_block_ptr(
-        x_ptr,
-        shape=(M, N),
-        strides=(x_stride_row, x_stride_col),
-        offsets=(pid_start * BLOCK_SIZE_M, 0),
-        block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N),
-        order=(1,0),
-    )
-
     for i in range(tl.cdiv(N, BLOCK_SIZE_N)):
-        x_block = tl.load(x_block_ptr, boundary_check=(0, 1), padding_option="zero")
-        y_block = (tl.exp(x_block - m) / d).to(x_block.dtype)
-        tl.store(y_block_ptr, y_block, boundary_check=(0, 1))
+        n_offsets = tl.arange(0, BLOCK_SIZE_N) + i * BLOCK_SIZE_N
+        n_mask = n_offsets < N
 
-        x_block_ptr = tl.advance(x_block_ptr, (0, BLOCK_SIZE_N))
-        y_block_ptr = tl.advance(y_block_ptr, (0, BLOCK_SIZE_N))
+        x_offsets = m_offsets[:, None] * x_stride_row + n_offsets[None, :] * x_stride_col # [BLOCK_SIZE_M, BLOCK_SIZE_N]
+        y_offsets = m_offsets[:, None] * y_stride_row + n_offsets[None, :] * y_stride_col # [BLOCK_SIZE_M, BLOCK_SIZE_N]
+
+        x_ptrs = x_ptr + x_offsets
+        y_ptrs = y_ptr + y_offsets
+
+        shared_mask = m_mask[:, None] & n_mask[None, :]
+
+        x_block = tl.load(x_ptrs, mask=shared_mask, other=-float('inf')) # [BLOCK_SIZE_M, BLOCK_SIZE_N]
+        y_block = (tl.exp(x_block - m) / d).to(x_block.dtype) # [BLOCK_SIZE_M, BLOCK_SIZE_N]
+        tl.store(y_ptrs, y_block, mask=shared_mask)
+        
+
+    # x_block_ptr = tl.make_block_ptr(
+    #     x_ptr,
+    #     shape=(M, N),
+    #     strides=(x_stride_row, x_stride_col),
+    #     offsets=(pid_start * BLOCK_SIZE_M, 0),
+    #     block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N),
+    #     order=(1,0),
+    # )
+
+    # y_block_ptr = tl.make_block_ptr(
+    #     y_ptr,
+    #     shape=(M, N),
+    #     strides=(y_stride_row, y_stride_col),
+    #     offsets=(pid_start * BLOCK_SIZE_M, 0),
+    #     block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N),
+    #     order=(1,0),
+    # )
+
+    # d = tl.zeros((BLOCK_SIZE_M, 1), dtype=tl.float32)
+    # m = tl.full((BLOCK_SIZE_M, 1), -float('inf'), dtype=tl.float32)
+    
+    # for i in range(tl.cdiv(N, BLOCK_SIZE_N)):
+    #     x_block = tl.load(x_block_ptr, boundary_check=(0, 1), padding_option="zero")
+    #     # Per-row max of this tile -> shape (BLOCK_SIZE_M, 1). `tl.max` is a
+    #     # reduction; `tl.maximum` is elementwise (no axis arg).
+    #     m_block = tl.max(x_block, axis=1, keep_dims=True)
+    #     # New running max across [tile so far, current tile].
+    #     m_new = tl.maximum(m, m_block)
+    #     # Rescale the running denominator into the new max, then add the
+    #     # contribution from the current tile (reduced to (BLOCK_SIZE_M, 1)).
+    #     d = d * tl.exp(m - m_new) + tl.sum(tl.exp(x_block - m_new), axis=1, keep_dims=True)
+    #     m = m_new
+
+    #     x_block_ptr = tl.advance(x_block_ptr, (0, BLOCK_SIZE_N))
+    
+    # x_block_ptr = tl.make_block_ptr(
+    #     x_ptr,
+    #     shape=(M, N),
+    #     strides=(x_stride_row, x_stride_col),
+    #     offsets=(pid_start * BLOCK_SIZE_M, 0),
+    #     block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N),
+    #     order=(1,0),
+    # )
+
+    # for i in range(tl.cdiv(N, BLOCK_SIZE_N)):
+    #     x_block = tl.load(x_block_ptr, boundary_check=(0, 1), padding_option="zero")
+    #     y_block = (tl.exp(x_block - m) / d).to(x_block.dtype)
+    #     tl.store(y_block_ptr, y_block, boundary_check=(0, 1))
+
+    #     x_block_ptr = tl.advance(x_block_ptr, (0, BLOCK_SIZE_N))
+    #     y_block_ptr = tl.advance(y_block_ptr, (0, BLOCK_SIZE_N))
 
 """
 For the backward pass, assume we have dL/dy_j = gy_j. Then, we have:
