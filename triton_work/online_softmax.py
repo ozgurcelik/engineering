@@ -81,42 +81,38 @@ def online_softmax_fwd_kernel(
     m_offsets = tl.arange(0, BLOCK_SIZE_M) + row_start
     m_mask = m_offsets < M
 
+    n_offsets = tl.arange(0, BLOCK_SIZE_N)
+
+    x_offsets = m_offsets[:, None] * x_stride_row + n_offsets[None, :] * x_stride_col # [BLOCK_SIZE_M, BLOCK_SIZE_N]
+    y_offsets = m_offsets[:, None] * y_stride_row + n_offsets[None, :] * y_stride_col # [BLOCK_SIZE_M, BLOCK_SIZE_N]
+
+    x_ptrs = x_ptr + x_offsets
+    y_ptrs = y_ptr + y_offsets
+
     d = tl.zeros((BLOCK_SIZE_M, 1), dtype=tl.float32)
     m = tl.full((BLOCK_SIZE_M, 1), -float('inf'), dtype=tl.float32)
     
     for i in range(tl.cdiv(N, BLOCK_SIZE_N)):
-        n_offsets = tl.arange(0, BLOCK_SIZE_N) + i * BLOCK_SIZE_N
-        n_mask = n_offsets < N
-
-        x_offsets = m_offsets[:, None] * x_stride_row + n_offsets[None, :] * x_stride_col # [BLOCK_SIZE_M, BLOCK_SIZE_N]
-
-        x_ptrs = x_ptr + x_offsets
-
-        shared_mask = m_mask[:, None] & n_mask[None, :]
-        
-        x_block = tl.load(x_ptrs, mask=shared_mask, other=-float('inf')) # [BLOCK_SIZE_M, BLOCK_SIZE_N]
+        x_block = tl.load(x_ptrs, mask=n_offsets[None, :] < N - i * BLOCK_SIZE_N, other=-float('inf')) # [BLOCK_SIZE_M, BLOCK_SIZE_N]
 
         m_block = tl.max(x_block, axis=1, keep_dims=True) # [BLOCK_SIZE_M, 1]
         m_new = tl.maximum(m, m_block) # [BLOCK_SIZE_M, 1]
         d = d * tl.exp(m - m_new) + tl.sum(tl.exp(x_block - m_new), axis=1, keep_dims=True) # [BLOCK_SIZE_M, 1]
         m = m_new
 
+        x_ptrs += BLOCK_SIZE_N * x_stride_col
+
+    x_ptrs = x_ptr + x_offsets
+
     for i in range(tl.cdiv(N, BLOCK_SIZE_N)):
-        n_offsets = tl.arange(0, BLOCK_SIZE_N) + i * BLOCK_SIZE_N
-        n_mask = n_offsets < N
-
-        x_offsets = m_offsets[:, None] * x_stride_row + n_offsets[None, :] * x_stride_col # [BLOCK_SIZE_M, BLOCK_SIZE_N]
-        y_offsets = m_offsets[:, None] * y_stride_row + n_offsets[None, :] * y_stride_col # [BLOCK_SIZE_M, BLOCK_SIZE_N]
-
-        x_ptrs = x_ptr + x_offsets
-        y_ptrs = y_ptr + y_offsets
-
-        shared_mask = m_mask[:, None] & n_mask[None, :]
-
-        x_block = tl.load(x_ptrs, mask=shared_mask, other=-float('inf')) # [BLOCK_SIZE_M, BLOCK_SIZE_N]
+        x_block = tl.load(x_ptrs, mask=n_offsets[None, :] < N - i * BLOCK_SIZE_N, other=-float('inf')) # [BLOCK_SIZE_M, BLOCK_SIZE_N]
         y_block = (tl.exp(x_block - m) / d).to(x_block.dtype) # [BLOCK_SIZE_M, BLOCK_SIZE_N]
-        tl.store(y_ptrs, y_block, mask=shared_mask)
-        
+        tl.store(y_ptrs, y_block, mask=n_offsets[None, :] < N - i * BLOCK_SIZE_N)
+
+        x_ptrs += BLOCK_SIZE_N * x_stride_col
+        y_ptrs += BLOCK_SIZE_N * y_stride_col
+
+    
 
     # x_block_ptr = tl.make_block_ptr(
     #     x_ptr,
