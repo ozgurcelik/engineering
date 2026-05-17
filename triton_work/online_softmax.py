@@ -225,10 +225,42 @@ class OnlineSoftmaxFunc(torch.autograd.Function):
 
 
 # %%
+def _check(x_ref, x_mine, gy, atol, rtol, tag):
+    """Run one (fwd, bwd) parity check vs torch.softmax and print the result."""
+    y_ref = torch.softmax(x_ref, dim=1)
+    y_mine = OnlineSoftmaxFunc.apply(x_mine)
+    torch.testing.assert_close(y_mine, y_ref, atol=atol, rtol=rtol)
+
+    y_ref.backward(gy)
+    y_mine.backward(gy)
+    torch.testing.assert_close(x_mine.grad, x_ref.grad, atol=atol, rtol=rtol)
+
+    fwd_err = (y_mine - y_ref).abs().max().item()
+    bwd_err = (x_mine.grad - x_ref.grad).abs().max().item()
+    row_sums = y_mine.sum(dim=1)
+    print(
+        f"[OK] {tag} dtype={x_ref.dtype} shape={tuple(x_ref.shape)} "
+        f"fwd_max_abs_err={fwd_err:.2e} "
+        f"bwd_max_abs_err={bwd_err:.2e} "
+        f"row_sum_min={row_sums.min().item():.6f} "
+        f"row_sum_max={row_sums.max().item():.6f}"
+    )
+
+
 if __name__ == "__main__":
     torch.manual_seed(0)
 
-    shapes = [(1, 16), (4, 128), (32, 1024), (128, 4096)]
+    # Shapes where N is a multiple of BLOCK_SIZE_N=16: no padding on the last
+    # tile, so these only exercise the "happy path".
+    aligned_shapes = [(1, 16), (4, 128), (32, 1024), (128, 4096)]
+
+    # Shapes where N is NOT a multiple of BLOCK_SIZE_N=16. The last tile is
+    # padded along the reduction axis, which the forward kernel currently
+    # handles incorrectly: `padding_option="zero"` makes the OOB slots
+    # participate in both `tl.max` (line 66) and `tl.sum(exp(...))` (line 71).
+    # The bwd is fine in isolation but inherits the wrong `y` from fwd.
+    unaligned_shapes = [(1, 17), (4, 33), (32, 1000), (128, 4097)]
+
     dtypes = [torch.float32, torch.float16]
 
     for dtype in dtypes:
@@ -236,29 +268,43 @@ if __name__ == "__main__":
         # (e.g. 4096), accumulated rounding can reach a few ULPs of fp16, so
         # we allow ~5e-3 absolute/relative slack.
         atol, rtol = (1e-6, 1e-5) if dtype == torch.float32 else (5e-3, 5e-3)
-        for shape in shapes:
+
+        for shape in aligned_shapes:
             x_ref = torch.randn(shape, dtype=dtype, device=DEVICE, requires_grad=True)
             x_mine = x_ref.detach().clone().requires_grad_(True)
             gy = torch.randn(shape, dtype=dtype, device=DEVICE)
+            _check(x_ref, x_mine, gy, atol, rtol, tag="aligned")
 
-            y_ref = torch.softmax(x_ref, dim=1)
-            y_mine = OnlineSoftmaxFunc.apply(x_mine)
-            torch.testing.assert_close(y_mine, y_ref, atol=atol, rtol=rtol)
+        # Padding-trap test #1: N not divisible by BLOCK_SIZE_N. With
+        # randn-distributed x the row max is typically positive O(1), so each
+        # padded slot contributes ~exp(-1) ≈ 0.37 to the denominator. For
+        # e.g. shape=(1, 17) we have 16 - (17 % 16) = 15 padded slots, plenty
+        # to bust both fp32 and fp16 tolerances.
+        for shape in unaligned_shapes:
+            x_ref = torch.randn(shape, dtype=dtype, device=DEVICE, requires_grad=True)
+            x_mine = x_ref.detach().clone().requires_grad_(True)
+            gy = torch.randn(shape, dtype=dtype, device=DEVICE)
+            _check(x_ref, x_mine, gy, atol, rtol, tag="unaligned")
 
-            y_ref.backward(gy)
-            y_mine.backward(gy)
-            torch.testing.assert_close(x_mine.grad, x_ref.grad, atol=atol, rtol=rtol)
+        # Padding-trap test #2: all entries strongly negative. The true row
+        # max is < 0, but `padding_option="zero"` makes the padded slots the
+        # new running max, which corrupts `m` itself (not just `d`). This is
+        # the catastrophic version of the bug. Uses an unaligned N so the
+        # padded slots actually exist.
+        shape = (4, 17)
+        x_ref = (torch.randn(shape, dtype=dtype, device=DEVICE) - 10.0).requires_grad_(True)
+        x_mine = x_ref.detach().clone().requires_grad_(True)
+        gy = torch.randn(shape, dtype=dtype, device=DEVICE)
+        _check(x_ref, x_mine, gy, atol, rtol, tag="all-negative")
 
-            fwd_err = (y_mine - y_ref).abs().max().item()
-            bwd_err = (x_mine.grad - x_ref.grad).abs().max().item()
-            row_sums = y_mine.sum(dim=1)
-            print(
-                f"[OK] OnlineSoftmaxFunc dtype={dtype} shape={shape} "
-                f"fwd_max_abs_err={fwd_err:.2e} "
-                f"bwd_max_abs_err={bwd_err:.2e} "
-                f"row_sum_min={row_sums.min().item():.6f} "
-                f"row_sum_max={row_sums.max().item():.6f}"
-            )
+        # Padding-trap test #3: aligned N but the LAST FULL tile is still
+        # processed correctly. This one should pass even with the bug present,
+        # and serves as a control — if this fails, something else is wrong.
+        shape = (4, 32)
+        x_ref = (torch.randn(shape, dtype=dtype, device=DEVICE) - 10.0).requires_grad_(True)
+        x_mine = x_ref.detach().clone().requires_grad_(True)
+        gy = torch.randn(shape, dtype=dtype, device=DEVICE)
+        _check(x_ref, x_mine, gy, atol, rtol, tag="aligned-negative (control)")
 
     print("All correctness checks passed.")
 
