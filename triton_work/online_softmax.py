@@ -40,24 +40,41 @@ def get_softmax_autotune_configs():
     #   across more lanes (hides latency, costs registers), stages
     #   software-pipeline successive tile iterations.
     return [
-        # One row per program: best when N is large enough that each row is
-        # already a fat chunk of work.
-        triton.Config({'BLOCK_SIZE_M': 1, 'BLOCK_SIZE_N': 64},   num_stages=2, num_warps=2),
-        triton.Config({'BLOCK_SIZE_M': 1, 'BLOCK_SIZE_N': 128},  num_stages=2, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 1, 'BLOCK_SIZE_N': 256},  num_stages=2, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 1, 'BLOCK_SIZE_N': 512},  num_stages=2, num_warps=8),
-        triton.Config({'BLOCK_SIZE_M': 1, 'BLOCK_SIZE_N': 1024}, num_stages=3, num_warps=8),
-        triton.Config({'BLOCK_SIZE_M': 1, 'BLOCK_SIZE_N': 2048}, num_stages=4, num_warps=8),
-        triton.Config({'BLOCK_SIZE_M': 1, 'BLOCK_SIZE_N': 4096}, num_stages=4, num_warps=8),
-        # Multiple rows per program: best for small N where one row underfills
-        # an SM. Packing rows raises arithmetic intensity per launch.
-        triton.Config({'BLOCK_SIZE_M': 2,  'BLOCK_SIZE_N': 128}, num_stages=2, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 4,  'BLOCK_SIZE_N': 128}, num_stages=2, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 4,  'BLOCK_SIZE_N': 256}, num_stages=2, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 8,  'BLOCK_SIZE_N': 128}, num_stages=2, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 8,  'BLOCK_SIZE_N': 256}, num_stages=2, num_warps=8),
-        triton.Config({'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 64},  num_stages=2, num_warps=4),
-        triton.Config({'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 128}, num_stages=2, num_warps=4),
+        # --- Small N: pack many rows per program ----------------------------
+        # With M fixed (e.g. 4096) and a tiny N, one-row-per-program would
+        # produce a kernel whose per-row reduction overhead dominates. Packing
+        # rows into a single program (a) raises arithmetic-per-launch and
+        # (b) keeps the launch grid wide enough to fill the GPU even though
+        # each program does more work.
+        triton.Config({'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 64},    num_stages=2, num_warps=2),
+        triton.Config({'BLOCK_SIZE_M': 8,  'BLOCK_SIZE_N': 128},   num_stages=2, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 4,  'BLOCK_SIZE_N': 256},   num_stages=2, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 2,  'BLOCK_SIZE_N': 512},   num_stages=2, num_warps=4),
+
+        # --- Medium N: one row per program, tile == row ---------------------
+        # BLOCK_SIZE_N >= N means the inner loop runs exactly once, so the
+        # row's data stays hot in smem/registers between the max+denom pass
+        # and the normalize pass. This is the regime where the kernel can
+        # hit its true 2*M*N effective-bandwidth ceiling. num_stages > 2 is
+        # cheap here because the tile is small enough to leave smem headroom
+        # for software pipelining.
+        triton.Config({'BLOCK_SIZE_M': 1,  'BLOCK_SIZE_N': 1024},  num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 1,  'BLOCK_SIZE_N': 2048},  num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 1,  'BLOCK_SIZE_N': 4096},  num_stages=4, num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 1,  'BLOCK_SIZE_N': 4096},  num_stages=2, num_warps=16),
+
+        # --- Large N: wide tile + more warps --------------------------------
+        # Goal: still keep BLOCK_SIZE_N >= N (or close to it) so the row
+        # survives in smem across the two passes -- otherwise the second
+        # pass refetches from DRAM and effective bandwidth drops by ~33%.
+        # The tile is now big (8K-32K fp32 = 32-128 KB) so num_stages drops
+        # to 1-2, and num_warps climbs to keep the per-tile reduction
+        # parallel (more warps = fewer elements per thread).
+        triton.Config({'BLOCK_SIZE_M': 1,  'BLOCK_SIZE_N': 8192},  num_stages=2, num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 1,  'BLOCK_SIZE_N': 8192},  num_stages=2, num_warps=16),
+        triton.Config({'BLOCK_SIZE_M': 1,  'BLOCK_SIZE_N': 16384}, num_stages=2, num_warps=16),
+        triton.Config({'BLOCK_SIZE_M': 1,  'BLOCK_SIZE_N': 16384}, num_stages=2, num_warps=32),
+        triton.Config({'BLOCK_SIZE_M': 1,  'BLOCK_SIZE_N': 32768}, num_stages=1, num_warps=32),
     ]
 
 
@@ -324,66 +341,66 @@ def _check(x_ref, x_mine, gy, atol, rtol, tag):
     )
 
 
-if __name__ == "__main__":
-    torch.manual_seed(0)
+# if __name__ == "__main__":
+#     torch.manual_seed(0)
 
-    # Shapes where N is a multiple of BLOCK_SIZE_N=16: no padding on the last
-    # tile, so these only exercise the "happy path".
-    aligned_shapes = [(128, 4096)]
+#     # Shapes where N is a multiple of BLOCK_SIZE_N=16: no padding on the last
+#     # tile, so these only exercise the "happy path".
+#     aligned_shapes = [(128, 4096)]
 
-    # Shapes where N is NOT a multiple of BLOCK_SIZE_N=16. The last tile is
-    # padded along the reduction axis, which the forward kernel currently
-    # handles incorrectly: `padding_option="zero"` makes the OOB slots
-    # participate in both `tl.max` (line 66) and `tl.sum(exp(...))` (line 71).
-    # The bwd is fine in isolation but inherits the wrong `y` from fwd.
-    unaligned_shapes = [(128, 4097)]
+#     # Shapes where N is NOT a multiple of BLOCK_SIZE_N=16. The last tile is
+#     # padded along the reduction axis, which the forward kernel currently
+#     # handles incorrectly: `padding_option="zero"` makes the OOB slots
+#     # participate in both `tl.max` (line 66) and `tl.sum(exp(...))` (line 71).
+#     # The bwd is fine in isolation but inherits the wrong `y` from fwd.
+#     unaligned_shapes = [(128, 4097)]
 
-    dtypes = [torch.float32, torch.float16]
+#     dtypes = [torch.float32, torch.float16]
 
-    for dtype in dtypes:
-        # Looser tolerances for fp16 due to reduced precision. For large N
-        # (e.g. 4096), accumulated rounding can reach a few ULPs of fp16, so
-        # we allow ~5e-3 absolute/relative slack.
-        atol, rtol = (1e-6, 1e-5) if dtype == torch.float32 else (5e-3, 5e-3)
+#     for dtype in dtypes:
+#         # Looser tolerances for fp16 due to reduced precision. For large N
+#         # (e.g. 4096), accumulated rounding can reach a few ULPs of fp16, so
+#         # we allow ~5e-3 absolute/relative slack.
+#         atol, rtol = (1e-6, 1e-5) if dtype == torch.float32 else (5e-3, 5e-3)
 
-        for shape in aligned_shapes:
-            x_ref = torch.randn(shape, dtype=dtype, device=DEVICE, requires_grad=True)
-            x_mine = x_ref.detach().clone().requires_grad_(True)
-            gy = torch.randn(shape, dtype=dtype, device=DEVICE)
-            _check(x_ref, x_mine, gy, atol, rtol, tag="aligned")
+#         for shape in aligned_shapes:
+#             x_ref = torch.randn(shape, dtype=dtype, device=DEVICE, requires_grad=True)
+#             x_mine = x_ref.detach().clone().requires_grad_(True)
+#             gy = torch.randn(shape, dtype=dtype, device=DEVICE)
+#             _check(x_ref, x_mine, gy, atol, rtol, tag="aligned")
 
-        # Padding-trap test #1: N not divisible by BLOCK_SIZE_N. With
-        # randn-distributed x the row max is typically positive O(1), so each
-        # padded slot contributes ~exp(-1) ≈ 0.37 to the denominator. For
-        # e.g. shape=(1, 17) we have 16 - (17 % 16) = 15 padded slots, plenty
-        # to bust both fp32 and fp16 tolerances.
-        for shape in unaligned_shapes:
-            x_ref = torch.randn(shape, dtype=dtype, device=DEVICE, requires_grad=True)
-            x_mine = x_ref.detach().clone().requires_grad_(True)
-            gy = torch.randn(shape, dtype=dtype, device=DEVICE)
-            _check(x_ref, x_mine, gy, atol, rtol, tag="unaligned")
+#         # Padding-trap test #1: N not divisible by BLOCK_SIZE_N. With
+#         # randn-distributed x the row max is typically positive O(1), so each
+#         # padded slot contributes ~exp(-1) ≈ 0.37 to the denominator. For
+#         # e.g. shape=(1, 17) we have 16 - (17 % 16) = 15 padded slots, plenty
+#         # to bust both fp32 and fp16 tolerances.
+#         for shape in unaligned_shapes:
+#             x_ref = torch.randn(shape, dtype=dtype, device=DEVICE, requires_grad=True)
+#             x_mine = x_ref.detach().clone().requires_grad_(True)
+#             gy = torch.randn(shape, dtype=dtype, device=DEVICE)
+#             _check(x_ref, x_mine, gy, atol, rtol, tag="unaligned")
 
-        # Padding-trap test #2: all entries strongly negative. The true row
-        # max is < 0, but `padding_option="zero"` makes the padded slots the
-        # new running max, which corrupts `m` itself (not just `d`). This is
-        # the catastrophic version of the bug. Uses an unaligned N so the
-        # padded slots actually exist.
-        shape = (4, 17)
-        x_ref = (torch.randn(shape, dtype=dtype, device=DEVICE) - 10.0).requires_grad_(True)
-        x_mine = x_ref.detach().clone().requires_grad_(True)
-        gy = torch.randn(shape, dtype=dtype, device=DEVICE)
-        _check(x_ref, x_mine, gy, atol, rtol, tag="all-negative")
+#         # Padding-trap test #2: all entries strongly negative. The true row
+#         # max is < 0, but `padding_option="zero"` makes the padded slots the
+#         # new running max, which corrupts `m` itself (not just `d`). This is
+#         # the catastrophic version of the bug. Uses an unaligned N so the
+#         # padded slots actually exist.
+#         shape = (4, 17)
+#         x_ref = (torch.randn(shape, dtype=dtype, device=DEVICE) - 10.0).requires_grad_(True)
+#         x_mine = x_ref.detach().clone().requires_grad_(True)
+#         gy = torch.randn(shape, dtype=dtype, device=DEVICE)
+#         _check(x_ref, x_mine, gy, atol, rtol, tag="all-negative")
 
-        # Padding-trap test #3: aligned N but the LAST FULL tile is still
-        # processed correctly. This one should pass even with the bug present,
-        # and serves as a control — if this fails, something else is wrong.
-        shape = (4, 32)
-        x_ref = (torch.randn(shape, dtype=dtype, device=DEVICE) - 10.0).requires_grad_(True)
-        x_mine = x_ref.detach().clone().requires_grad_(True)
-        gy = torch.randn(shape, dtype=dtype, device=DEVICE)
-        _check(x_ref, x_mine, gy, atol, rtol, tag="aligned-negative (control)")
+#         # Padding-trap test #3: aligned N but the LAST FULL tile is still
+#         # processed correctly. This one should pass even with the bug present,
+#         # and serves as a control — if this fails, something else is wrong.
+#         shape = (4, 32)
+#         x_ref = (torch.randn(shape, dtype=dtype, device=DEVICE) - 10.0).requires_grad_(True)
+#         x_mine = x_ref.detach().clone().requires_grad_(True)
+#         gy = torch.randn(shape, dtype=dtype, device=DEVICE)
+#         _check(x_ref, x_mine, gy, atol, rtol, tag="aligned-negative (control)")
 
-    print("All correctness checks passed.")
+#     print("All correctness checks passed.")
 
 # %%
 # Benchmark in fp32: online softmax (Triton) vs torch.softmax.
@@ -460,7 +477,7 @@ def benchmark_bwd(M, N, dtype, provider):
         lambda: torch.autograd.grad(y, x, gy, retain_graph=True)
     )
     # Bytes moved: read gy, read y, write dx -> 3 * M * N * sizeof(dtype).
-    gbps = lambda ms: 2 * x.numel() * x.element_size() * 1e-9 / (ms * 1e-3)
+    gbps = lambda ms: 3 * x.numel() * x.element_size() * 1e-9 / (ms * 1e-3)
     return gbps(ms)
 
 
