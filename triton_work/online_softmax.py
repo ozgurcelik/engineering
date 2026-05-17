@@ -7,23 +7,23 @@ import triton.language as tl
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 """
-Imagine z vector. Then softmax(z_i) = exp(z_i) / sum(exp(z_j)) for j = 1 to N.
+Imagine x vector. Then softmax(x_i) = exp(x_i) / sum(exp(x_j)) for j = 1 to N.
 But, this can be unstablized due to overflow. So, we write it as:
 
-softmax(z_i) = exp(z_i - max_z) / sum(exp(z_j - max_z)) for j = 1 to N.
+softmax(x_i) = exp(x_i - max_x) / sum(exp(x_j - max_x)) for j = 1 to N.
 
-where max_z is the maximum element in the vector.
+where max_x is the maximum element in the vector.
 
-This is stable because the exp(z_j - max_z) terms are all less than 1, so the sum of the exp(z_j - max_z) terms is less than N.
+This is stable because the exp(x_j - max_x) terms are all less than 1, so the sum of the exp(x_j - max_x) terms is less than N.
 
 Now, say that m_i is the maximum element in the vector from start to i.
-And d_i is the sum of the exp(z_j - max_i) for j = 1 to i.
-So, d_N = sum(exp(z_j - max_N)) for j = 1 to N which is the denominator of the softmax function.
+And d_i is the sum of the exp(x_j - max_i) for j = 1 to i.
+So, d_N = sum(exp(x_j - max_N)) for j = 1 to N which is the denominator of the softmax function.
 
-d_i = \sum_{j=1}^{i} exp(z_j - max_i)
-= \sum_{j=1}^{i-1} exp(z_j - max_i) + exp(z_i - max_i)
-= \sum_{j=1}^{i-1} exp(z_j - max_i-1) * exp(max_i-1 - max_i) + exp(z_i - max_i)
-= d_{i-1} * exp(max_i-1 - max_i) + exp(z_i - max_i)
+d_i = \sum_{j=1}^{i} exp(x_j - max_i)
+= \sum_{j=1}^{i-1} exp(x_j - max_i) + exp(x_i - max_i)
+= \sum_{j=1}^{i-1} exp(x_j - max_i-1) * exp(max_i-1 - max_i) + exp(x_i - max_i)
+= d_{i-1} * exp(max_i-1 - max_i) + exp(x_i - max_i)
 
 """
 
@@ -90,71 +90,55 @@ def online_softmax_fwd_kernel(
         x_block_ptr = tl.advance(x_block_ptr, (0, BLOCK_SIZE_N))
         y_block_ptr = tl.advance(y_block_ptr, (0, BLOCK_SIZE_N))
 
-def online_softmax_fwd_triton(x: torch.Tensor) -> torch.Tensor:
-    M, N = x.shape
-    
-    BLOCK_SIZE_M = 1
-    BLOCK_SIZE_N = 16
-
-    y = torch.zeros_like(x)
-    online_softmax_fwd_kernel[(triton.cdiv(M, BLOCK_SIZE_M),)](
-        x, y,
-        x.stride(0), x.stride(1),
-        y.stride(0), y.stride(1),
-        M, N,
-        BLOCK_SIZE_M, BLOCK_SIZE_N,
-    )
-    return y
-
 """
-For the backward pass, assume we have dL/ds_j = g_j. Then, we have:
+For the backward pass, assume we have dL/dy_j = gy_j. Then, we have:
 
-dL/dz_i = \sum_{j=1}^{N} dL/ds_j * ds_j/dz_i
+dL/dx_i = \sum_{j=1}^{N} dL/dy_j * dy_j/dx_i
 with
-ds_j/dz_i = s_j(delta_ij - s_i)
+dy_j/dx_i = y_j(delta_ij - y_i)
 
 so
 
-dL/dz_i = \sum_{j=1}^{N} g_j * s_j(delta_ij - s_i)
-= g_i * s_i - s_i * \sum_{j=1}^{N} g_j * s_j
-= s_i * (g_i - \sum_{j=1}^{N} g_j * s_j)
+dL/dx_i = \sum_{j=1}^{N} gy_j * y_j(delta_ij - y_i)
+= gy_i * y_i - y_i * \sum_{j=1}^{N} gy_j * y_j
+= y_i * (gy_i - \sum_{j=1}^{N} gy_j * y_j)
 
 """
 
 @triton.jit
 def online_softmax_bwd_kernel(
-    g_ptr,
-    s_ptr,
-    x_ptr,
-    g_stride_row, g_stride_col,
-    s_stride_row, s_stride_col,
-    x_stride_row, x_stride_col,
+    gy_ptr,
+    y_ptr,
+    dx_ptr,
+    gy_stride_row, gy_stride_col,
+    y_stride_row, y_stride_col,
+    dx_stride_row, dx_stride_col,
     M, N,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
 ):
     pid_start = tl.program_id(0)
 
-    g_block_ptr = tl.make_block_ptr(
-        g_ptr,
+    gy_block_ptr = tl.make_block_ptr(
+        gy_ptr,
         shape=(M, N),
-        strides=(g_stride_row, g_stride_col),
+        strides=(gy_stride_row, gy_stride_col),
         offsets=(pid_start * BLOCK_SIZE_M, 0),
         block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N),
         order=(1,0),
     )
-    s_block_ptr = tl.make_block_ptr(
-        s_ptr,
+    y_block_ptr = tl.make_block_ptr(
+        y_ptr,
         shape=(M, N),
-        strides=(s_stride_row, s_stride_col),
+        strides=(y_stride_row, y_stride_col),
         offsets=(pid_start * BLOCK_SIZE_M, 0),
         block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N),
         order=(1,0),
     )
-    x_block_ptr = tl.make_block_ptr(
-        x_ptr,
+    dx_block_ptr = tl.make_block_ptr(
+        dx_ptr,
         shape=(M, N),
-        strides=(x_stride_row, x_stride_col),
+        strides=(dx_stride_row, dx_stride_col),
         offsets=(pid_start * BLOCK_SIZE_M, 0),
         block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N),
         order=(1,0),
@@ -162,41 +146,82 @@ def online_softmax_bwd_kernel(
     
     cum_sum = tl.zeros((BLOCK_SIZE_M, 1), dtype=tl.float32)
     for i in range(tl.cdiv(N, BLOCK_SIZE_N)):
-        g_block = tl.load(g_block_ptr, boundary_check=(0, 1), padding_option="zero")
-        s_block = tl.load(s_block_ptr, boundary_check=(0, 1), padding_option="zero")
-        cum_sum += tl.sum(g_block * s_block, axis=1, keep_dims=True)
+        gy_block = tl.load(gy_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        y_block = tl.load(y_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        cum_sum += tl.sum(gy_block * y_block, axis=1, keep_dims=True)
     
-        g_block_ptr = tl.advance(g_block_ptr, (0, BLOCK_SIZE_N))
-        s_block_ptr = tl.advance(s_block_ptr, (0, BLOCK_SIZE_N))
+        gy_block_ptr = tl.advance(gy_block_ptr, (0, BLOCK_SIZE_N))
+        y_block_ptr = tl.advance(y_block_ptr, (0, BLOCK_SIZE_N))
     
-    g_block_ptr = tl.make_block_ptr(
-        g_ptr,
+    gy_block_ptr = tl.make_block_ptr(
+        gy_ptr,
         shape=(M, N),
-        strides=(g_stride_row, g_stride_col),
+        strides=(gy_stride_row, gy_stride_col),
         offsets=(pid_start * BLOCK_SIZE_M, 0),
         block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N),
         order=(1,0),
     )
-    s_block_ptr = tl.make_block_ptr(
-        s_ptr,
+    y_block_ptr = tl.make_block_ptr(
+        y_ptr,
         shape=(M, N),
-        strides=(s_stride_row, s_stride_col),
+        strides=(y_stride_row, y_stride_col),
         offsets=(pid_start * BLOCK_SIZE_M, 0),
         block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N),
         order=(1,0),
     )
     
     for i in range(tl.cdiv(N, BLOCK_SIZE_N)):
-        g_block = tl.load(g_block_ptr, boundary_check=(0, 1), padding_option="zero")
-        s_block = tl.load(s_block_ptr, boundary_check=(0, 1), padding_option="zero")
-        x_block = s_block * (g_block - cum_sum)
-        tl.store(x_block_ptr, x_block, boundary_check=(0, 1))
+        gy_block = tl.load(gy_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        y_block = tl.load(y_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        dx_block = (y_block * (gy_block - cum_sum)).to(y_block.dtype)
+        tl.store(dx_block_ptr, dx_block, boundary_check=(0, 1))
 
-        g_block_ptr = tl.advance(g_block_ptr, (0, BLOCK_SIZE_N))
-        s_block_ptr = tl.advance(s_block_ptr, (0, BLOCK_SIZE_N))
-        x_block_ptr = tl.advance(x_block_ptr, (0, BLOCK_SIZE_N))
+        gy_block_ptr = tl.advance(gy_block_ptr, (0, BLOCK_SIZE_N))
+        y_block_ptr = tl.advance(y_block_ptr, (0, BLOCK_SIZE_N))
+        dx_block_ptr = tl.advance(dx_block_ptr, (0, BLOCK_SIZE_N))
 
+class OnlineSoftmaxFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        M, N = x.shape
 
+        BLOCK_SIZE_M = 1
+        BLOCK_SIZE_N = 16
+
+        y = torch.zeros_like(x)
+        online_softmax_fwd_kernel[(triton.cdiv(M, BLOCK_SIZE_M),)](
+            x, y,
+            x.stride(0), x.stride(1),
+            y.stride(0), y.stride(1),
+            M, N,
+            BLOCK_SIZE_M, BLOCK_SIZE_N,
+        )
+
+        ctx.save_for_backward(y)
+
+        return y
+
+    @staticmethod
+    def backward(ctx, gy: torch.Tensor) -> torch.Tensor:
+        y = ctx.saved_tensors[0]
+        M, N = y.shape
+
+        BLOCK_SIZE_M = 1
+        BLOCK_SIZE_N = 16
+
+        dx = torch.zeros_like(y)
+
+        online_softmax_bwd_kernel[(triton.cdiv(M, BLOCK_SIZE_M),)](
+            gy, y, dx,
+            gy.stride(0), gy.stride(1),
+            y.stride(0), y.stride(1),
+            dx.stride(0), dx.stride(1),
+            M, N,
+            BLOCK_SIZE_M, BLOCK_SIZE_N,
+        )
+
+        return dx
+    
 
 
 # %%
@@ -205,7 +230,6 @@ if __name__ == "__main__":
 
     shapes = [(1, 16), (4, 128), (32, 1024), (128, 4096)]
     dtypes = [torch.float32, torch.float16]
-    impls = [online_softmax_fwd_triton]
 
     for dtype in dtypes:
         # Looser tolerances for fp16 due to reduced precision. For large N
@@ -213,21 +237,28 @@ if __name__ == "__main__":
         # we allow ~5e-3 absolute/relative slack.
         atol, rtol = (1e-6, 1e-5) if dtype == torch.float32 else (5e-3, 5e-3)
         for shape in shapes:
-            x = torch.randn(shape, dtype=dtype, device=DEVICE)
-            ref = torch.softmax(x, dim=1)
+            x_ref = torch.randn(shape, dtype=dtype, device=DEVICE, requires_grad=True)
+            x_mine = x_ref.detach().clone().requires_grad_(True)
+            gy = torch.randn(shape, dtype=dtype, device=DEVICE)
 
-            for impl in impls:
-                mine = impl(x)
-                torch.testing.assert_close(mine, ref, atol=atol, rtol=rtol)
+            y_ref = torch.softmax(x_ref, dim=1)
+            y_mine = OnlineSoftmaxFunc.apply(x_mine)
+            torch.testing.assert_close(y_mine, y_ref, atol=atol, rtol=rtol)
 
-                max_abs_err = (mine - ref).abs().max().item()
-                row_sums = mine.sum(dim=1)
-                print(
-                    f"[OK] impl={impl.__name__} dtype={dtype} shape={shape} "
-                    f"max_abs_err={max_abs_err:.2e} "
-                    f"row_sum_min={row_sums.min().item():.6f} "
-                    f"row_sum_max={row_sums.max().item():.6f}"
-                )
+            y_ref.backward(gy)
+            y_mine.backward(gy)
+            torch.testing.assert_close(x_mine.grad, x_ref.grad, atol=atol, rtol=rtol)
+
+            fwd_err = (y_mine - y_ref).abs().max().item()
+            bwd_err = (x_mine.grad - x_ref.grad).abs().max().item()
+            row_sums = y_mine.sum(dim=1)
+            print(
+                f"[OK] OnlineSoftmaxFunc dtype={dtype} shape={shape} "
+                f"fwd_max_abs_err={fwd_err:.2e} "
+                f"bwd_max_abs_err={bwd_err:.2e} "
+                f"row_sum_min={row_sums.min().item():.6f} "
+                f"row_sum_max={row_sums.max().item():.6f}"
+            )
 
     print("All correctness checks passed.")
 
@@ -237,7 +268,9 @@ if __name__ == "__main__":
 # Softmax is memory-bound: each element is read once and written once, with a
 # small amount of arithmetic in between (max + exp + sum + div). The relevant
 # throughput metric is therefore effective DRAM bandwidth in GB/s, not TFLOPS.
-# For an (M, N) input in fp32 we move 2 * M * N * 4 bytes per call.
+# For an (M, N) input in fp32 the forward moves 2 * M * N * 4 bytes per call
+# (read x, write y); the backward moves 3 * M * N * 4 bytes per call (read gy,
+# read y, write dx).
 #
 # We hold M fixed (so each row of work is well-sized for the SM) and sweep N,
 # which is both the reduction dimension of softmax and the per-row working set.
@@ -256,21 +289,58 @@ if __name__ == "__main__":
         ],
         styles=[('blue', '-'), ('green', '-')],
         ylabel='GB/s',
-        plot_name='softmax-performance-fp32',
+        plot_name='softmax-fwd-performance-fp32',
         args={'M': 4096, 'dtype': torch.float32},
     ))
-def benchmark(M, N, dtype, provider):
+def benchmark_fwd(M, N, dtype, provider):
     x = torch.randn((M, N), device=DEVICE, dtype=dtype)
     stream = getattr(torch, DEVICE.type).Stream()
     getattr(torch, DEVICE.type).set_stream(stream)
     if provider == 'torch':
         ms = triton.testing.do_bench(lambda: torch.softmax(x, dim=1))
     if provider == 'triton':
-        ms = triton.testing.do_bench(lambda: online_softmax_fwd_triton(x))
+        ms = triton.testing.do_bench(lambda: OnlineSoftmaxFunc.apply(x))
     # Bytes moved: read x once, write y once -> 2 * M * N * sizeof(dtype).
     gbps = lambda ms: 2 * x.numel() * x.element_size() * 1e-9 / (ms * 1e-3)
     return gbps(ms)
 
 
-benchmark.run(show_plots=True, print_data=True)
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=['N'],
+        x_vals=[128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768],
+        line_arg='provider',
+        line_vals=['triton', 'torch'],
+        line_names=[
+            'Triton (online_softmax bwd)',
+            'Torch (torch.softmax bwd)',
+        ],
+        styles=[('blue', '-'), ('green', '-')],
+        ylabel='GB/s',
+        plot_name='softmax-bwd-performance-fp32',
+        args={'M': 4096, 'dtype': torch.float32},
+    ))
+def benchmark_bwd(M, N, dtype, provider):
+    x = torch.randn((M, N), device=DEVICE, dtype=dtype, requires_grad=True)
+    gy = torch.randn((M, N), device=DEVICE, dtype=dtype)
+    stream = getattr(torch, DEVICE.type).Stream()
+    getattr(torch, DEVICE.type).set_stream(stream)
+
+    # Build the autograd graph once outside the timed loop, then only time the
+    # backward pass itself via torch.autograd.grad with retain_graph=True.
+    if provider == 'torch':
+        y = torch.softmax(x, dim=1)
+    else:
+        y = OnlineSoftmaxFunc.apply(x)
+
+    ms = triton.testing.do_bench(
+        lambda: torch.autograd.grad(y, x, gy, retain_graph=True)
+    )
+    # Bytes moved: read gy, read y, write dx -> 3 * M * N * sizeof(dtype).
+    gbps = lambda ms: 3 * x.numel() * x.element_size() * 1e-9 / (ms * 1e-3)
+    return gbps(ms)
+
+
+benchmark_fwd.run(show_plots=True, print_data=True)
+benchmark_bwd.run(show_plots=True, print_data=True)
 # %%
