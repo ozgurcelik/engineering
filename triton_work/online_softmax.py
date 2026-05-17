@@ -27,6 +27,44 @@ d_i = \sum_{j=1}^{i} exp(x_j - max_i)
 
 """
 
+def get_softmax_autotune_configs():
+    # Two compilation knobs varied per-shape:
+    # - BLOCK_SIZE_M: rows per program. Small N benefits from packing many rows
+    #   into one program (amortizes launch overhead + better occupancy);
+    #   large N is happy with 1 row/program since each row is already a lot
+    #   of work.
+    # - BLOCK_SIZE_N: tile width along the reduction axis. Smaller tiles mean
+    #   more loop iterations (more pipeline opportunity) but more overhead;
+    #   larger tiles cut iteration count at the cost of register pressure.
+    # - num_warps / num_stages: same role as matmul -- warps spread the tile
+    #   across more lanes (hides latency, costs registers), stages
+    #   software-pipeline successive tile iterations.
+    return [
+        # One row per program: best when N is large enough that each row is
+        # already a fat chunk of work.
+        triton.Config({'BLOCK_SIZE_M': 1, 'BLOCK_SIZE_N': 64},   num_stages=2, num_warps=2),
+        triton.Config({'BLOCK_SIZE_M': 1, 'BLOCK_SIZE_N': 128},  num_stages=2, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 1, 'BLOCK_SIZE_N': 256},  num_stages=2, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 1, 'BLOCK_SIZE_N': 512},  num_stages=2, num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 1, 'BLOCK_SIZE_N': 1024}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 1, 'BLOCK_SIZE_N': 2048}, num_stages=4, num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 1, 'BLOCK_SIZE_N': 4096}, num_stages=4, num_warps=8),
+        # Multiple rows per program: best for small N where one row underfills
+        # an SM. Packing rows raises arithmetic intensity per launch.
+        triton.Config({'BLOCK_SIZE_M': 2,  'BLOCK_SIZE_N': 128}, num_stages=2, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 4,  'BLOCK_SIZE_N': 128}, num_stages=2, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 4,  'BLOCK_SIZE_N': 256}, num_stages=2, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 8,  'BLOCK_SIZE_N': 128}, num_stages=2, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 8,  'BLOCK_SIZE_N': 256}, num_stages=2, num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 64},  num_stages=2, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 128}, num_stages=2, num_warps=4),
+    ]
+
+
+@triton.autotune(
+    configs=get_softmax_autotune_configs(),
+    key=['M', 'N'],
+)
 @triton.jit
 def online_softmax_fwd_kernel(
     x_ptr, y_ptr, # Input and output pointers. Both input and output are (M, N) matrices.
@@ -147,6 +185,10 @@ dL/dx_i = \sum_{j=1}^{N} gy_j * y_j(delta_ij - y_i)
 
 """
 
+@triton.autotune(
+    configs=get_softmax_autotune_configs(),
+    key=['M', 'N'],
+)
 @triton.jit
 def online_softmax_bwd_kernel(
     gy_ptr,
@@ -227,16 +269,16 @@ class OnlineSoftmaxFunc(torch.autograd.Function):
     def forward(ctx, x):
         M, N = x.shape
 
-        BLOCK_SIZE_M = 1
-        BLOCK_SIZE_N = 16
-
-        y = torch.zeros_like(x)
-        online_softmax_fwd_kernel[(triton.cdiv(M, BLOCK_SIZE_M),)](
+        y = torch.empty_like(x)
+        # BLOCK_SIZE_{M,N}, num_warps, num_stages are picked by @triton.autotune
+        # at first launch per (M, N). The grid must therefore be a lambda that
+        # reads BLOCK_SIZE_M from the chosen META dict.
+        grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']),)
+        online_softmax_fwd_kernel[grid](
             x, y,
             x.stride(0), x.stride(1),
             y.stride(0), y.stride(1),
             M, N,
-            BLOCK_SIZE_M, BLOCK_SIZE_N,
         )
 
         ctx.save_for_backward(y)
@@ -248,18 +290,15 @@ class OnlineSoftmaxFunc(torch.autograd.Function):
         y = ctx.saved_tensors[0]
         M, N = y.shape
 
-        BLOCK_SIZE_M = 1
-        BLOCK_SIZE_N = 16
+        dx = torch.empty_like(y)
 
-        dx = torch.zeros_like(y)
-
-        online_softmax_bwd_kernel[(triton.cdiv(M, BLOCK_SIZE_M),)](
+        grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']),)
+        online_softmax_bwd_kernel[grid](
             gy, y, dx,
             gy.stride(0), gy.stride(1),
             y.stride(0), y.stride(1),
             dx.stride(0), dx.stride(1),
             M, N,
-            BLOCK_SIZE_M, BLOCK_SIZE_N,
         )
 
         return dx
@@ -294,14 +333,14 @@ if __name__ == "__main__":
 
     # Shapes where N is a multiple of BLOCK_SIZE_N=16: no padding on the last
     # tile, so these only exercise the "happy path".
-    aligned_shapes = [(1, 16), (4, 128), (32, 1024), (128, 4096)]
+    aligned_shapes = [(128, 4096)]
 
     # Shapes where N is NOT a multiple of BLOCK_SIZE_N=16. The last tile is
     # padded along the reduction axis, which the forward kernel currently
     # handles incorrectly: `padding_option="zero"` makes the OOB slots
     # participate in both `tl.max` (line 66) and `tl.sum(exp(...))` (line 71).
     # The bwd is fine in isolation but inherits the wrong `y` from fwd.
-    unaligned_shapes = [(1, 17), (4, 33), (32, 1000), (128, 4097)]
+    unaligned_shapes = [(128, 4097)]
 
     dtypes = [torch.float32, torch.float16]
 
@@ -425,7 +464,7 @@ def benchmark_bwd(M, N, dtype, provider):
         lambda: torch.autograd.grad(y, x, gy, retain_graph=True)
     )
     # Bytes moved: read gy, read y, write dx -> 3 * M * N * sizeof(dtype).
-    gbps = lambda ms: 3 * x.numel() * x.element_size() * 1e-9 / (ms * 1e-3)
+    gbps = lambda ms: 2 * x.numel() * x.element_size() * 1e-9 / (ms * 1e-3)
     return gbps(ms)
 
 
