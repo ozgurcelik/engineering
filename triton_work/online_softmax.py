@@ -110,7 +110,9 @@ def online_softmax_fwd_kernel(
     m = tl.full((BLOCK_SIZE_M, 1), -float('inf'), dtype=tl.float32)
     
     for i in range(tl.cdiv(N, BLOCK_SIZE_N)):
-        x_block = tl.load(x_ptrs, mask=n_offsets[None, :] < N - i * BLOCK_SIZE_N, other=-float('inf')) # [BLOCK_SIZE_M, BLOCK_SIZE_N]
+        col_mask = n_offsets[None, :] < N - i * BLOCK_SIZE_N
+        tile_mask = col_mask & m_mask[:, None]
+        x_block = tl.load(x_ptrs, mask=tile_mask, other=-float('inf')) # [BLOCK_SIZE_M, BLOCK_SIZE_N]
 
         m_block = tl.max(x_block, axis=1, keep_dims=True) # [BLOCK_SIZE_M, 1]
         m_new = tl.maximum(m, m_block) # [BLOCK_SIZE_M, 1]
@@ -122,9 +124,11 @@ def online_softmax_fwd_kernel(
     x_ptrs = x_ptr + x_offsets
 
     for i in range(tl.cdiv(N, BLOCK_SIZE_N)):
-        x_block = tl.load(x_ptrs, mask=n_offsets[None, :] < N - i * BLOCK_SIZE_N, other=-float('inf')) # [BLOCK_SIZE_M, BLOCK_SIZE_N]
+        col_mask = n_offsets[None, :] < N - i * BLOCK_SIZE_N
+        tile_mask = col_mask & m_mask[:, None]
+        x_block = tl.load(x_ptrs, mask=tile_mask, other=-float('inf')) # [BLOCK_SIZE_M, BLOCK_SIZE_N]
         y_block = (tl.exp(x_block - m) / d).to(x_block.dtype) # [BLOCK_SIZE_M, BLOCK_SIZE_N]
-        tl.store(y_ptrs, y_block, mask=n_offsets[None, :] < N - i * BLOCK_SIZE_N)
+        tl.store(y_ptrs, y_block, mask=tile_mask)
 
         x_ptrs += BLOCK_SIZE_N * x_stride_col
         y_ptrs += BLOCK_SIZE_N * y_stride_col
