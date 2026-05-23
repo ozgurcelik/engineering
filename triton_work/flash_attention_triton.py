@@ -81,6 +81,10 @@ def flash_fwd_kernel(
         Kj = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero") # (K_TILE_SIZE, D)
         Vj = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero") # (K_TILE_SIZE, D)
         Sij = tl.dot(Qi, Kj.T) * scale # (Q_TILE_SIZE, K_TILE_SIZE)
+        # Mask padded key positions so they don't contribute to softmax.
+        # Kj/Vj are zero-padded, so without this mask exp(0)=1 would leak weight.
+        k_offsets = j * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
+        Sij = tl.where(k_offsets[None, :] < N_KEYS, Sij, -float('inf'))
         mi_new = tl.maximum(mi, tl.max(Sij, axis=-1)) # (Q_TILE_SIZE,)
         Pij = tl.exp(Sij - mi_new[:, None]) # (Q_TILE_SIZE, K_TILE_SIZE)
         alpha = tl.exp(mi - mi_new) # (Q_TILE_SIZE,)
@@ -177,3 +181,4 @@ def check_forward_correctness():
 
 if __name__ == "__main__":
     check_forward_correctness()
+# %%
