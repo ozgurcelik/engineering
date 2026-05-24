@@ -19,6 +19,7 @@ def flash_fwd_kernel(
     D: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr,
     K_TILE_SIZE: tl.constexpr,
+    is_causal: tl.constexpr,
 ):
     # Program indices
     query_tile_index = tl.program_id(0)
@@ -71,7 +72,24 @@ def flash_fwd_kernel(
         order=(0,),
     )
 
-    Tk = tl.cdiv(N_KEYS, K_TILE_SIZE)
+    # For causal attention, key tiles whose smallest key index is already past
+    # the largest query index in this query tile would have Sij entirely masked
+    # to -inf -- which is a no-op for the running (mi, li, Oi) state but still
+    # costs two tl.loads, a tl.dot, and the mask/exp work. Tightening the loop
+    # bound to skip those tiles cuts work roughly in half for causal and is
+    # what makes causal attention actually faster than full attention.
+    if is_causal:
+        # Last reachable key index for this query tile is
+        #   (query_tile_index + 1) * Q_TILE_SIZE - 1,
+        # so the number of key tiles we need to visit is
+        #   ceil(((query_tile_index + 1) * Q_TILE_SIZE) / K_TILE_SIZE).
+        # Also clamp to the actual number of key tiles so we don't run past N_KEYS.
+        Tk = tl.minimum(
+            tl.cdiv((query_tile_index + 1) * Q_TILE_SIZE, K_TILE_SIZE),
+            tl.cdiv(N_KEYS, K_TILE_SIZE),
+        )
+    else:
+        Tk = tl.cdiv(N_KEYS, K_TILE_SIZE)
     Qi = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero") # (Q_TILE_SIZE, D)
     Oi = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)
     li = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)
@@ -85,6 +103,12 @@ def flash_fwd_kernel(
         # Kj/Vj are zero-padded, so without this mask exp(0)=1 would leak weight.
         k_offsets = j * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
         Sij = tl.where(k_offsets[None, :] < N_KEYS, Sij, -float('inf'))
+        if is_causal:
+            # for causal attention, we need to mask the future keys
+            # so, we only keep q >= k positions
+            q_offsets = query_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
+            mask = q_offsets[:, None] >= k_offsets[None, :]  # (Q_TILE_SIZE, K_TILE_SIZE)
+            Sij = tl.where(mask, Sij, -float('inf'))
         mi_new = tl.maximum(mi, tl.max(Sij, axis=-1)) # (Q_TILE_SIZE,)
         Pij = tl.exp(Sij - mi_new[:, None]) # (Q_TILE_SIZE, K_TILE_SIZE)
         alpha = tl.exp(mi - mi_new) # (Q_TILE_SIZE,)
@@ -101,8 +125,9 @@ def flash_fwd_kernel(
 
 class FlashAttentionFunc(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, Q, K, V):
+    def forward(ctx, Q, K, V, is_causal=False):
         ctx.save_for_backward(Q, K, V)
+        ctx.is_causal = is_causal
         Bq, Bk = 16, 16
         B, N_queries, D = Q.shape
         N_keys = K.shape[1]
@@ -122,6 +147,7 @@ class FlashAttentionFunc(torch.autograd.Function):
             scale,
             D,
             Bq, Bk,
+            is_causal,
         )
         ctx.save_for_backward(O, L)
         return O
@@ -132,10 +158,20 @@ class FlashAttentionFunc(torch.autograd.Function):
 
 
 # %%
-def naive_attention(Q, K, V):
-    """Reference non-causal scaled dot-product attention."""
+def naive_attention(Q, K, V, is_causal=False):
+    """Reference scaled dot-product attention.
+
+    When `is_causal` is True, position `k` is masked out for query `q` whenever
+    `k > q` (matches the kernel's absolute-position convention).
+    """
     d = Q.shape[-1]
     S = torch.einsum("bqd,bkd->bqk", Q, K) / math.sqrt(d)
+    if is_causal:
+        Nq, Nk = Q.shape[1], K.shape[1]
+        q_idx = torch.arange(Nq, device=Q.device)
+        k_idx = torch.arange(Nk, device=Q.device)
+        causal_mask = q_idx[:, None] >= k_idx[None, :]  # (Nq, Nk)
+        S = S.masked_fill(~causal_mask, float("-inf"))
     P = torch.softmax(S, dim=-1)
     return torch.einsum("bqk,bkd->bqd", P, V)
 
@@ -162,18 +198,19 @@ def check_forward_correctness():
         K = torch.randn(B, Nk, D, device=device, dtype=dtype)
         V = torch.randn(B, Nk, D, device=device, dtype=dtype)
 
-        O_ref = naive_attention(Q, K, V)
-        O_triton = FlashAttentionFunc.apply(Q, K, V)
+        for is_causal in (False, True):
+            O_ref = naive_attention(Q, K, V, is_causal=is_causal)
+            O_triton = FlashAttentionFunc.apply(Q, K, V, is_causal)
 
-        max_abs = (O_ref - O_triton).abs().max().item()
-        mean_abs = (O_ref - O_triton).abs().mean().item()
-        ok = torch.allclose(O_ref, O_triton, atol=atol, rtol=rtol)
-        all_ok &= ok
-        status = "PASS" if ok else "FAIL"
-        print(
-            f"[{status}] B={B} Nq={Nq} Nk={Nk} D={D} | "
-            f"max_abs_err={max_abs:.3e} mean_abs_err={mean_abs:.3e}"
-        )
+            max_abs = (O_ref - O_triton).abs().max().item()
+            mean_abs = (O_ref - O_triton).abs().mean().item()
+            ok = torch.allclose(O_ref, O_triton, atol=atol, rtol=rtol)
+            all_ok &= ok
+            status = "PASS" if ok else "FAIL"
+            print(
+                f"[{status}] causal={is_causal} B={B} Nq={Nq} Nk={Nk} D={D} | "
+                f"max_abs_err={max_abs:.3e} mean_abs_err={mean_abs:.3e}"
+            )
 
     print("\nOverall:", "ALL TESTS PASSED" if all_ok else "SOME TESTS FAILED")
     return all_ok
