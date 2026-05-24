@@ -4,6 +4,25 @@ import triton.language as tl
 import torch
 import math
 
+"""
+Goal: fuse the three steps of attention
+    S = Q @ K^T
+    P = softmax(S)
+    O = P @ V
+into a single kernel. The naive version is three kernel launches and
+the intermediates S and P are O(N^2), so they get fully materialized
+in HBM and reread by the next launch. Fusing means Sij and Pij stay
+in registers / SRAM and never touch HBM.
+
+Why the inner loop over Tk:
+Doing it "in one go" would require the full K of shape (N_keys, D)
+and the full Sij of shape (Q_TILE_SIZE, N_keys) to live in registers/SRAM
+simultaneously, which blows the on-chip budget for any realistic seq len.
+So we can't run offline softmax (which needs all of Sij to take max ->
+exp -> normalize). Instead we use *online* softmax: process one key
+tile at a time and fold each chunk into a running (mi, li, Oi) state.
+The Tk loop is the form that online recurrence takes.
+"""
 
 @triton.jit
 def flash_fwd_kernel(
