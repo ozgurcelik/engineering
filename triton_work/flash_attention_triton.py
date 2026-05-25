@@ -326,6 +326,151 @@ def flash_bwd_dq_kernel(
     tl.store(dQ_block_ptr, dQi.to(dQ_block_ptr.type.element_ty), boundary_check=(0, 1))
     
 
+@triton.jit
+def flash_bwd_dkv_kernel(
+    Q_ptr, K_ptr, V_ptr,
+    dO_ptr, D_ptr, L_ptr,
+    dK_ptr, dV_ptr,
+    stride_qb, stride_qq, stride_qd,
+    stride_kb, stride_kk, stride_kd,
+    stride_vb, stride_vk, stride_vd,
+    stride_dOb, stride_dOq, stride_dOd,
+    stride_db, stride_dq,
+    stride_lb, stride_lq,
+    stride_dKb, stride_dKq, stride_dKd,
+    stride_dVb, stride_dVq, stride_dVd,
+    N_QUERIES, N_KEYS,
+    scale,
+    d: tl.constexpr,
+    Q_TILE_SIZE: tl.constexpr,
+    K_TILE_SIZE: tl.constexpr,
+    is_causal: tl.constexpr,
+):
+    # Program indices
+    key_tile_index = tl.program_id(0)
+    batch_index = tl.program_id(1)
+    
+    Q_block_ptr = tl.make_block_ptr(
+        Q_ptr + batch_index * stride_qb,
+        shape=(N_QUERIES, d),
+        strides=(stride_qq, stride_qd),
+        offsets=(0, 0),
+        block_shape=(Q_TILE_SIZE, d),
+        order=(1, 0),
+    )
+
+    dO_block_ptr = tl.make_block_ptr(
+        dO_ptr + batch_index * stride_dOb,
+        shape=(N_QUERIES, d),
+        strides=(stride_dOq, stride_dOd),
+        offsets=(0, 0),
+        block_shape=(Q_TILE_SIZE, d),
+        order=(1, 0),
+    )
+    
+    K_block_ptr = tl.make_block_ptr(
+        K_ptr + batch_index * stride_kb,
+        shape=(N_KEYS, d),
+        strides=(stride_kk, stride_kd),
+        offsets=(key_tile_index * K_TILE_SIZE, 0),
+        block_shape=(K_TILE_SIZE, d),
+        order=(1, 0),
+    )
+
+    K_T_block_ptr = tl.make_block_ptr(
+        K_ptr + batch_index * stride_kb,
+        shape=(d, N_KEYS),
+        strides=(stride_kd, stride_kk),
+        offsets=(0, key_tile_index * K_TILE_SIZE),
+        block_shape=(d, K_TILE_SIZE),
+        order=(0, 1),
+    )
+
+    V_block_ptr = tl.make_block_ptr(
+        V_ptr + batch_index * stride_vb,
+        shape=(N_KEYS, d),
+        strides=(stride_vk, stride_vd),
+        offsets=(key_tile_index * K_TILE_SIZE, 0),
+        block_shape=(K_TILE_SIZE, d),
+        order=(1, 0),
+    )
+
+    D_block_ptr = tl.make_block_ptr(
+        D_ptr + batch_index * stride_db,
+        shape=(N_QUERIES,),
+        strides=(stride_dq,),
+        offsets=(0,),
+        block_shape=(Q_TILE_SIZE,),
+        order=(0,),
+    )
+
+    L_block_ptr = tl.make_block_ptr(
+        L_ptr + batch_index * stride_lb,
+        shape=(N_QUERIES,),
+        strides=(stride_lq,),
+        offsets=(0,),
+        block_shape=(Q_TILE_SIZE,),
+        order=(0,),
+    )
+
+    dK_block_ptr = tl.make_block_ptr(
+        dK_ptr + batch_index * stride_dKb,
+        shape=(N_KEYS, d),
+        strides=(stride_dKq, stride_dKd),
+        offsets=(key_tile_index * K_TILE_SIZE, 0),
+        block_shape=(K_TILE_SIZE, d),
+        order=(1, 0),
+    )
+    
+    dV_block_ptr = tl.make_block_ptr(
+        dV_ptr + batch_index * stride_dVb,
+        shape=(N_KEYS, d),
+        strides=(stride_dVq, stride_dVd),
+        offsets=(key_tile_index * K_TILE_SIZE, 0),
+        block_shape=(K_TILE_SIZE, d),
+        order=(1, 0),
+    )
+
+    Kj = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero") # (K_TILE_SIZE, d)
+    Kj_T = tl.load(K_T_block_ptr, boundary_check=(0, 1), padding_option="zero") # (d, K_TILE_SIZE)
+    Vj = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero") # (K_TILE_SIZE, d)
+
+    k_offsets = key_tile_index * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
+
+    dKj = tl.zeros((K_TILE_SIZE, d), dtype=tl.float32)
+    dVj = tl.zeros((K_TILE_SIZE, d), dtype=tl.float32)
+
+    Tq = tl.cdiv(N_QUERIES, Q_TILE_SIZE)
+    for i in range(Tq):
+        Qi = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero") # (Q_TILE_SIZE, d)
+        dOi = tl.load(dO_block_ptr, boundary_check=(0, 1), padding_option="zero") # (Q_TILE_SIZE, d)
+        Di = tl.load(D_block_ptr, boundary_check=(0,), padding_option="zero") # (Q_TILE_SIZE,)
+        Li = tl.load(L_block_ptr, boundary_check=(0,), padding_option="zero") # (Q_TILE_SIZE,)
+
+        Sij = tl.dot(Qi, Kj_T) * scale # (Q_TILE_SIZE, K_TILE_SIZE)
+        Sij = tl.where(k_offsets[None, :] < N_KEYS, Sij, -float('inf'))
+        if is_causal:
+            # for causal attention, we need to mask the future keys
+            # so, we only keep q >= k positions
+            q_offsets = i * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
+            mask = q_offsets[:, None] >= k_offsets[None, :]  # (Q_TILE_SIZE, K_TILE_SIZE)
+            Sij = tl.where(mask, Sij, -float('inf'))
+        Pij = tl.exp(Sij - Li[:, None]) # (Q_TILE_SIZE, K_TILE_SIZE)
+        dVj = dVj + tl.dot(Pij.T, dOi) # (K_TILE_SIZE, d)
+        dPij = tl.dot(dOi, Vj.T) # (Q_TILE_SIZE, K_TILE_SIZE)
+        dSij = Pij * (dPij - Di[:, None]) # (Q_TILE_SIZE, K_TILE_SIZE)
+        dKj = dKj + tl.dot(tl.trans(dSij).to(Kj.dtype), Qi) * scale # (K_TILE_SIZE, d)
+
+        Q_block_ptr = tl.advance(Q_block_ptr, (Q_TILE_SIZE, 0))
+        dO_block_ptr = tl.advance(dO_block_ptr, (Q_TILE_SIZE, 0))
+        D_block_ptr = tl.advance(D_block_ptr, (Q_TILE_SIZE,))
+        L_block_ptr = tl.advance(L_block_ptr, (Q_TILE_SIZE,))
+
+    tl.store(dK_block_ptr, dKj.to(dK_block_ptr.type.element_ty), boundary_check=(0, 1))
+    tl.store(dV_block_ptr, dVj.to(dV_block_ptr.type.element_ty), boundary_check=(0, 1))
+    
+
+
 class FlashAttentionFunc(torch.autograd.Function):
     @staticmethod
     def forward(ctx, Q, K, V, is_causal=False):
@@ -334,8 +479,8 @@ class FlashAttentionFunc(torch.autograd.Function):
         N_keys = K.shape[1]
         scale = 1.0 / math.sqrt(D)
         Tq = triton.cdiv(N_queries, Bq)
-        O = torch.empty((B, N_queries, D), device=Q.device)
-        L = torch.empty((B, N_queries), device=Q.device)
+        O = torch.empty((B, N_queries, D), device=Q.device, dtype=Q.dtype)
+        L = torch.empty((B, N_queries), device=Q.device, dtype=torch.float32)
         flash_fwd_kernel[(Tq, B)](
             Q, K, V,
             O, L,
@@ -350,12 +495,76 @@ class FlashAttentionFunc(torch.autograd.Function):
             Bq, Bk,
             is_causal,
         )
-        ctx.save_for_backward(Q, K, V, O, L, is_causal)
+        ctx.save_for_backward(Q, K, V, O, L)
+        ctx.is_causal = is_causal
+        ctx.scale = scale
+        ctx.Bq = Bq
+        ctx.Bk = Bk
         return O
-    
+
     @staticmethod
-    def backward(ctx):
-        raise NotImplementedError("Backward pass is not implemented")
+    def backward(ctx, dO):
+        Q, K, V, O, L = ctx.saved_tensors
+        is_causal = ctx.is_causal
+        scale = ctx.scale
+        Bq, Bk = ctx.Bq, ctx.Bk
+
+        B, N_queries, D = Q.shape
+        N_keys = K.shape[1]
+        Tq = triton.cdiv(N_queries, Bq)
+        Tk = triton.cdiv(N_keys, Bk)
+
+        # dO may arrive non-contiguous (e.g. from a slice upstream); the kernels
+        # assume the usual (b, q, d) stride pattern, so make it contiguous.
+        dO = dO.contiguous()
+
+        # Precompute Di = rowsum(O * dO). Shared by the dQ and dKV kernels.
+        Di = torch.empty(B, N_queries, device=Q.device, dtype=torch.float32)
+        preprocess_kernel[(Tq, B)](
+            O, dO, Di,
+            O.stride(0), O.stride(1), O.stride(2),
+            dO.stride(0), dO.stride(1), dO.stride(2),
+            Di.stride(0), Di.stride(1),
+            N_queries, D, Bq,
+        )
+
+        dQ = torch.empty_like(Q)
+        dK = torch.empty_like(K)
+        dV = torch.empty_like(V)
+
+        flash_bwd_dq_kernel[(Tq, B)](
+            Q, K, V,
+            dO, Di, L,
+            dQ,
+            Q.stride(0), Q.stride(1), Q.stride(2),
+            K.stride(0), K.stride(1), K.stride(2),
+            V.stride(0), V.stride(1), V.stride(2),
+            dO.stride(0), dO.stride(1), dO.stride(2),
+            Di.stride(0), Di.stride(1),
+            L.stride(0), L.stride(1),
+            dQ.stride(0), dQ.stride(1), dQ.stride(2),
+            N_queries, N_keys, scale, D, Bq, Bk, is_causal,
+        )
+
+        flash_bwd_dkv_kernel[(Tk, B)](
+            Q, K, V,
+            dO, Di, L,
+            dK, dV,
+            Q.stride(0), Q.stride(1), Q.stride(2),
+            K.stride(0), K.stride(1), K.stride(2),
+            V.stride(0), V.stride(1), V.stride(2),
+            dO.stride(0), dO.stride(1), dO.stride(2),
+            Di.stride(0), Di.stride(1),
+            L.stride(0), L.stride(1),
+            dK.stride(0), dK.stride(1), dK.stride(2),
+            dV.stride(0), dV.stride(1), dV.stride(2),
+            N_queries, N_keys, scale, D, Bq, Bk, is_causal,
+        )
+
+        # backward must return one gradient per forward input:
+        #   forward(Q, K, V, is_causal) -> (dQ, dK, dV, None)
+        # is_causal is a Python bool, no gradient.
+        return dQ, dK, dV, None
 
 
 # %%
@@ -526,6 +735,109 @@ def check_dq_correctness():
     return all_ok
 
 
+def check_dkv_correctness():
+    """Verify flash_bwd_dkv_kernel computes dK, dV against autograd.
+
+    Pipeline per config:
+      1. Run flash_fwd_kernel -> O, L
+      2. Run preprocess_kernel -> Di = rowsum(O * dO)
+      3. Run flash_bwd_dkv_kernel -> dK, dV
+      4. Compare to torch.autograd.grad(naive_attention(...), (K, V), dO)
+    """
+    torch.manual_seed(0)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.float32
+    Bq, Bk = 16, 16
+
+    configs = [
+        # (B, N_queries, N_keys, D)
+        (1, 16, 16, 32),
+        (2, 32, 32, 64),
+        (4, 64, 64, 64),
+        (8, 128, 128, 128),
+        (2, 48, 80, 64),
+        (3, 17, 33, 32),
+    ]
+
+    atol, rtol = 1e-2, 1e-2
+    all_ok = True
+    for B, Nq, Nk, D in configs:
+        Q = torch.randn(B, Nq, D, device=device, dtype=dtype, requires_grad=True)
+        K = torch.randn(B, Nk, D, device=device, dtype=dtype, requires_grad=True)
+        V = torch.randn(B, Nk, D, device=device, dtype=dtype, requires_grad=True)
+        dO = torch.randn(B, Nq, D, device=device, dtype=dtype)
+
+        scale = 1.0 / math.sqrt(D)
+        Tq = triton.cdiv(Nq, Bq)
+        Tk = triton.cdiv(Nk, Bk)
+
+        for is_causal in (False, True):
+            # Reference dK, dV via autograd on the naive attention.
+            O_ref = naive_attention(Q, K, V, is_causal=is_causal)
+            dK_ref, dV_ref = torch.autograd.grad(
+                O_ref, (K, V), dO, retain_graph=False
+            )
+
+            # 1. Forward pass to get O and L.
+            O = torch.empty(B, Nq, D, device=device, dtype=dtype)
+            L = torch.empty(B, Nq, device=device, dtype=dtype)
+            flash_fwd_kernel[(Tq, B)](
+                Q.detach(), K.detach(), V.detach(),
+                O, L,
+                Q.stride(0), Q.stride(1), Q.stride(2),
+                K.stride(0), K.stride(1), K.stride(2),
+                V.stride(0), V.stride(1), V.stride(2),
+                O.stride(0), O.stride(1), O.stride(2),
+                L.stride(0), L.stride(1),
+                Nq, Nk, scale, D, Bq, Bk, is_causal,
+            )
+
+            # 2. Preprocess: Di = rowsum(O * dO).
+            Di = torch.empty(B, Nq, device=device, dtype=dtype)
+            preprocess_kernel[(Tq, B)](
+                O, dO, Di,
+                O.stride(0), O.stride(1), O.stride(2),
+                dO.stride(0), dO.stride(1), dO.stride(2),
+                Di.stride(0), Di.stride(1),
+                Nq, D, Bq,
+            )
+
+            # 3. dK, dV backward kernel.
+            dK = torch.empty(B, Nk, D, device=device, dtype=dtype)
+            dV = torch.empty(B, Nk, D, device=device, dtype=dtype)
+            flash_bwd_dkv_kernel[(Tk, B)](
+                Q.detach(), K.detach(), V.detach(),
+                dO, Di, L,
+                dK, dV,
+                Q.stride(0), Q.stride(1), Q.stride(2),
+                K.stride(0), K.stride(1), K.stride(2),
+                V.stride(0), V.stride(1), V.stride(2),
+                dO.stride(0), dO.stride(1), dO.stride(2),
+                Di.stride(0), Di.stride(1),
+                L.stride(0), L.stride(1),
+                dK.stride(0), dK.stride(1), dK.stride(2),
+                dV.stride(0), dV.stride(1), dV.stride(2),
+                Nq, Nk, scale, D, Bq, Bk, is_causal,
+            )
+
+            max_dK = (dK - dK_ref).abs().max().item()
+            max_dV = (dV - dV_ref).abs().max().item()
+            ok_K = torch.allclose(dK, dK_ref, atol=atol, rtol=rtol)
+            ok_V = torch.allclose(dV, dV_ref, atol=atol, rtol=rtol)
+            ok = ok_K and ok_V
+            all_ok &= ok
+            status = "PASS" if ok else "FAIL"
+            tag_K = " " if ok_K else "!"
+            tag_V = " " if ok_V else "!"
+            print(
+                f"[{status}] dKV causal={is_causal} B={B} Nq={Nq} Nk={Nk} D={D} | "
+                f"dK{tag_K}err={max_dK:.3e}  dV{tag_V}err={max_dV:.3e}"
+            )
+
+    print("\ndKV:", "ALL TESTS PASSED" if all_ok else "SOME TESTS FAILED")
+    return all_ok
+
+
 def check_forward_correctness():
     torch.manual_seed(0)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -566,10 +878,73 @@ def check_forward_correctness():
     return all_ok
 
 
+def check_end_to_end_backward():
+    """Verify the full FlashAttentionFunc.backward against autograd.
+
+    Runs forward + backward through the autograd.Function and compares
+    dQ, dK, dV in one shot against torch.autograd.grad on naive_attention.
+    """
+    torch.manual_seed(0)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.float32
+
+    configs = [
+        # (B, N_queries, N_keys, D)
+        (1, 16, 16, 32),
+        (2, 32, 32, 64),
+        (4, 64, 64, 64),
+        (8, 128, 128, 128),
+        (2, 48, 80, 64),
+        (3, 17, 33, 32),
+    ]
+
+    atol, rtol = 1e-2, 1e-2
+    all_ok = True
+    for B, Nq, Nk, D in configs:
+        for is_causal in (False, True):
+            Q = torch.randn(B, Nq, D, device=device, dtype=dtype, requires_grad=True)
+            K = torch.randn(B, Nk, D, device=device, dtype=dtype, requires_grad=True)
+            V = torch.randn(B, Nk, D, device=device, dtype=dtype, requires_grad=True)
+            dO = torch.randn(B, Nq, D, device=device, dtype=dtype)
+
+            # Reference: pure-PyTorch attention + autograd.
+            O_ref = naive_attention(Q, K, V, is_causal=is_causal)
+            dQ_ref, dK_ref, dV_ref = torch.autograd.grad(O_ref, (Q, K, V), dO)
+
+            # Triton: forward + backward via the autograd.Function.
+            Q2 = Q.detach().clone().requires_grad_(True)
+            K2 = K.detach().clone().requires_grad_(True)
+            V2 = V.detach().clone().requires_grad_(True)
+            O_triton = FlashAttentionFunc.apply(Q2, K2, V2, is_causal)
+            O_triton.backward(dO)
+
+            max_dQ = (Q2.grad - dQ_ref).abs().max().item()
+            max_dK = (K2.grad - dK_ref).abs().max().item()
+            max_dV = (V2.grad - dV_ref).abs().max().item()
+            ok = (
+                torch.allclose(Q2.grad, dQ_ref, atol=atol, rtol=rtol)
+                and torch.allclose(K2.grad, dK_ref, atol=atol, rtol=rtol)
+                and torch.allclose(V2.grad, dV_ref, atol=atol, rtol=rtol)
+            )
+            all_ok &= ok
+            status = "PASS" if ok else "FAIL"
+            print(
+                f"[{status}] e2e causal={is_causal} B={B} Nq={Nq} Nk={Nk} D={D} | "
+                f"dQ={max_dQ:.3e} dK={max_dK:.3e} dV={max_dV:.3e}"
+            )
+
+    print("\nE2E backward:", "ALL TESTS PASSED" if all_ok else "SOME TESTS FAILED")
+    return all_ok
+
+
 if __name__ == "__main__":
     check_preprocess_correctness()
     print()
     check_forward_correctness()
     print()
     check_dq_correctness()
+    print()
+    check_dkv_correctness()
+    print()
+    check_end_to_end_backward()
 # %%
