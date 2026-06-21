@@ -1,7 +1,3 @@
-"""
-https://medium.com/@arjunsrinivasan.a/demystifying-pytorch-distributed-data-parallel-ddp-an-inside-look-6d0d42a645ff
-"""
-
 import torch.distributed as dist
 import torch
 
