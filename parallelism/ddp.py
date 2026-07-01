@@ -63,7 +63,7 @@ class DDP_Hook(torch.nn.Module):
 
     State of self.handles when backward() returns? 
     By the time backward() returns, every param's grad has been computed, so every hook has fired — self.handles holds one handle per param (fully populated). 
-    And exactly as you said: some of those all-reduces have already completed, some are still in flight on the background stream. 
+    Some of those all-reduces have already completed, some are still in flight on the background stream. 
     That's precisely why finish_gradient_synchronization must .wait() on each one before averaging.
     """
     def __init__(self, module: torch.nn.Module):
