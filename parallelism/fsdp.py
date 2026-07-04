@@ -31,26 +31,26 @@ class FSDP(torch.nn.Module):
             self.world_size = 1
             self.rank = 0
 
-        self.fsdp_modules: list[torch.nn.Module] = []
-        self._find_fsdp_modules()
-        self._shard_fsdp_modules()
+        self.fsdp_layers: list[torch.nn.Module] = []
+        self._find_fsdp_layers()
+        self._shard_fsdp_layers()
 
-    def _find_fsdp_modules(self):
+    def _find_fsdp_layers(self):
         """
-        Find all the modules that are going to be sharded.
+        Find all the layers that are going to be sharded.
         """
         for submodule in self.module.modules():
             if isinstance(submodule, (torch.nn.Linear, torch.nn.Embedding)):
-                self.fsdp_modules.append(submodule)
+                self.fsdp_layers.append(submodule)
 
-    def _shard_fsdp_modules(self):
+    def _shard_fsdp_layers(self):
         """
-        Shard the parameters of the FSDP modules.
+        Shard the parameters of the FSDP layers.
         """
-        for module in self.fsdp_modules:
-            module._fsdp_param_metadata: dict[str, ShardMetadata] = {}
-            module._fsdp_local_params: dict[str, torch.nn.Parameter] = {}
-            self._shard_module_parameters(module)
+        for layer in self.fsdp_layers:
+            layer._fsdp_param_metadata: dict[str, ShardMetadata] = {}
+            layer._fsdp_local_params: dict[str, torch.nn.Parameter] = {}
+            self._shard_layer_parameters(layer)
     
     def _get_shard_metadata(self, param: torch.nn.Parameter) -> ShardMetadata:
         """
@@ -86,20 +86,20 @@ class FSDP(torch.nn.Module):
         local_shard = flattened_param[metadata["start"]:metadata["end"]].clone()
         return local_shard, metadata
 
-    def _shard_module_parameters(self, module: torch.nn.Module) -> None:
+    def _shard_layer_parameters(self, layer: torch.nn.Module) -> None:
         """
-        Shard the parameters of the module.
+        Shard the parameters of the layer.
         Linear has weight and bias, Embedding has weight.
         """
         for param_name in ("weight", "bias"):
-            param = getattr(module, param_name, None)
+            param = getattr(layer, param_name, None)
             if param is None:
                 continue
 
             local_shard, metadata = self._get_local_shard(param)
-            module._fsdp_param_metadata[param_name] = metadata
+            layer._fsdp_param_metadata[param_name] = metadata
 
-            setattr(module, param_name, torch.nn.Parameter(local_shard))
+            setattr(layer, param_name, torch.nn.Parameter(local_shard))
 
     def _all_gather_param(self, local_param: torch.nn.Parameter, metadata: ShardMetadata) -> torch.Tensor:
         """
@@ -118,34 +118,41 @@ class FSDP(torch.nn.Module):
         full_flattened_param = full_flattened_param[:metadata["num_elements"]]
         return full_flattened_param.view(metadata["shape"])
 
-    def _save_local_parameters(self, module: torch.nn.Module, param_name: str, param: torch.nn.Parameter) -> None:
+    def _save_local_parameter(self, layer: torch.nn.Module, param_name: str, param: torch.nn.Parameter) -> None:
         """
         Save the local shard of the parameter so that we don't lose it during the forward pass.
         """
-        local_shard, metadata = self._get_local_shard(param)
-        module._fsdp_local_params[param_name] = torch.nn.Parameter(local_shard)
+        layer._fsdp_local_params[param_name] = param
 
-    def _free_module_parameters(self, module: torch.nn.Module) -> None:
+    def _free_layer_parameters(self, layer: torch.nn.Module) -> None:
         """
-        Free the parameters of the module.
+        Free the parameters of the layer.
         """
-        return None
+        for param_name, local_param in layer._fsdp_local_params.items():
+            setattr(layer, param_name, local_param)
+
+        layer._fsdp_local_params.clear()
         
 
-    def _gather_module_params(self, module: torch.nn.Module) -> None:
+    def _gather_layer_params(self, layer: torch.nn.Module) -> None:
         for param_name in ("weight", "bias"):
-            local_param = getattr(module, param_name, None)
-            metadata = module._fsdp_param_metadata.get(param_name)
+            local_param = getattr(layer, param_name, None)
+            metadata = layer._fsdp_param_metadata.get(param_name)
             if local_param is None or metadata is None:
                 continue
+            self._save_local_parameter(layer, param_name, local_param)
             full_param = self._all_gather_param(local_param, metadata)
-            setattr(module, param_name, torch.nn.Parameter(full_param))
+            setattr(layer, param_name, torch.nn.Parameter(full_param))
             
 
     def forward(self, *inputs, **kwargs):
-        for module in self.fsdp_modules:
-            self._gather_module_params(module)
-        return self.module(*inputs, **kwargs)
+        for layer in self.fsdp_layers:
+            self._gather_layer_params(layer)
+        try:
+            return self.module(*inputs, **kwargs)
+        finally:
+            for layer in self.fsdp_layers:
+                self._free_layer_parameters(layer)
 
     def finish_gradient_synchronization(self):
         pass
@@ -161,9 +168,20 @@ if __name__ == "__main__":
 
     fsdp = FSDP(model)
 
-    print("num fsdp modules:", len(fsdp.fsdp_modules))
-    for i, module in enumerate(fsdp.fsdp_modules):
-        print(i, type(module).__name__)
+    print("num fsdp layers:", len(fsdp.fsdp_layers))
+    for i, layer in enumerate(fsdp.fsdp_layers):
+        print(i, type(layer).__name__)
+        for param_name, metadata in layer._fsdp_param_metadata.items():
+            print(f"    {param_name}: {metadata}")
+
+    print("\nInspect a single Linear layer:")
+    linear_layer = fsdp.fsdp_layers[1]
+    print("repr:", linear_layer)
+    print("in_features:", linear_layer.in_features, "out_features:", linear_layer.out_features)
+    for param_name, param in linear_layer.named_parameters():
+        print(f"    {param_name}: shape={tuple(param.shape)} numel={param.numel()}")
+        print(f"        values={param.data.flatten()[:8].tolist()} ...")
+    print("    stored shard metadata:", linear_layer._fsdp_param_metadata)
 
     print("\nShard test:")
 
