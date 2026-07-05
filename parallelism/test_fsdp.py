@@ -260,7 +260,12 @@ def install_backward_peak_probe(fsdp_model: FSDP, peak_live: dict) -> None:
     This is best-effort instrumentation: if the method was renamed, we skip it
     and rely on the end-to-end correctness check instead.
     """
-    original = getattr(fsdp_model, "_regather_layer_params", None)
+    method_name = (
+        "_gather_layer_params_for_backward"
+        if hasattr(fsdp_model, "_gather_layer_params_for_backward")
+        else "_regather_layer_params"
+    )
+    original = getattr(fsdp_model, method_name, None)
     if original is None:
         return
 
@@ -279,7 +284,73 @@ def install_backward_peak_probe(fsdp_model: FSDP, peak_live: dict) -> None:
         peak_live["value"] = max(peak_live["value"], count_materialized_layers())
         return result
 
-    fsdp_model._regather_layer_params = probed
+    setattr(fsdp_model, method_name, probed)
+
+
+def _count_materialized_layers(fsdp_model: FSDP) -> int:
+    materialized = 0
+    for layer_state in fsdp_model._layer_states.values():
+        if any(
+            not _full_param_is_freed(param_state)
+            for param_state in layer_state.param_states.values()
+        ):
+            materialized += 1
+    return materialized
+
+
+def install_forward_peak_probe(fsdp_model: FSDP, fwd_peak: dict) -> None:
+    """Sample how many FSDP layers hold a materialized full weight during the
+    forward pass. With the 'start gathering layer i once layer i-2 has finished
+    its forward' prefetch rule, exactly one layer is prefetched ahead of the
+    one currently in use, so the peak is 2 (for a model with >= 3 FSDP layers).
+
+    - No prefetch (just-in-time gather) would give a peak of 1.
+    - Prefetching everything up front would give a peak of #layers (here 3).
+
+    We register our own pre/post forward hooks; they run after FSDP's own hooks
+    (registration order), so they observe the post-use / post-free+prefetch
+    state. A prefetched-but-not-yet-used layer counts as materialized because
+    its full weight storage is already allocated for the in-flight all-gather.
+    """
+
+    def sample(*_args):
+        fwd_peak["value"] = max(fwd_peak["value"], _count_materialized_layers(fsdp_model))
+
+    for layer in fsdp_model.fsdp_layers:
+        layer.register_forward_pre_hook(sample)
+        layer.register_forward_hook(sample)
+
+
+def install_async_all_gather_probe(ag_calls: dict) -> callable:
+    """Record whether the weight all-gather is issued asynchronously (so it can
+    be prefetched and overlap with compute). Detects both the flat
+    `all_gather_into_tensor` and the list-based `all_gather` APIs. Returns a
+    restore() callable."""
+    original_into = getattr(dist, "all_gather_into_tensor", None)
+    original_list = getattr(dist, "all_gather", None)
+
+    def make_traced(original):
+        def traced(*args, **kwargs):
+            if kwargs.get("async_op", False):
+                ag_calls["async"] += 1
+            else:
+                ag_calls["sync"] += 1
+            return original(*args, **kwargs)
+
+        return traced
+
+    if original_into is not None:
+        dist.all_gather_into_tensor = make_traced(original_into)
+    if original_list is not None:
+        dist.all_gather = make_traced(original_list)
+
+    def restore() -> None:
+        if original_into is not None:
+            dist.all_gather_into_tensor = original_into
+        if original_list is not None:
+            dist.all_gather = original_list
+
+    return restore
 
 
 def install_async_reduce_scatter_probe(async_calls: dict) -> callable:
@@ -316,8 +387,14 @@ def run_training_test(rank: int, world_size: int) -> None:
         peak_live = {"value": 0}
         install_backward_peak_probe(fsdp_model, peak_live)
 
+        fwd_peak = {"value": 0}
+        install_forward_peak_probe(fsdp_model, fwd_peak)
+
         async_calls = {"async": 0, "sync": 0}
         restore_reduce_scatter = install_async_reduce_scatter_probe(async_calls)
+
+        all_gather_calls = {"async": 0, "sync": 0}
+        restore_all_gather = install_async_all_gather_probe(all_gather_calls)
 
         optimizer_kwargs = {"lr": 0.03}
         reference_optimizer = torch.optim.SGD(
@@ -360,6 +437,7 @@ def run_training_test(rank: int, world_size: int) -> None:
             assert_rank0_matches_reference(reference_model, fsdp_model, step)
 
         restore_reduce_scatter()
+        restore_all_gather()
 
         assert peak_live["value"] <= 1, (
             f"expected at most one materialized full weight during backward, "
@@ -374,10 +452,27 @@ def run_training_test(rank: int, world_size: int) -> None:
             f"sync={async_calls['sync']})"
         )
 
+        assert all_gather_calls["async"] > 0, (
+            "expected the weight all-gather to be issued with async_op=True so "
+            "it can be prefetched and overlap with compute, but every "
+            f"all-gather was synchronous (async={all_gather_calls['async']}, "
+            f"sync={all_gather_calls['sync']})"
+        )
+
+        assert fwd_peak["value"] == 2, (
+            f"expected forward peak of exactly 2 materialized layers with the "
+            f"'gather layer i after layer i-2 finished forward' prefetch rule "
+            f"(one in use + one prefetched ahead), but peak was "
+            f"{fwd_peak['value']}. A peak of 1 means no prefetch; a peak of 3 "
+            f"means everything was gathered up front."
+        )
+
         if rank == 0:
             print(
-                f"Milestone 3 OK: FSDP matched the reference for {NUM_STEPS} steps; "
-                f"peak full weights during backward = {peak_live['value']}; "
+                f"Milestone 4 OK: FSDP matched the reference for {NUM_STEPS} steps; "
+                f"forward peak materialized layers = {fwd_peak['value']}; "
+                f"async all-gathers = {all_gather_calls['async']}; "
+                f"backward peak = {peak_live['value']}; "
                 f"async reduce-scatters = {async_calls['async']}."
             )
     finally:
@@ -385,9 +480,9 @@ def run_training_test(rank: int, world_size: int) -> None:
 
 
 def main() -> None:
-    # Milestone 3: training must still match the reference, but the gradient
-    # reduce-scatter is now issued asynchronously and waited on inside
-    # finish_gradient_synchronization.
+    # Milestone 4: forward weights are prefetched asynchronously using the
+    # 'start gathering layer i once layer i-2 finished its forward' rule, so at
+    # most two layers are materialized at once during the forward pass.
     mp.spawn(
         run_training_test,
         args=(WORLD_SIZE,),
