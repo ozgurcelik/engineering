@@ -75,13 +75,13 @@ def gather_full_fsdp_named_parameters(fsdp_model: FSDP) -> dict[str, torch.Tenso
     full_params: dict[str, torch.Tensor] = {}
 
     for module_name, layer in fsdp_model.module.named_modules():
-        metadata_by_param = getattr(layer, "_fsdp_param_metadata", None)
-        if not metadata_by_param:
+        layer_state = fsdp_model._layer_states.get(layer)
+        if layer_state is None:
             continue
 
-        for param_name, metadata in metadata_by_param.items():
-            local_param = getattr(layer, param_name)
-            local_shard = local_param.detach()
+        for param_name, param_state in layer_state.param_states.items():
+            local_shard = param_state.local_param.detach()
+            metadata = param_state.metadata
 
             if fsdp_model.world_size == 1:
                 full_flat = local_shard
@@ -93,7 +93,7 @@ def gather_full_fsdp_named_parameters(fsdp_model: FSDP) -> dict[str, torch.Tenso
                 dist.all_gather(gathered_shards, local_shard)
                 full_flat = torch.cat(gathered_shards, dim=0)
 
-            full_param = full_flat[: metadata["num_elements"]].view(metadata["shape"])
+            full_param = full_flat[: metadata.num_elements].view(metadata.shape)
             full_name = f"{module_name}.{param_name}" if module_name else param_name
             full_params[full_name] = full_param.detach().clone()
 
@@ -127,7 +127,55 @@ def assert_rank0_matches_reference(
         )
 
 
-def run_test(rank: int, world_size: int) -> None:
+def assert_layers_are_sharded(fsdp_model: FSDP) -> None:
+    for layer, layer_state in fsdp_model._layer_states.items():
+        for param_name, param_state in layer_state.param_states.items():
+            actual_param = getattr(layer, param_name)
+            assert actual_param is param_state.local_param
+            assert tuple(actual_param.shape) == tuple(param_state.local_param.shape)
+            assert param_state.full_param is None
+
+
+def broadcast_reference_model(reference_model: nn.Module) -> None:
+    with torch.no_grad():
+        for param in reference_model.parameters():
+            dist.broadcast(param.data, src=0)
+        for buffer in reference_model.buffers():
+            dist.broadcast(buffer.data, src=0)
+
+
+def run_forward_lifecycle_test(rank: int, world_size: int) -> None:
+    setup(rank, world_size)
+
+    try:
+        torch.manual_seed(rank)
+        reference_model = TinyFSDPModel()
+        broadcast_reference_model(reference_model)
+        fsdp_model = FSDP(deepcopy(reference_model))
+
+        tokens, _ = make_dataset()
+        local_batch_size = DATASET_SIZE // world_size
+        offset = rank * local_batch_size
+        local_tokens = tokens[offset : offset + local_batch_size]
+
+        reference_outputs = reference_model(local_tokens)
+        fsdp_outputs = fsdp_model(local_tokens)
+
+        torch.testing.assert_close(
+            fsdp_outputs,
+            reference_outputs,
+            rtol=1e-5,
+            atol=1e-6,
+        )
+        assert_layers_are_sharded(fsdp_model)
+
+        if rank == 0:
+            print("FSDP forward lifecycle matched reference and restored local shards.")
+    finally:
+        cleanup()
+
+
+def run_training_test(rank: int, world_size: int) -> None:
     setup(rank, world_size)
 
     try:
@@ -178,7 +226,12 @@ def run_test(rank: int, world_size: int) -> None:
 
 
 def main() -> None:
-    mp.spawn(run_test, args=(WORLD_SIZE,), nprocs=WORLD_SIZE, join=True)
+    mp.spawn(
+        run_forward_lifecycle_test,
+        args=(WORLD_SIZE,),
+        nprocs=WORLD_SIZE,
+        join=True,
+    )
 
 
 if __name__ == "__main__":

@@ -3,12 +3,11 @@ from __future__ import annotations
 import torch
 import torch.distributed as dist
 
-from typing import TypedDict
-
 from dataclasses import dataclass, field
 
 
-class ShardMetadata(TypedDict):
+@dataclass
+class ShardMetadata:
     num_elements: int
     shard_size: int
     padded_num_elements: int
@@ -48,11 +47,13 @@ class FSDP(torch.nn.Module):
         self._broadcast_initial_state()
 
         self._layer_states: dict[torch.nn.Module, FSDPLayerState] = {}
+        self._forward_hook_handles: list[torch.utils.hooks.RemovableHandle] = []
 
         self.fsdp_layers: list[torch.nn.Module] = []
         self._replicate_parameters: list[torch.nn.Parameter] = []
         self._find_fsdp_layers_and_replicated_parameters()
-        self._shard_fsdp_layers()
+        self._create_layer_states()
+        self._register_forward_hooks()
 
         self._has_full_params = False
 
@@ -68,30 +69,6 @@ class FSDP(torch.nn.Module):
                 dist.broadcast(param.data, src=0)
             for buffer in self.module.buffers():
                 dist.broadcast(buffer.data, src=0)
-
-    def _create_layer_state(self, layer: torch.nn.Module) -> FSDPLayerState:
-        """
-        Create the state for the layer.
-        """
-        param_states: dict[str, FSDPParamState] = {}
-        for param_name in ("weight", "bias"):
-            param = getattr(layer, param_name, None)
-            if param is None:
-                continue
-
-            local_shard, metadata = self._get_local_shard(param)
-            param_state = FSDPParamState(
-                name=param_name,
-                metadata=metadata,
-                local_param=torch.nn.Parameter(local_shard),
-            )
-            param_states[param_name] = param_state
-            
-        return FSDPLayerState(
-            layer=layer,
-            param_states=param_states,
-        )
-            
             
     def _find_fsdp_layers_and_replicated_parameters(self) -> None:
         """
@@ -105,15 +82,6 @@ class FSDP(torch.nn.Module):
                 for param in submodule.parameters(recurse=False):
                     if param.requires_grad:
                         self._replicate_parameters.append(param)
-
-    def _shard_fsdp_layers(self) -> None:
-        """
-        Shard the parameters of the FSDP layers.
-        """
-        for layer in self.fsdp_layers:
-            layer._fsdp_param_metadata: dict[str, ShardMetadata] = {}
-            layer._fsdp_local_params: dict[str, torch.nn.Parameter] = {}
-            self._shard_layer_parameters(layer)
     
     def _get_shard_metadata(self, param: torch.nn.Parameter) -> ShardMetadata:
         """
@@ -142,41 +110,105 @@ class FSDP(torch.nn.Module):
 
         flattened_param = param.detach().flatten()
 
-        if metadata["padded_num_elements"] > metadata["num_elements"]:
-            padding = torch.zeros(metadata["padded_num_elements"] - metadata["num_elements"], dtype=param.dtype, device=param.device)
+        if metadata.padded_num_elements > metadata.num_elements:
+            padding = torch.zeros(metadata.padded_num_elements - metadata.num_elements, dtype=param.dtype, device=param.device)
             flattened_param = torch.cat([flattened_param, padding])
 
-        local_shard = flattened_param[metadata["start"]:metadata["end"]].clone()
+        local_shard = flattened_param[metadata.start:metadata.end].clone()
         return local_shard, metadata
 
-    def _shard_layer_parameters(self, layer: torch.nn.Module) -> None:
+    def _create_layer_state(self, layer: torch.nn.Module) -> FSDPLayerState:
         """
-        Shard the parameters of the layer.
-        Linear has weight and bias, Embedding has weight.
+        Create the state for the layer and set the local parameter to the layer.
         """
+        param_states: dict[str, FSDPParamState] = {}
         for param_name in ("weight", "bias"):
             param = getattr(layer, param_name, None)
             if param is None:
                 continue
 
             local_shard, metadata = self._get_local_shard(param)
-            layer._fsdp_param_metadata[param_name] = metadata
+            param_state = FSDPParamState(
+                name=param_name,
+                metadata=metadata,
+                local_param=torch.nn.Parameter(local_shard),
+            )
+            param_states[param_name] = param_state
+            setattr(layer, param_name, param_state.local_param)
+            
+        return FSDPLayerState(
+            layer=layer,
+            param_states=param_states,
+        )
 
-            setattr(layer, param_name, torch.nn.Parameter(local_shard))
+    def _create_layer_states(self) -> None:
+        """
+        Create the states for the FSDP layers.
+        """
+        for layer in self.fsdp_layers:
+            self._layer_states[layer] = self._create_layer_state(layer)
+
+    def _pre_forward_hook(self, layer: torch.nn.Module, inputs: tuple[torch.Tensor, ...]):
+        """
+        Pre-forward hook for the FSDP layers.
+        We should do the all-gather of the parameters for the forward pass.
+        """
+        self._gather_layer_params(layer)
+
+    def _post_forward_hook(self, layer: torch.nn.Module, inputs: tuple[torch.Tensor, ...], outputs: torch.Tensor):
+        """
+        Post-forward hook for the FSDP layers.
+        We should shard the parameters again after the forward pass.
+        """
+        for param_name, param_state in self._layer_states[layer].param_states.items():
+            setattr(layer, param_name, param_state.local_param)
+            param_state.full_param = None
+
+    def _register_forward_hooks(self) -> None:
+        """
+        Register the forward hooks for the FSDP layers.
+        """
+        for layer in self.fsdp_layers:
+            self._forward_hook_handles.append(layer.register_forward_pre_hook(self._pre_forward_hook))
+            self._forward_hook_handles.append(layer.register_forward_hook(self._post_forward_hook))
+
+    def _all_gather_param(self, local_param: torch.nn.Parameter, metadata: ShardMetadata) -> torch.Tensor:
+        """
+        All-gather the parameter.
+        We need to all-gather the parameter for the forward and backward pass.
+        We need to discard the padding elements.
+        """
+        local_shard = local_param.detach()
+
+        if self.world_size == 1:
+            full_flattened_param = local_shard
+        else:
+            gathered_shards = [torch.empty_like(local_shard) for _ in range(self.world_size)]
+            dist.all_gather(gathered_shards, local_shard, async_op=False)
+            full_flattened_param = torch.cat(gathered_shards, dim=0)
+
+        full_flattened_param = full_flattened_param[:metadata.num_elements]
+        return full_flattened_param.view(metadata.shape)
+
+    def _persist_local_parameter(self, layer: torch.nn.Module, param_name: str, param: torch.nn.Parameter) -> None:
+        """
+        Save the local shard of the parameter so that we don't lose it during the forward pass.
+        """
+        self._layer_states[layer].param_states[param_name].local_param = param
 
     def _reduce_scatter_grad(self, full_grad: torch.Tensor, metadata: ShardMetadata) -> torch.Tensor:
         """
         Reduce-scatter the gradient.
         """
         flattened_grad = full_grad.flatten()
-        if metadata["padded_num_elements"] > metadata["num_elements"]:
-            padding = torch.zeros(metadata["padded_num_elements"] - metadata["num_elements"], dtype=full_grad.dtype, device=full_grad.device)
+        if metadata.padded_num_elements > metadata.num_elements:
+            padding = torch.zeros(metadata.padded_num_elements - metadata.num_elements, dtype=full_grad.dtype, device=full_grad.device)
             flattened_grad = torch.cat([flattened_grad, padding])
 
         if self.world_size == 1:
             local_grad = flattened_grad
         else:
-            local_grad = torch.empty(metadata["shard_size"], dtype=full_grad.dtype, device=full_grad.device)
+            local_grad = torch.empty(metadata.shard_size, dtype=full_grad.dtype, device=full_grad.device)
             dist.reduce_scatter_tensor(output=local_grad, input=flattened_grad, op=dist.ReduceOp.SUM, async_op=False)
             local_grad.div_(self.world_size)
         return local_grad
@@ -195,45 +227,17 @@ class FSDP(torch.nn.Module):
         else:
             local_param.grad = None
 
-
-    def _all_gather_param(self, local_param: torch.nn.Parameter, metadata: ShardMetadata) -> torch.Tensor:
-        """
-        All-gather the parameter.
-        We need to all-gather the parameter for the forward and backward pass.
-        """
-        local_shard = local_param.detach()
-
-        if self.world_size == 1:
-            full_flattened_param = local_shard
-        else:
-            gathered_shards = [torch.empty_like(local_shard) for _ in range(self.world_size)]
-            dist.all_gather(gathered_shards, local_shard, async_op=False)
-            full_flattened_param = torch.cat(gathered_shards, dim=0)
-
-        full_flattened_param = full_flattened_param[:metadata["num_elements"]]
-        return full_flattened_param.view(metadata["shape"])
-
-    def _save_local_parameter(self, layer: torch.nn.Module, param_name: str, param: torch.nn.Parameter) -> None:
-        """
-        Save the local shard of the parameter so that we don't lose it during the forward pass.
-        """
-        layer._fsdp_local_params[param_name] = param
-
     def _restore_local_parameters(self, layer: torch.nn.Module) -> None:
         """
-        Restore the local parameters of the layer.
+        After we are done with the full parameters, we need to restore the local shard of parameters to the layer.
+        We have the local param already persisted in the param state, so we just need to copy the gradient back to the local param.
         """
-        for param_name, local_param in layer._fsdp_local_params.items():
+        for param_name, param_state in self._layer_states[layer].param_states.items():
             full_param = getattr(layer, param_name, None)
-            if full_param is None or local_param is None:
-                continue
-            metadata = layer._fsdp_param_metadata.get(param_name)
-            if metadata is None:
-                continue
-            self._copy_grad_to_local_parameter(full_param, local_param, metadata)
-            setattr(layer, param_name, local_param)
+            self._copy_grad_to_local_parameter(full_param, param_state.local_param, param_state.metadata)
+            setattr(layer, param_name, param_state.local_param)
+            param_state.full_param = None
 
-        layer._fsdp_local_params.clear()
 
     def _free_all_layer_parameters(self) -> None:
         """
@@ -256,21 +260,17 @@ class FSDP(torch.nn.Module):
         
 
     def _gather_layer_params(self, layer: torch.nn.Module) -> None:
-        for param_name in ("weight", "bias"):
+        for param_name, param_state in self._layer_states[layer].param_states.items():
             local_param = getattr(layer, param_name, None)
-            metadata = layer._fsdp_param_metadata.get(param_name)
+            metadata = param_state.metadata
             if local_param is None or metadata is None:
                 continue
-            self._save_local_parameter(layer, param_name, local_param)
-            full_param = self._all_gather_param(local_param, metadata)
-            setattr(layer, param_name, torch.nn.Parameter(full_param))
+            self._persist_local_parameter(layer, param_name, local_param)
+            param_state.full_param = torch.nn.Parameter(self._all_gather_param(local_param, metadata))
+            setattr(layer, param_name, param_state.full_param)
             
 
     def forward(self, *inputs, **kwargs):
-        if not self._has_full_params:
-            for layer in self.fsdp_layers:
-                self._gather_layer_params(layer)
-            self._has_full_params = True
         return self.module(*inputs, **kwargs)
 
     def finish_gradient_synchronization(self):
