@@ -166,7 +166,8 @@ class FSDP(torch.nn.Module):
         We need to discard the padding elements.
         """
         local_shard = local_param.detach()
-
+        if self.compute_dtype is not None:
+            local_shard = local_shard.to(self.compute_dtype)
         if self.world_size == 1:
             full_flattened_param = local_shard
         else:
@@ -183,6 +184,8 @@ class FSDP(torch.nn.Module):
         Issue an async all-gather operation.
         """
         local_shard = local_param.detach()
+        if self.compute_dtype is not None:
+            local_shard = local_shard.to(self.compute_dtype)
         if self.world_size == 1:
             return None, local_shard.clone()
         buffer = torch.empty(metadata.padded_num_elements, dtype=local_shard.dtype, device=local_shard.device)
@@ -342,7 +345,7 @@ class FSDP(torch.nn.Module):
         for pending_reduce_scatter in self._pending_reduce_scatters:
             if pending_reduce_scatter.handle is not None:
                 pending_reduce_scatter.handle.wait()
-            local_grad = pending_reduce_scatter.output.div_(self.world_size)
+            local_grad = pending_reduce_scatter.output.to(pending_reduce_scatter.local_param.dtype).div_(self.world_size)
             if pending_reduce_scatter.local_param.grad is None:
                 pending_reduce_scatter.local_param.grad = local_grad
             else:

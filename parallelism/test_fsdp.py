@@ -19,8 +19,13 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
+import torch.nn.functional as F
 
 from fsdp import FSDP
+
+
+COMPUTE_DTYPE = torch.bfloat16
+MP_DIMS = [8, 16, 16, 7]
 
 
 WORLD_SIZE = 2
@@ -479,12 +484,205 @@ def run_training_test(rank: int, world_size: int) -> None:
         cleanup()
 
 
+def build_mp_base() -> nn.Sequential:
+    """A pure-Linear MLP so mixed-precision compute flows cleanly (no norm /
+    embedding dtype boundaries to worry about)."""
+    layers: list[nn.Module] = []
+    for i in range(len(MP_DIMS) - 1):
+        layers.append(nn.Linear(MP_DIMS[i], MP_DIMS[i + 1]))
+        if i < len(MP_DIMS) - 2:
+            layers.append(nn.ReLU())
+    return nn.Sequential(*layers)
+
+
+class MixedPrecisionReference(nn.Module):
+    """Single-process replica of FSDP's mixed-precision recipe: fp32 master
+    weights, cast to compute_dtype for the matmul (so grads flow back into the
+    fp32 masters), exactly what sharded FSDP should reproduce."""
+
+    def __init__(self, base: nn.Sequential, compute_dtype: torch.dtype) -> None:
+        super().__init__()
+        self.base = base
+        self.compute_dtype = compute_dtype
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for module in self.base:
+            if isinstance(module, nn.Linear):
+                bias = None if module.bias is None else module.bias.to(self.compute_dtype)
+                x = F.linear(x, module.weight.to(self.compute_dtype), bias)
+            else:
+                x = module(x)
+        return x
+
+
+def install_comm_dtype_probe(dtypes: dict) -> callable:
+    """Record the dtype of every tensor handed to the weight all-gather and the
+    gradient reduce-scatter, so we can assert communication happens in the low
+    compute dtype (the bandwidth win), not fp32."""
+    orig_ag_into = getattr(dist, "all_gather_into_tensor", None)
+    orig_ag_list = getattr(dist, "all_gather", None)
+    orig_rs = dist.reduce_scatter_tensor
+
+    def ag_into(output, input, *args, **kwargs):
+        dtypes["all_gather"].add(output.dtype)
+        dtypes["all_gather"].add(input.dtype)
+        return orig_ag_into(output, input, *args, **kwargs)
+
+    def ag_list(tensor_list, tensor, *args, **kwargs):
+        dtypes["all_gather"].add(tensor.dtype)
+        return orig_ag_list(tensor_list, tensor, *args, **kwargs)
+
+    def rs(output, input, *args, **kwargs):
+        dtypes["reduce_scatter"].add(output.dtype)
+        dtypes["reduce_scatter"].add(input.dtype)
+        return orig_rs(output, input, *args, **kwargs)
+
+    if orig_ag_into is not None:
+        dist.all_gather_into_tensor = ag_into
+    if orig_ag_list is not None:
+        dist.all_gather = ag_list
+    dist.reduce_scatter_tensor = rs
+
+    def restore() -> None:
+        if orig_ag_into is not None:
+            dist.all_gather_into_tensor = orig_ag_into
+        if orig_ag_list is not None:
+            dist.all_gather = orig_ag_list
+        dist.reduce_scatter_tensor = orig_rs
+
+    return restore
+
+
+def assert_masters_are_fp32(fsdp_model: FSDP) -> None:
+    for layer_state in fsdp_model._layer_states.values():
+        for param_state in layer_state.param_states.values():
+            assert param_state.local_param.dtype == torch.float32, (
+                "master weight (local shard) must stay fp32, got "
+                f"{param_state.local_param.dtype}"
+            )
+            if param_state.local_param.grad is not None:
+                assert param_state.local_param.grad.dtype == torch.float32, (
+                    "master weight gradient must be cast back to fp32 for the "
+                    f"optimizer, got {param_state.local_param.grad.dtype}"
+                )
+
+
+def run_mixed_precision_test(rank: int, world_size: int) -> None:
+    """Milestone 5 verification.
+
+    - Weights are communicated (all-gather + reduce-scatter) in compute_dtype.
+    - The full weight seen during forward is compute_dtype.
+    - Master shards and their gradients stay fp32.
+    - The forward output exactly matches a single-process mixed-precision
+      reference (gathered low-precision weights are bit-identical to casting the
+      full fp32 weight), and a few training steps stay close to that reference.
+    """
+    setup(rank, world_size)
+
+    try:
+        torch.manual_seed(rank)
+        base = build_mp_base()
+        broadcast_reference_model(base)
+
+        reference = MixedPrecisionReference(deepcopy(base), COMPUTE_DTYPE)
+        fsdp_model = FSDP(deepcopy(base), compute_dtype=COMPUTE_DTYPE)
+
+        generator = torch.Generator().manual_seed(4321)
+        inputs = torch.randn(DATASET_SIZE, MP_DIMS[0], generator=generator).to(COMPUTE_DTYPE)
+        targets = torch.randn(DATASET_SIZE, MP_DIMS[-1], generator=generator)
+
+        assert DATASET_SIZE % world_size == 0
+        local_bs = DATASET_SIZE // world_size
+        offset = rank * local_bs
+        local_inputs = inputs[offset : offset + local_bs]
+        local_targets = targets[offset : offset + local_bs]
+
+        # Capture the dtype of the weight the layer actually computes with.
+        seen_weight_dtypes: set = set()
+
+        def record_weight_dtype(layer, _inputs):
+            seen_weight_dtypes.add(getattr(layer, "weight").dtype)
+
+        for layer in fsdp_model.fsdp_layers:
+            layer.register_forward_pre_hook(record_weight_dtype)
+
+        # Forward output must match the reference exactly at init: gathering
+        # bf16 shards reconstructs the same weight as casting the full weight.
+        with torch.no_grad():
+            fsdp_out0 = fsdp_model(local_inputs).float()
+            ref_out0 = reference(local_inputs).float()
+        torch.testing.assert_close(fsdp_out0, ref_out0, rtol=0, atol=0)
+
+        assert seen_weight_dtypes == {COMPUTE_DTYPE}, (
+            f"forward should compute with {COMPUTE_DTYPE} weights, saw {seen_weight_dtypes}"
+        )
+
+        optimizer_kwargs = {"lr": 0.05}
+        reference_optimizer = torch.optim.SGD(reference.parameters(), **optimizer_kwargs)
+        fsdp_optimizer = torch.optim.SGD(fsdp_model.parameters(), **optimizer_kwargs)
+        loss_fn = nn.MSELoss()
+
+        comm_dtypes = {"all_gather": set(), "reduce_scatter": set()}
+        restore_comm = install_comm_dtype_probe(comm_dtypes)
+
+        try:
+            for _ in range(NUM_STEPS):
+                reference_optimizer.zero_grad()
+                reference_out = reference(inputs).float()
+                reference_loss = loss_fn(reference_out, targets)
+                reference_loss.backward()
+                reference_optimizer.step()
+
+                fsdp_optimizer.zero_grad()
+                fsdp_out = fsdp_model(local_inputs).float()
+                fsdp_loss = loss_fn(fsdp_out, local_targets)
+                fsdp_loss.backward()
+                fsdp_model.finish_gradient_synchronization()
+                assert_masters_are_fp32(fsdp_model)
+                fsdp_optimizer.step()
+        finally:
+            restore_comm()
+
+        assert comm_dtypes["all_gather"] == {COMPUTE_DTYPE}, (
+            f"weights must be all-gathered in {COMPUTE_DTYPE}, saw {comm_dtypes['all_gather']}"
+        )
+        assert comm_dtypes["reduce_scatter"] == {COMPUTE_DTYPE}, (
+            f"gradients must be reduce-scattered in {COMPUTE_DTYPE}, saw {comm_dtypes['reduce_scatter']}"
+        )
+
+        # After a few steps, the sharded mixed-precision result should track the
+        # single-process reference closely (small bf16 reduction differences).
+        fsdp_full = gather_full_fsdp_named_parameters(fsdp_model)
+        if dist.get_rank() == 0:
+            reference_params = dict(reference.base.named_parameters())
+            assert reference_params.keys() == fsdp_full.keys()
+            for name, ref_param in reference_params.items():
+                torch.testing.assert_close(
+                    fsdp_full[name],
+                    ref_param.detach(),
+                    rtol=2e-2,
+                    atol=2e-2,
+                    msg=f"mixed-precision param {name!r} drifted from reference",
+                )
+            print(
+                "Milestone 5 OK: weights communicated in "
+                f"{COMPUTE_DTYPE}, masters + grads fp32, forward matched the "
+                "mixed-precision reference."
+            )
+    finally:
+        cleanup()
+
+
+def run_all(rank: int, world_size: int) -> None:
+    run_training_test(rank, world_size)
+    run_mixed_precision_test(rank, world_size)
+
+
 def main() -> None:
-    # Milestone 4: forward weights are prefetched asynchronously using the
-    # 'start gathering layer i once layer i-2 finished its forward' rule, so at
-    # most two layers are materialized at once during the forward pass.
+    # Milestone 5: fp32 regression (M1-M4) plus the mixed-precision contract -
+    # weights are communicated in compute_dtype while masters/grads stay fp32.
     mp.spawn(
-        run_training_test,
+        run_all,
         args=(WORLD_SIZE,),
         nprocs=WORLD_SIZE,
         join=True,
