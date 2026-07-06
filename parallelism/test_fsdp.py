@@ -1,13 +1,17 @@
-"""
-Distributed correctness test for the FSDP container in ``fsdp.py``.
+"""Tests for the FullyShardedDataParallel (FSDP) implementation in ``fsdp.py``.
 
-This is a test-first milestone: the current partial FSDP implementation may fail
-this test until the later milestones add initialization sync, replicated-parameter
-gradient sync, and the full gather/free lifecycle.
-
-Run directly:
+Modeled after the Stanford CS336 assignment-2 FSDP tests
+(https://github.com/stanford-cs336/assignment2-systems/blob/main/tests/test_fsdp.py),
+adapted to run against this repo's ``FSDP`` class as a standalone script
+(no pytest / cs336_basics dependency):
 
     conda run -n distvenv python parallelism/test_fsdp.py
+
+Two checks, each run for compute_dtype in {None (fp32), torch.float16}:
+  * test_fsdp_correctness  - sharded FSDP matches a single-process baseline
+    (with matching mixed-precision behavior when compute_dtype is set).
+  * test_fsdp_gradient_sync - after sync, every parameter has a correctly
+    shaped/typed gradient, and replicated (non-sharded) grads agree on all ranks.
 """
 
 from __future__ import annotations
@@ -24,83 +28,121 @@ import torch.nn.functional as F
 from fsdp import FSDP
 
 
-COMPUTE_DTYPE = torch.bfloat16
-MP_DIMS = [8, 16, 16, 7]
+def _cast_floating(obj, dtype: torch.dtype):
+    """Cast every floating-point tensor in obj (Tensor / tuple / list) to
+    dtype via a differentiable ``.to()``; leave integer/bool tensors and
+    non-tensors untouched. Mirrors the helper the FSDP activation casting uses."""
+    if torch.is_tensor(obj):
+        return obj.to(dtype) if obj.is_floating_point() else obj
+    if isinstance(obj, tuple):
+        return tuple(_cast_floating(o, dtype) for o in obj)
+    if isinstance(obj, list):
+        return [_cast_floating(o, dtype) for o in obj]
+    return obj
 
 
-WORLD_SIZE = 2
-NUM_STEPS = 3
-DATASET_SIZE = 12
-VOCAB_SIZE = 23
-SEQ_LEN = 5
-EMBED_DIM = 8
-HIDDEN_DIM = 16
-OUT_DIM = 7
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
 
 
-def setup(rank: int, world_size: int) -> None:
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = os.environ.get("MASTER_PORT", "12357")
-    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+class RMSNorm(nn.Module):
+    """RMSNorm that preserves the activation dtype (upcasts to fp32 internally
+    for the reduction, casts the result back). This is what lets a fp16 model
+    flow low-precision activations through the norms without hitting a
+    fp32/fp16 boundary at the following Linear."""
 
-
-def cleanup() -> None:
-    dist.destroy_process_group()
-
-
-class TinyFSDPModel(nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, dim: int, eps: float = 1e-5) -> None:
         super().__init__()
-        self.embedding = nn.Embedding(VOCAB_SIZE, EMBED_DIM)
-        self.proj = nn.Linear(EMBED_DIM, HIDDEN_DIM)
-        self.norm = nn.LayerNorm(HIDDEN_DIM)
-        self.out = nn.Linear(HIDDEN_DIM, OUT_DIM)
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
 
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
-        x = self.embedding(tokens)
-        x = torch.relu(self.proj(x))
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        in_dtype = x.dtype
+        x = x.float()
+        norm = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return (norm * self.weight).to(in_dtype)
+
+
+class ToyFSDPModel(nn.Module):
+    """Embedding + norms + linears: exercises both FSDP-sharded layers
+    (Embedding/Linear) and replicated layers (RMSNorm)."""
+
+    def __init__(self, vocab_size: int = 100, d_model: int = 64, d_ff: int = 128) -> None:
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.norm1 = RMSNorm(d_model)
+        self.linear1 = nn.Linear(d_model, d_ff, bias=False)
+        self.norm2 = RMSNorm(d_ff)
+        self.linear2 = nn.Linear(d_ff, d_model, bias=False)
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.embedding(x)
+        x = self.norm1(x)
+        x = self.linear1(x)
+        x = torch.relu(x)
+        x = self.norm2(x)
+        x = self.linear2(x)
+        x = self.lm_head(x)
+        return x
+
+
+class ToyMLPModel(nn.Module):
+    """An MLP fed *raw fp32 activations*: the very first FSDP layer is a Linear
+    that receives fp32 input, so nothing casts the activation down to
+    compute_dtype before it meets a low-precision weight. This is the case that
+    crashes a weight-only-casting FSDP ("float != Half"), and the one that
+    activation-boundary casting is meant to fix. Also contains a real fp32
+    ``nn.LayerNorm`` to exercise a replicated norm on the low-precision path."""
+
+    def __init__(self, d_in: int = 16, d_hidden: int = 32, d_out: int = 16) -> None:
+        super().__init__()
+        self.l1 = nn.Linear(d_in, d_hidden, bias=False)
+        self.norm = nn.LayerNorm(d_hidden)
+        self.l2 = nn.Linear(d_hidden, d_out, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = torch.relu(self.l1(x))
         x = self.norm(x)
-        return self.out(x)
+        return self.l2(x)
 
 
-def make_dataset() -> tuple[torch.Tensor, torch.Tensor]:
-    generator = torch.Generator().manual_seed(1234)
-    tokens = torch.randint(
-        low=0,
-        high=VOCAB_SIZE,
-        size=(DATASET_SIZE, SEQ_LEN),
-        generator=generator,
-    )
-    targets = torch.randn(DATASET_SIZE, SEQ_LEN, OUT_DIM, generator=generator)
-    return tokens, targets
+# ---------------------------------------------------------------------------
+# Adapters onto this repo's FSDP API (mirrors the CS336 adapter functions)
+# ---------------------------------------------------------------------------
 
 
-def gather_full_fsdp_named_parameters(fsdp_model: FSDP) -> dict[str, torch.Tensor]:
-    """Reconstruct full parameters from FSDP local shards on every rank."""
+def get_fsdp(module: nn.Module, compute_dtype: torch.dtype | None = None) -> FSDP:
+    return FSDP(module, compute_dtype=compute_dtype)
+
+
+def fsdp_on_after_backward(fsdp_model: FSDP, optimizer: torch.optim.Optimizer) -> None:
+    # optimizer is accepted to match the CS336 signature; unused here.
+    fsdp_model.finish_gradient_synchronization()
+
+
+def fsdp_gather_full_params(fsdp_model: FSDP) -> dict[str, torch.Tensor]:
+    """Reconstruct full (unsharded) parameters from the local fp32 master
+    shards on every rank, keyed like ``module.named_parameters()``."""
     full_params: dict[str, torch.Tensor] = {}
 
     for module_name, layer in fsdp_model.module.named_modules():
         layer_state = fsdp_model._layer_states.get(layer)
         if layer_state is None:
             continue
-
         for param_name, param_state in layer_state.param_states.items():
             local_shard = param_state.local_param.detach()
             metadata = param_state.metadata
-
             if fsdp_model.world_size == 1:
                 full_flat = local_shard
             else:
-                gathered_shards = [
-                    torch.empty_like(local_shard)
-                    for _ in range(fsdp_model.world_size)
-                ]
-                dist.all_gather(gathered_shards, local_shard)
-                full_flat = torch.cat(gathered_shards, dim=0)
-
-            full_param = full_flat[: metadata.num_elements].view(metadata.shape)
-            full_name = f"{module_name}.{param_name}" if module_name else param_name
-            full_params[full_name] = full_param.detach().clone()
+                gathered = [torch.empty_like(local_shard) for _ in range(fsdp_model.world_size)]
+                dist.all_gather(gathered, local_shard)
+                full_flat = torch.cat(gathered, dim=0)
+            full = full_flat[: metadata.num_elements].view(metadata.shape)
+            name = f"{module_name}.{param_name}" if module_name else param_name
+            full_params[name] = full.detach().clone()
 
     for name, param in fsdp_model.module.named_parameters():
         if name not in full_params:
@@ -109,584 +151,390 @@ def gather_full_fsdp_named_parameters(fsdp_model: FSDP) -> dict[str, torch.Tenso
     return full_params
 
 
-def assert_rank0_matches_reference(
-    reference_model: nn.Module,
-    fsdp_model: FSDP,
-    step: int,
-) -> None:
-    fsdp_params = gather_full_fsdp_named_parameters(fsdp_model)
+# ---------------------------------------------------------------------------
+# Process group helpers
+# ---------------------------------------------------------------------------
 
-    if dist.get_rank() != 0:
-        return
 
-    reference_params = dict(reference_model.named_parameters())
-    assert reference_params.keys() == fsdp_params.keys()
+def _setup_process_group(rank: int, world_size: int, backend: str = "gloo") -> torch.device:
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ.setdefault("MASTER_PORT", "12357")
+    dist.init_process_group(backend, rank=rank, world_size=world_size)
+    return torch.device("cpu")
 
-    for name, reference_param in reference_params.items():
-        torch.testing.assert_close(
-            fsdp_params[name],
-            reference_param.detach(),
-            rtol=1e-5,
-            atol=1e-6,
-            msg=f"FSDP parameter {name!r} diverged from reference at step {step}",
+
+def _cleanup_process_group() -> None:
+    dist.destroy_process_group()
+
+
+# ---------------------------------------------------------------------------
+# Mixed-precision baseline: replicate FSDP's recipe on a single-process model
+# ---------------------------------------------------------------------------
+
+
+def _apply_mixed_precision_hooks(model: nn.Module, compute_dtype: torch.dtype) -> None:
+    """Cast Linear/Embedding weights to compute_dtype for forward/backward,
+    keep master weights + optimizer updates in fp32 (grads cast back to fp32).
+    This is the single-process analogue of what sharded FSDP does."""
+    for mod in model.modules():
+        if not isinstance(mod, (nn.Linear, nn.Embedding)):
+            continue
+
+        def make_fwd_pre(dt):
+            def hook(m, inp):
+                m._saved_fp32 = m.weight.data
+                m.weight.data = m.weight.data.to(dt)
+
+            return hook
+
+        def make_fwd_post():
+            def hook(m, inp, out):
+                m.weight.data = m._saved_fp32
+                del m._saved_fp32
+                m.weight.grad = None
+
+            return hook
+
+        mod.register_forward_pre_hook(make_fwd_pre(compute_dtype))
+        mod.register_forward_hook(make_fwd_post())
+
+        # Linear backward needs the weight in compute_dtype for grad_input.
+        if isinstance(mod, nn.Linear):
+
+            def make_bwd_pre(dt):
+                def hook(m, grad_output):
+                    m._saved_fp32_bwd = m.weight.data
+                    m.weight.data = m.weight.data.to(dt)
+                    m.weight.grad = None
+
+                return hook
+
+            mod.register_full_backward_pre_hook(make_bwd_pre(compute_dtype))
+
+        def make_grad_hook(m, is_linear):
+            def hook(param):
+                if is_linear and hasattr(m, "_saved_fp32_bwd"):
+                    m.weight.data = m._saved_fp32_bwd
+                    del m._saved_fp32_bwd
+                if param.grad is not None:
+                    param.grad = param.grad.to(torch.float32)
+
+            return hook
+
+        mod.weight.register_post_accumulate_grad_hook(
+            make_grad_hook(mod, isinstance(mod, nn.Linear))
         )
 
 
-def assert_layers_are_sharded(
-    fsdp_model: FSDP,
-    *,
-    expect_full_params: bool,
-) -> None:
-    for layer, layer_state in fsdp_model._layer_states.items():
-        for param_name, param_state in layer_state.param_states.items():
-            actual_param = getattr(layer, param_name)
-            assert actual_param is param_state.local_param
-            assert tuple(actual_param.shape) == tuple(param_state.local_param.shape)
-            if expect_full_params:
-                assert param_state.full_param is not None
-            else:
-                assert param_state.full_param is None
+def _apply_boundary_mixed_precision_hooks(model: nn.Module, compute_dtype: torch.dtype) -> None:
+    """Single-process reference for FSDP's *transparent activation-boundary*
+    mixed precision. In addition to casting each Linear/Embedding weight to
+    compute_dtype (like ``_apply_mixed_precision_hooks``), this also casts the
+    layer's floating-point *inputs* to compute_dtype on entry and casts the
+    floating-point *outputs* back to the incoming dtype on exit (for Embedding,
+    whose input is integer, outputs are restored to the fp32 master dtype).
 
+    This is exactly what the activation-aware FSDP does at each wrapped layer,
+    so an FSDP model must match a single-process model with these hooks."""
+    for mod in model.modules():
+        if not isinstance(mod, (nn.Linear, nn.Embedding)):
+            continue
+        master_dtype = mod.weight.dtype  # fp32
 
-def _full_param_is_freed(param_state) -> bool:
-    """A gathered full weight counts as freed when its underlying storage is
-    empty. We keep the Parameter object alive (so backward can refill it in a
-    later milestone), but its data must no longer occupy memory."""
-    full = param_state.full_param
-    if full is None:
-        return True
-    if full.numel() == 0:
-        return True
-    return full.untyped_storage().size() == 0
+        def make_fwd_pre(dt, master):
+            def hook(m, args):
+                m._saved_fp32 = m.weight.data
+                m.weight.data = m.weight.data.to(dt)
+                restore = master
+                for a in args:
+                    if torch.is_tensor(a) and a.is_floating_point():
+                        restore = a.dtype
+                        break
+                m._restore_dtype = restore
+                return _cast_floating(args, dt)
 
+            return hook
 
-def assert_full_params_freed_after_forward(fsdp_model: FSDP) -> None:
-    for layer, layer_state in fsdp_model._layer_states.items():
-        for param_name, param_state in layer_state.param_states.items():
-            actual_param = getattr(layer, param_name)
-            assert actual_param is param_state.local_param, (
-                f"layer attribute {param_name!r} should point back at the local shard"
-            )
-            assert tuple(actual_param.shape) == tuple(param_state.local_param.shape)
-            assert _full_param_is_freed(param_state), (
-                f"full weight for {param_name!r} was not freed after forward"
-            )
+        def make_fwd_post():
+            def hook(m, args, out):
+                m.weight.data = m._saved_fp32
+                del m._saved_fp32
+                m.weight.grad = None
+                return _cast_floating(out, m._restore_dtype)
 
+            return hook
 
-def broadcast_reference_model(reference_model: nn.Module) -> None:
-    with torch.no_grad():
-        for param in reference_model.parameters():
-            dist.broadcast(param.data, src=0)
-        for buffer in reference_model.buffers():
-            dist.broadcast(buffer.data, src=0)
+        mod.register_forward_pre_hook(make_fwd_pre(compute_dtype, master_dtype))
+        mod.register_forward_hook(make_fwd_post())
 
+        if isinstance(mod, nn.Linear):
 
-def run_forward_lifecycle_test(rank: int, world_size: int) -> None:
-    """Milestone 1 verification.
+            def make_bwd_pre(dt):
+                def hook(m, grad_output):
+                    m._saved_fp32_bwd = m.weight.data
+                    m.weight.data = m.weight.data.to(dt)
+                    m.weight.grad = None
 
-    Checks three things about the forward pass:
-      1. The FSDP forward output still matches the reference model (gather works).
-      2. Every gathered full weight is freed once its layer's forward is done.
-      3. At most one FSDP layer's full weight is materialized at any instant
-         (no prefetch yet), proving we gather-then-free layer by layer.
-    """
-    setup(rank, world_size)
+                return hook
 
-    try:
-        torch.manual_seed(rank)
-        reference_model = TinyFSDPModel()
-        broadcast_reference_model(reference_model)
-        fsdp_model = FSDP(deepcopy(reference_model))
+            mod.register_full_backward_pre_hook(make_bwd_pre(compute_dtype))
 
-        # Measure how many FSDP layers hold a *materialized* (non-empty) full
-        # weight at the same time, by inspecting real storage state instead of
-        # intercepting method calls (so it doesn't matter how the free path is
-        # factored inside fsdp.py). We sample right after each layer's weights
-        # have been gathered: our pre-hook is registered *after* FSDP's own
-        # pre-hook, so it runs second and sees the freshly gathered state.
-        # Without prefetching, the peak must be exactly 1: by the time layer i
-        # is gathered, layer i-1 has already been freed in its post-hook.
-        peak_live = {"value": 0}
+        def make_grad_hook(m, is_linear):
+            def hook(param):
+                if is_linear and hasattr(m, "_saved_fp32_bwd"):
+                    m.weight.data = m._saved_fp32_bwd
+                    del m._saved_fp32_bwd
+                if param.grad is not None:
+                    param.grad = param.grad.to(torch.float32)
 
-        def count_materialized_layers() -> int:
-            materialized = 0
-            for layer_state in fsdp_model._layer_states.values():
-                if any(
-                    not _full_param_is_freed(param_state)
-                    for param_state in layer_state.param_states.values()
-                ):
-                    materialized += 1
-            return materialized
+            return hook
 
-        def sample_after_gather(_layer, _inputs):
-            peak_live["value"] = max(peak_live["value"], count_materialized_layers())
-
-        for fsdp_layer in fsdp_model.fsdp_layers:
-            fsdp_layer.register_forward_pre_hook(sample_after_gather)
-
-        tokens, _ = make_dataset()
-        local_batch_size = DATASET_SIZE // world_size
-        offset = rank * local_batch_size
-        local_tokens = tokens[offset : offset + local_batch_size]
-
-        reference_outputs = reference_model(local_tokens)
-        fsdp_outputs = fsdp_model(local_tokens)
-
-        torch.testing.assert_close(
-            fsdp_outputs,
-            reference_outputs,
-            rtol=1e-5,
-            atol=1e-6,
-        )
-        assert_full_params_freed_after_forward(fsdp_model)
-
-        assert peak_live["value"] == 1, (
-            f"expected at most one materialized full weight at a time, "
-            f"but peak was {peak_live['value']}"
+        mod.weight.register_post_accumulate_grad_hook(
+            make_grad_hook(mod, isinstance(mod, nn.Linear))
         )
 
-        if rank == 0:
-            print(
-                "Milestone 1 OK: forward matched reference, full weights freed, "
-                f"peak simultaneous full weights = {peak_live['value']}."
-            )
-    finally:
-        cleanup()
 
+# ---------------------------------------------------------------------------
+# Correctness: sharded FSDP == single-process baseline
+# ---------------------------------------------------------------------------
 
-def install_backward_peak_probe(fsdp_model: FSDP, peak_live: dict) -> None:
-    """Sample how many FSDP layers are simultaneously materialized during the
-    backward pass. We wrap `_regather_layer_params`, which runs right after a
-    layer's weight has been re-gathered for its backward. By that point every
-    layer processed earlier in the backward must already be freed, so the peak
-    stays at 1. If a layer forgets to free, upstream layers pile up and the
-    peak climbs.
 
-    This is best-effort instrumentation: if the method was renamed, we skip it
-    and rely on the end-to-end correctness check instead.
-    """
-    method_name = (
-        "_gather_layer_params_for_backward"
-        if hasattr(fsdp_model, "_gather_layer_params_for_backward")
-        else "_regather_layer_params"
-    )
-    original = getattr(fsdp_model, method_name, None)
-    if original is None:
-        return
+def _test_fsdp_correctness(rank: int, world_size: int, compute_dtype) -> None:
+    torch.use_deterministic_algorithms(True)
+    device = _setup_process_group(rank=rank, world_size=world_size, backend="gloo")
+    dist.barrier()
 
-    def count_materialized_layers() -> int:
-        materialized = 0
-        for layer_state in fsdp_model._layer_states.values():
-            if any(
-                not _full_param_is_freed(param_state)
-                for param_state in layer_state.param_states.values()
-            ):
-                materialized += 1
-        return materialized
+    torch.manual_seed(42)
+    base_model = ToyFSDPModel(vocab_size=100, d_model=64, d_ff=128).to(device)
 
-    def probed(layer):
-        result = original(layer)
-        peak_live["value"] = max(peak_live["value"], count_materialized_layers())
-        return result
+    non_parallel_model = deepcopy(base_model)
+    if compute_dtype is not None:
+        _apply_mixed_precision_hooks(non_parallel_model, compute_dtype)
 
-    setattr(fsdp_model, method_name, probed)
+    fsdp_model = get_fsdp(deepcopy(base_model), compute_dtype=compute_dtype)
 
+    loss_fn = nn.CrossEntropyLoss()
+    fsdp_optimizer = torch.optim.SGD(fsdp_model.parameters(), lr=0.01)
+    non_parallel_optimizer = torch.optim.SGD(non_parallel_model.parameters(), lr=0.01)
 
-def _count_materialized_layers(fsdp_model: FSDP) -> int:
-    materialized = 0
-    for layer_state in fsdp_model._layer_states.values():
-        if any(
-            not _full_param_is_freed(param_state)
-            for param_state in layer_state.param_states.values()
-        ):
-            materialized += 1
-    return materialized
+    torch.manual_seed(123)
+    batch_size = 20
+    seq_len = 8
+    all_input_ids = torch.randint(0, 100, (batch_size, seq_len), device=device)
+    all_labels = torch.randint(0, 100, (batch_size,), device=device)
 
+    local_bs = batch_size // world_size
 
-def install_forward_peak_probe(fsdp_model: FSDP, fwd_peak: dict) -> None:
-    """Sample how many FSDP layers hold a materialized full weight during the
-    forward pass. With the 'start gathering layer i once layer i-2 has finished
-    its forward' prefetch rule, exactly one layer is prefetched ahead of the
-    one currently in use, so the peak is 2 (for a model with >= 3 FSDP layers).
+    for step in range(3):
+        fsdp_optimizer.zero_grad(set_to_none=True)
+        non_parallel_optimizer.zero_grad(set_to_none=True)
 
-    - No prefetch (just-in-time gather) would give a peak of 1.
-    - Prefetching everything up front would give a peak of #layers (here 3).
+        non_parallel_out = non_parallel_model(all_input_ids)
+        non_parallel_loss = loss_fn(non_parallel_out[:, -1, :].float(), all_labels)
+        non_parallel_loss.backward()
+        non_parallel_optimizer.step()
 
-    We register our own pre/post forward hooks; they run after FSDP's own hooks
-    (registration order), so they observe the post-use / post-free+prefetch
-    state. A prefetched-but-not-yet-used layer counts as materialized because
-    its full weight storage is already allocated for the in-flight all-gather.
-    """
-
-    def sample(*_args):
-        fwd_peak["value"] = max(fwd_peak["value"], _count_materialized_layers(fsdp_model))
-
-    for layer in fsdp_model.fsdp_layers:
-        layer.register_forward_pre_hook(sample)
-        layer.register_forward_hook(sample)
-
-
-def install_async_all_gather_probe(ag_calls: dict) -> callable:
-    """Record whether the weight all-gather is issued asynchronously (so it can
-    be prefetched and overlap with compute). Detects both the flat
-    `all_gather_into_tensor` and the list-based `all_gather` APIs. Returns a
-    restore() callable."""
-    original_into = getattr(dist, "all_gather_into_tensor", None)
-    original_list = getattr(dist, "all_gather", None)
-
-    def make_traced(original):
-        def traced(*args, **kwargs):
-            if kwargs.get("async_op", False):
-                ag_calls["async"] += 1
-            else:
-                ag_calls["sync"] += 1
-            return original(*args, **kwargs)
-
-        return traced
-
-    if original_into is not None:
-        dist.all_gather_into_tensor = make_traced(original_into)
-    if original_list is not None:
-        dist.all_gather = make_traced(original_list)
-
-    def restore() -> None:
-        if original_into is not None:
-            dist.all_gather_into_tensor = original_into
-        if original_list is not None:
-            dist.all_gather = original_list
-
-    return restore
-
-
-def install_async_reduce_scatter_probe(async_calls: dict) -> callable:
-    """Record whether reduce-scatter is issued asynchronously. Returns a
-    restore() callable that undoes the patch. Milestone 3 requires the
-    gradient reduce-scatter to run with async_op=True so it can overlap with
-    the remaining backward compute."""
-    original = dist.reduce_scatter_tensor
-
-    def traced(*args, **kwargs):
-        if kwargs.get("async_op", False):
-            async_calls["async"] += 1
-        else:
-            async_calls["sync"] += 1
-        return original(*args, **kwargs)
-
-    dist.reduce_scatter_tensor = traced
-
-    def restore() -> None:
-        dist.reduce_scatter_tensor = original
-
-    return restore
-
-
-def run_training_test(rank: int, world_size: int) -> None:
-    setup(rank, world_size)
-
-    try:
-        torch.manual_seed(rank)
-        reference_model = TinyFSDPModel()
-        broadcast_reference_model(reference_model)
-        fsdp_model = FSDP(deepcopy(reference_model))
-
-        peak_live = {"value": 0}
-        install_backward_peak_probe(fsdp_model, peak_live)
-
-        fwd_peak = {"value": 0}
-        install_forward_peak_probe(fsdp_model, fwd_peak)
-
-        async_calls = {"async": 0, "sync": 0}
-        restore_reduce_scatter = install_async_reduce_scatter_probe(async_calls)
-
-        all_gather_calls = {"async": 0, "sync": 0}
-        restore_all_gather = install_async_all_gather_probe(all_gather_calls)
-
-        optimizer_kwargs = {"lr": 0.03}
-        reference_optimizer = torch.optim.SGD(
-            reference_model.parameters(),
-            **optimizer_kwargs,
-        )
-        fsdp_optimizer = torch.optim.SGD(
-            fsdp_model.parameters(),
-            **optimizer_kwargs,
-        )
-        loss_fn = nn.MSELoss()
-
-        all_tokens, all_targets = make_dataset()
-        assert DATASET_SIZE % world_size == 0
-        local_batch_size = DATASET_SIZE // world_size
-
-        for step in range(NUM_STEPS):
-            reference_optimizer.zero_grad()
-            fsdp_optimizer.zero_grad()
-
-            reference_outputs = reference_model(all_tokens)
-            reference_loss = loss_fn(reference_outputs, all_targets)
-            reference_loss.backward()
-            reference_optimizer.step()
-
-            offset = rank * local_batch_size
-            local_tokens = all_tokens[offset : offset + local_batch_size]
-            local_targets = all_targets[offset : offset + local_batch_size]
-
-            fsdp_outputs = fsdp_model(local_tokens)
-            fsdp_loss = loss_fn(fsdp_outputs, local_targets)
-            fsdp_loss.backward()
-            fsdp_model.finish_gradient_synchronization()
-
-            # After sync, weights must be back to sharded local shards and every
-            # gathered full weight must be freed (backward re-gather cleaned up).
-            assert_full_params_freed_after_forward(fsdp_model)
-            fsdp_optimizer.step()
-
-            assert_rank0_matches_reference(reference_model, fsdp_model, step)
-
-        restore_reduce_scatter()
-        restore_all_gather()
-
-        assert peak_live["value"] <= 1, (
-            f"expected at most one materialized full weight during backward, "
-            f"but peak was {peak_live['value']} (a layer likely did not free "
-            f"its re-gathered weight)"
-        )
-
-        assert async_calls["async"] > 0, (
-            "expected the gradient reduce-scatter to be issued with "
-            "async_op=True so it can overlap with backward compute, but every "
-            f"reduce-scatter was synchronous (async={async_calls['async']}, "
-            f"sync={async_calls['sync']})"
-        )
-
-        assert all_gather_calls["async"] > 0, (
-            "expected the weight all-gather to be issued with async_op=True so "
-            "it can be prefetched and overlap with compute, but every "
-            f"all-gather was synchronous (async={all_gather_calls['async']}, "
-            f"sync={all_gather_calls['sync']})"
-        )
-
-        assert fwd_peak["value"] == 2, (
-            f"expected forward peak of exactly 2 materialized layers with the "
-            f"'gather layer i after layer i-2 finished forward' prefetch rule "
-            f"(one in use + one prefetched ahead), but peak was "
-            f"{fwd_peak['value']}. A peak of 1 means no prefetch; a peak of 3 "
-            f"means everything was gathered up front."
-        )
-
-        if rank == 0:
-            print(
-                f"Milestone 4 OK: FSDP matched the reference for {NUM_STEPS} steps; "
-                f"forward peak materialized layers = {fwd_peak['value']}; "
-                f"async all-gathers = {all_gather_calls['async']}; "
-                f"backward peak = {peak_live['value']}; "
-                f"async reduce-scatters = {async_calls['async']}."
-            )
-    finally:
-        cleanup()
-
-
-def build_mp_base() -> nn.Sequential:
-    """A pure-Linear MLP so mixed-precision compute flows cleanly (no norm /
-    embedding dtype boundaries to worry about)."""
-    layers: list[nn.Module] = []
-    for i in range(len(MP_DIMS) - 1):
-        layers.append(nn.Linear(MP_DIMS[i], MP_DIMS[i + 1]))
-        if i < len(MP_DIMS) - 2:
-            layers.append(nn.ReLU())
-    return nn.Sequential(*layers)
-
-
-class MixedPrecisionReference(nn.Module):
-    """Single-process replica of FSDP's mixed-precision recipe: fp32 master
-    weights, cast to compute_dtype for the matmul (so grads flow back into the
-    fp32 masters), exactly what sharded FSDP should reproduce."""
-
-    def __init__(self, base: nn.Sequential, compute_dtype: torch.dtype) -> None:
-        super().__init__()
-        self.base = base
-        self.compute_dtype = compute_dtype
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        for module in self.base:
-            if isinstance(module, nn.Linear):
-                bias = None if module.bias is None else module.bias.to(self.compute_dtype)
-                x = F.linear(x, module.weight.to(self.compute_dtype), bias)
-            else:
-                x = module(x)
-        return x
-
-
-def install_comm_dtype_probe(dtypes: dict) -> callable:
-    """Record the dtype of every tensor handed to the weight all-gather and the
-    gradient reduce-scatter, so we can assert communication happens in the low
-    compute dtype (the bandwidth win), not fp32."""
-    orig_ag_into = getattr(dist, "all_gather_into_tensor", None)
-    orig_ag_list = getattr(dist, "all_gather", None)
-    orig_rs = dist.reduce_scatter_tensor
-
-    def ag_into(output, input, *args, **kwargs):
-        dtypes["all_gather"].add(output.dtype)
-        dtypes["all_gather"].add(input.dtype)
-        return orig_ag_into(output, input, *args, **kwargs)
-
-    def ag_list(tensor_list, tensor, *args, **kwargs):
-        dtypes["all_gather"].add(tensor.dtype)
-        return orig_ag_list(tensor_list, tensor, *args, **kwargs)
-
-    def rs(output, input, *args, **kwargs):
-        dtypes["reduce_scatter"].add(output.dtype)
-        dtypes["reduce_scatter"].add(input.dtype)
-        return orig_rs(output, input, *args, **kwargs)
-
-    if orig_ag_into is not None:
-        dist.all_gather_into_tensor = ag_into
-    if orig_ag_list is not None:
-        dist.all_gather = ag_list
-    dist.reduce_scatter_tensor = rs
-
-    def restore() -> None:
-        if orig_ag_into is not None:
-            dist.all_gather_into_tensor = orig_ag_into
-        if orig_ag_list is not None:
-            dist.all_gather = orig_ag_list
-        dist.reduce_scatter_tensor = orig_rs
-
-    return restore
-
-
-def assert_masters_are_fp32(fsdp_model: FSDP) -> None:
-    for layer_state in fsdp_model._layer_states.values():
-        for param_state in layer_state.param_states.values():
-            assert param_state.local_param.dtype == torch.float32, (
-                "master weight (local shard) must stay fp32, got "
-                f"{param_state.local_param.dtype}"
-            )
-            if param_state.local_param.grad is not None:
-                assert param_state.local_param.grad.dtype == torch.float32, (
-                    "master weight gradient must be cast back to fp32 for the "
-                    f"optimizer, got {param_state.local_param.grad.dtype}"
-                )
-
-
-def run_mixed_precision_test(rank: int, world_size: int) -> None:
-    """Milestone 5 verification.
-
-    - Weights are communicated (all-gather + reduce-scatter) in compute_dtype.
-    - The full weight seen during forward is compute_dtype.
-    - Master shards and their gradients stay fp32.
-    - The forward output exactly matches a single-process mixed-precision
-      reference (gathered low-precision weights are bit-identical to casting the
-      full fp32 weight), and a few training steps stay close to that reference.
-    """
-    setup(rank, world_size)
-
-    try:
-        torch.manual_seed(rank)
-        base = build_mp_base()
-        broadcast_reference_model(base)
-
-        reference = MixedPrecisionReference(deepcopy(base), COMPUTE_DTYPE)
-        fsdp_model = FSDP(deepcopy(base), compute_dtype=COMPUTE_DTYPE)
-
-        generator = torch.Generator().manual_seed(4321)
-        inputs = torch.randn(DATASET_SIZE, MP_DIMS[0], generator=generator).to(COMPUTE_DTYPE)
-        targets = torch.randn(DATASET_SIZE, MP_DIMS[-1], generator=generator)
-
-        assert DATASET_SIZE % world_size == 0
-        local_bs = DATASET_SIZE // world_size
         offset = rank * local_bs
-        local_inputs = inputs[offset : offset + local_bs]
-        local_targets = targets[offset : offset + local_bs]
+        local_input = all_input_ids[offset : offset + local_bs]
+        local_labels = all_labels[offset : offset + local_bs]
+        fsdp_out = fsdp_model(local_input)
+        fsdp_loss = loss_fn(fsdp_out[:, -1, :].float(), local_labels)
+        fsdp_loss.backward()
 
-        # Capture the dtype of the weight the layer actually computes with.
-        seen_weight_dtypes: set = set()
+        fsdp_on_after_backward(fsdp_model, fsdp_optimizer)
+        fsdp_optimizer.step()
 
-        def record_weight_dtype(layer, _inputs):
-            seen_weight_dtypes.add(getattr(layer, "weight").dtype)
-
-        for layer in fsdp_model.fsdp_layers:
-            layer.register_forward_pre_hook(record_weight_dtype)
-
-        # Forward output must match the reference exactly at init: gathering
-        # bf16 shards reconstructs the same weight as casting the full weight.
-        with torch.no_grad():
-            fsdp_out0 = fsdp_model(local_inputs).float()
-            ref_out0 = reference(local_inputs).float()
-        torch.testing.assert_close(fsdp_out0, ref_out0, rtol=0, atol=0)
-
-        assert seen_weight_dtypes == {COMPUTE_DTYPE}, (
-            f"forward should compute with {COMPUTE_DTYPE} weights, saw {seen_weight_dtypes}"
-        )
-
-        optimizer_kwargs = {"lr": 0.05}
-        reference_optimizer = torch.optim.SGD(reference.parameters(), **optimizer_kwargs)
-        fsdp_optimizer = torch.optim.SGD(fsdp_model.parameters(), **optimizer_kwargs)
-        loss_fn = nn.MSELoss()
-
-        comm_dtypes = {"all_gather": set(), "reduce_scatter": set()}
-        restore_comm = install_comm_dtype_probe(comm_dtypes)
-
-        try:
-            for _ in range(NUM_STEPS):
-                reference_optimizer.zero_grad()
-                reference_out = reference(inputs).float()
-                reference_loss = loss_fn(reference_out, targets)
-                reference_loss.backward()
-                reference_optimizer.step()
-
-                fsdp_optimizer.zero_grad()
-                fsdp_out = fsdp_model(local_inputs).float()
-                fsdp_loss = loss_fn(fsdp_out, local_targets)
-                fsdp_loss.backward()
-                fsdp_model.finish_gradient_synchronization()
-                assert_masters_are_fp32(fsdp_model)
-                fsdp_optimizer.step()
-        finally:
-            restore_comm()
-
-        assert comm_dtypes["all_gather"] == {COMPUTE_DTYPE}, (
-            f"weights must be all-gathered in {COMPUTE_DTYPE}, saw {comm_dtypes['all_gather']}"
-        )
-        assert comm_dtypes["reduce_scatter"] == {COMPUTE_DTYPE}, (
-            f"gradients must be reduce-scattered in {COMPUTE_DTYPE}, saw {comm_dtypes['reduce_scatter']}"
-        )
-
-        # After a few steps, the sharded mixed-precision result should track the
-        # single-process reference closely (small bf16 reduction differences).
-        fsdp_full = gather_full_fsdp_named_parameters(fsdp_model)
-        if dist.get_rank() == 0:
-            reference_params = dict(reference.base.named_parameters())
-            assert reference_params.keys() == fsdp_full.keys()
-            for name, ref_param in reference_params.items():
-                torch.testing.assert_close(
-                    fsdp_full[name],
-                    ref_param.detach(),
-                    rtol=2e-2,
-                    atol=2e-2,
-                    msg=f"mixed-precision param {name!r} drifted from reference",
-                )
-            print(
-                "Milestone 5 OK: weights communicated in "
-                f"{COMPUTE_DTYPE}, masters + grads fp32, forward matched the "
-                "mixed-precision reference."
+        full_params = fsdp_gather_full_params(fsdp_model)
+        for name, np_param in non_parallel_model.named_parameters():
+            fsdp_full = full_params[name]
+            atol = 1e-6 if compute_dtype is None else 1e-4
+            rtol = 1e-4
+            assert torch.allclose(np_param.data, fsdp_full, atol=atol, rtol=rtol), (
+                f"Step {step}: Parameter {name} mismatch. Max diff: "
+                f"{(np_param.data - fsdp_full).abs().max().item()}"
             )
-    finally:
-        cleanup()
+
+        torch.manual_seed(42 + step)
+        perm = torch.randperm(batch_size)
+        all_input_ids = all_input_ids[perm]
+        all_labels = all_labels[perm]
+
+    if rank == 0:
+        tag = "fp32" if compute_dtype is None else str(compute_dtype)
+        print(f"test_fsdp_correctness[{tag}]: matched the baseline for 3 steps.")
+
+    _cleanup_process_group()
 
 
-def run_all(rank: int, world_size: int) -> None:
-    run_training_test(rank, world_size)
-    run_mixed_precision_test(rank, world_size)
+# ---------------------------------------------------------------------------
+# Gradient sync: shapes, dtypes, and replicated-grad agreement across ranks
+# ---------------------------------------------------------------------------
+
+
+def _test_fsdp_gradient_sync(rank: int, world_size: int, compute_dtype) -> None:
+    torch.use_deterministic_algorithms(True)
+    device = _setup_process_group(rank=rank, world_size=world_size, backend="gloo")
+    dist.barrier()
+
+    torch.manual_seed(42)
+    model = ToyFSDPModel(vocab_size=100, d_model=64, d_ff=128).to(device)
+    fsdp_model = get_fsdp(model, compute_dtype=compute_dtype)
+
+    # Each rank gets different data, so replicated grads must be synced.
+    torch.manual_seed(rank)
+    input_ids = torch.randint(0, 100, (4, 8), device=device)
+
+    fsdp_optimizer = torch.optim.SGD(fsdp_model.parameters(), lr=0.01)
+
+    out = fsdp_model(input_ids)
+    loss = out.sum()
+    loss.backward()
+
+    fsdp_on_after_backward(fsdp_model, fsdp_optimizer)
+
+    # Every parameter must carry a gradient matching its (sharded) data shape,
+    # in the fp32 master dtype, regardless of compute_dtype.
+    for name, param in fsdp_model.module.named_parameters():
+        if not param.requires_grad:
+            continue
+        assert param.grad is not None, f"Gradient is None for {name}"
+        assert param.grad.shape == param.data.shape, (
+            f"Gradient shape {param.grad.shape} != data shape {param.data.shape} for {name}"
+        )
+        assert param.grad.dtype == param.data.dtype, (
+            f"Gradient dtype {param.grad.dtype} != data dtype {param.data.dtype} for {name}"
+        )
+
+    # Replicated (non-FSDP) parameter gradients must be identical across ranks.
+    for name, param in fsdp_model.module.named_parameters():
+        if not param.requires_grad:
+            continue
+        parts = name.rsplit(".", 1)
+        modules = dict(fsdp_model.module.named_modules())
+        mod = modules[parts[0]] if len(parts) == 2 else fsdp_model.module
+        if isinstance(mod, (nn.Linear, nn.Embedding)):
+            continue
+        gathered = [torch.zeros_like(param.grad) for _ in range(world_size)]
+        dist.all_gather(gathered, param.grad)
+        for r in range(1, world_size):
+            assert torch.allclose(gathered[0], gathered[r], atol=1e-4, rtol=1e-4), (
+                f"Replicated gradient for {name} differs between rank 0 and rank {r}. "
+                f"Max diff: {(gathered[0] - gathered[r]).abs().max().item()}"
+            )
+
+    if rank == 0:
+        tag = "fp32" if compute_dtype is None else str(compute_dtype)
+        print(f"test_fsdp_gradient_sync[{tag}]: grads shaped/typed and replicas synced.")
+
+    _cleanup_process_group()
+
+
+# ---------------------------------------------------------------------------
+# Robustness: activation-dtype handling for arbitrary (fp32-activation) models
+# ---------------------------------------------------------------------------
+
+
+def _test_fsdp_activation_dtype(rank: int, world_size: int, compute_dtype) -> None:
+    """FSDP must run a model whose activations are NOT already in compute_dtype
+    (here, a Linear-first MLP fed fp32 input) and match a single-process model
+    with matching boundary mixed-precision hooks. Also checks masters/grads
+    stay fp32."""
+    torch.use_deterministic_algorithms(True)
+    device = _setup_process_group(rank=rank, world_size=world_size, backend="gloo")
+    dist.barrier()
+
+    torch.manual_seed(7)
+    base_model = ToyMLPModel(d_in=16, d_hidden=32, d_out=16).to(device)
+
+    ref_model = deepcopy(base_model)
+    if compute_dtype is not None:
+        _apply_boundary_mixed_precision_hooks(ref_model, compute_dtype)
+
+    fsdp_model = get_fsdp(deepcopy(base_model), compute_dtype=compute_dtype)
+
+    fsdp_optimizer = torch.optim.SGD(fsdp_model.parameters(), lr=0.05)
+    ref_optimizer = torch.optim.SGD(ref_model.parameters(), lr=0.05)
+
+    torch.manual_seed(99)
+    batch_size = 16
+    all_x = torch.randn(batch_size, 16, device=device)
+    all_y = torch.randn(batch_size, 16, device=device)
+    local_bs = batch_size // world_size
+
+    for step in range(3):
+        fsdp_optimizer.zero_grad(set_to_none=True)
+        ref_optimizer.zero_grad(set_to_none=True)
+
+        ref_out = ref_model(all_x)
+        ref_loss = F.mse_loss(ref_out.float(), all_y)
+        ref_loss.backward()
+        ref_optimizer.step()
+
+        offset = rank * local_bs
+        local_x = all_x[offset : offset + local_bs]
+        local_y = all_y[offset : offset + local_bs]
+        fsdp_out = fsdp_model(local_x)
+        fsdp_loss = F.mse_loss(fsdp_out.float(), local_y)
+        fsdp_loss.backward()
+
+        fsdp_on_after_backward(fsdp_model, fsdp_optimizer)
+        fsdp_optimizer.step()
+
+        # Master weights and their grads must stay fp32 regardless of compute_dtype.
+        for name, param in fsdp_model.module.named_parameters():
+            assert param.data.dtype == torch.float32, f"{name} master is {param.data.dtype}"
+            if param.grad is not None:
+                assert param.grad.dtype == torch.float32, f"{name} grad is {param.grad.dtype}"
+
+        full_params = fsdp_gather_full_params(fsdp_model)
+        atol = 1e-6 if compute_dtype is None else 2e-3
+        rtol = 1e-4 if compute_dtype is None else 2e-3
+        for name, ref_param in ref_model.named_parameters():
+            fsdp_full = full_params[name]
+            assert torch.allclose(ref_param.data, fsdp_full, atol=atol, rtol=rtol), (
+                f"Step {step}: Parameter {name} mismatch. Max diff: "
+                f"{(ref_param.data - fsdp_full).abs().max().item()}"
+            )
+
+    if rank == 0:
+        tag = "fp32" if compute_dtype is None else str(compute_dtype)
+        print(f"test_fsdp_activation_dtype[{tag}]: fp32-activation MLP ran and matched reference.")
+
+    _cleanup_process_group()
+
+
+# ---------------------------------------------------------------------------
+# Runners (script equivalents of the pytest-parametrized entry points)
+# ---------------------------------------------------------------------------
+
+WORLD_SIZE = 2
+_PORT = 12357
+
+
+def _spawn(fn, compute_dtype) -> None:
+    global _PORT
+    _PORT += 1
+    os.environ["MASTER_PORT"] = str(_PORT)
+    mp.spawn(fn, args=(WORLD_SIZE, compute_dtype), nprocs=WORLD_SIZE, join=True)
+
+
+def test_fsdp_correctness(compute_dtype) -> None:
+    _spawn(_test_fsdp_correctness, compute_dtype)
+
+
+def test_fsdp_gradient_sync(compute_dtype) -> None:
+    _spawn(_test_fsdp_gradient_sync, compute_dtype)
+
+
+def test_fsdp_activation_dtype(compute_dtype) -> None:
+    _spawn(_test_fsdp_activation_dtype, compute_dtype)
 
 
 def main() -> None:
-    # Milestone 5: fp32 regression (M1-M4) plus the mixed-precision contract -
-    # weights are communicated in compute_dtype while masters/grads stay fp32.
-    mp.spawn(
-        run_all,
-        args=(WORLD_SIZE,),
-        nprocs=WORLD_SIZE,
-        join=True,
-    )
+    for compute_dtype in (None, torch.float16):
+        test_fsdp_correctness(compute_dtype)
+        test_fsdp_gradient_sync(compute_dtype)
+        test_fsdp_activation_dtype(compute_dtype)
 
 
 if __name__ == "__main__":

@@ -27,6 +27,7 @@ class FSDPParamState:
 class FSDPLayerState:
     layer: torch.nn.Module
     param_states: dict[str, FSDPParamState] = field(default_factory=dict)
+    restore_dtype: torch.dtype | None = None
 
 @dataclass
 class PendingReduceScatter:
@@ -34,6 +35,32 @@ class PendingReduceScatter:
     output: torch.Tensor # the local shard grad. valid after the wait()
     input_keepalive: torch.Tensor # keep the reduce scatters input alive until we are done with it
     local_param: torch.nn.Parameter | None = None # for the finalized grad
+
+def _cast_floating(obj, dtype: torch.dtype):
+    """
+    Cast every floating-point Tensor in obj (Tensor / tuple / list) to
+    `dtype` via a differentiable .to(); leave integer/bool tensors (e.g.
+    Embedding indices) and non-tensors untouched.
+    """
+    if torch.is_tensor(obj):
+        return obj.to(dtype) if obj.is_floating_point() else obj
+    if isinstance(obj, tuple):
+        return tuple(_cast_floating(o, dtype) for o in obj)
+    if isinstance(obj, list):
+        return [_cast_floating(o, dtype) for o in obj]
+    return obj
+
+def _infer_restore_dtype(layer: torch.nn.Module, inputs: tuple) -> torch.dtype:
+    """
+    dtype that floating-point OUTPUTS are cast back to on exit. Use the first
+    floating-point input's dtype (keeps FSDP transparent to the surrounding
+    model). If there's no floating-point input (e.g. Embedding takes integer
+    indices), fall back to the layer's fp32 master weight dtype.
+    """
+    for input in inputs:
+        if torch.is_tensor(input) and input.is_floating_point():
+            return input.dtype
+    return layer.weight.dtype
 
 class FSDP(torch.nn.Module):
     def __init__(self, 
@@ -224,8 +251,13 @@ class FSDP(torch.nn.Module):
         """
         Pre-forward hook for the FSDP layers.
         We should do the all-gather of the parameters for the forward pass.
+        Also cast the inputs to the compute dtype.
         """
         self._use_prefetched_layer(layer)
+        if self.compute_dtype is None:
+            return None
+        self._layer_states[layer].restore_dtype = _infer_restore_dtype(layer, inputs)
+        return _cast_floating(inputs, self.compute_dtype)
 
     def _post_forward_hook(self, layer: torch.nn.Module, inputs: tuple[torch.Tensor, ...], outputs: torch.Tensor):
         """
@@ -239,6 +271,10 @@ class FSDP(torch.nn.Module):
         next_2_index = self._layer_index[layer] + 2
         if next_2_index < len(self.fsdp_layers):
             self._prefetch_layer(self.fsdp_layers[next_2_index])
+
+        if self.compute_dtype is None:
+            return None
+        return _cast_floating(outputs, self._layer_states[layer].restore_dtype)
 
     def _register_forward_hooks(self) -> None:
         """
