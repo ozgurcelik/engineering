@@ -90,6 +90,7 @@ class FSDP(torch.nn.Module):
         self.fsdp_layers: list[torch.nn.Module] = []
         self._replicate_parameters: list[torch.nn.Parameter] = []
         self._find_fsdp_layers_and_replicated_parameters()
+        self._cast_replicated_params_to_float32()
         self._layer_index = {layer: i for i, layer in enumerate(self.fsdp_layers)}
         self._create_layer_states()
         self._register_forward_hooks()
@@ -120,6 +121,13 @@ class FSDP(torch.nn.Module):
                 for param in submodule.parameters(recurse=False):
                     if param.requires_grad:
                         self._replicate_parameters.append(param)
+
+    def _cast_replicated_params_to_float32(self) -> None:
+        """
+        Cast the replicated parameters to float32.
+        """
+        for param in self._replicate_parameters:
+            param.data = param.data.to(torch.float32)
     
     def _get_shard_metadata(self, param: torch.nn.Parameter) -> ShardMetadata:
         """
@@ -152,7 +160,8 @@ class FSDP(torch.nn.Module):
             padding = torch.zeros(metadata.padded_num_elements - metadata.num_elements, dtype=param.dtype, device=param.device)
             flattened_param = torch.cat([flattened_param, padding])
 
-        local_shard = flattened_param[metadata.start:metadata.end].clone()
+        # Master weight is always in float32.
+        local_shard = flattened_param[metadata.start:metadata.end].clone().to(torch.float32)
         return local_shard, metadata
 
     def _create_layer_state(self, layer: torch.nn.Module) -> FSDPLayerState:
