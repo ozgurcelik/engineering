@@ -108,6 +108,30 @@ class ToyMLPModel(nn.Module):
         return self.l2(x)
 
 
+class FrozenShardedParamModel(nn.Module):
+    """Contains frozen Embedding/Linear parameters, which FSDP still needs to
+    all-gather for compute but must not turn into trainable local shards."""
+
+    frozen_names = {"embedding.weight", "linear2.weight", "linear2.bias"}
+
+    def __init__(self, vocab_size: int = 29, d_model: int = 9, d_hidden: int = 17, d_out: int = 5) -> None:
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.linear1 = nn.Linear(d_model, d_hidden)
+        self.linear2 = nn.Linear(d_hidden, d_hidden)
+        self.linear3 = nn.Linear(d_hidden, d_out)
+
+        self.embedding.weight.requires_grad = False
+        self.linear2.weight.requires_grad = False
+        self.linear2.bias.requires_grad = False
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.embedding(x).mean(dim=1)
+        x = torch.relu(self.linear1(x))
+        x = torch.relu(self.linear2(x))
+        return self.linear3(x)
+
+
 # ---------------------------------------------------------------------------
 # Adapters onto this repo's FSDP API (mirrors the CS336 adapter functions)
 # ---------------------------------------------------------------------------
@@ -504,6 +528,59 @@ def _test_fsdp_activation_dtype(rank: int, world_size: int, compute_dtype) -> No
 
 
 # ---------------------------------------------------------------------------
+# Frozen sharded params: requires_grad must survive FSDP wrapping
+# ---------------------------------------------------------------------------
+
+
+def _test_fsdp_preserves_requires_grad(rank: int, world_size: int, compute_dtype) -> None:
+    torch.use_deterministic_algorithms(True)
+    device = _setup_process_group(rank=rank, world_size=world_size, backend="gloo")
+    dist.barrier()
+
+    torch.manual_seed(17)
+    model = FrozenShardedParamModel().to(device)
+    fsdp_model = get_fsdp(deepcopy(model), compute_dtype=compute_dtype)
+
+    frozen_names = FrozenShardedParamModel.frozen_names
+    for name, param in fsdp_model.module.named_parameters():
+        assert param.requires_grad is (name not in frozen_names), (
+            f"{name} requires_grad={param.requires_grad}, expected {name not in frozen_names}"
+        )
+
+    before = fsdp_gather_full_params(fsdp_model)
+    optimizer = torch.optim.SGD(fsdp_model.parameters(), lr=0.05)
+
+    torch.manual_seed(200 + rank)
+    input_ids = torch.randint(0, 29, (6, 4), device=device)
+    target = torch.randn(6, 5, device=device)
+
+    out = fsdp_model(input_ids)
+    loss = F.mse_loss(out.float(), target)
+    loss.backward()
+    fsdp_model.finish_gradient_synchronization()
+
+    for name, param in fsdp_model.module.named_parameters():
+        if name in frozen_names:
+            assert param.grad is None, f"Frozen sharded parameter {name} received a gradient"
+        else:
+            assert param.grad is not None, f"Trainable sharded parameter {name} did not receive a gradient"
+            assert param.grad.shape == param.data.shape
+            assert param.grad.dtype == param.data.dtype
+
+    optimizer.step()
+    after = fsdp_gather_full_params(fsdp_model)
+
+    for name in frozen_names:
+        assert torch.equal(before[name], after[name]), f"Frozen sharded parameter {name} changed"
+
+    if rank == 0:
+        tag = "fp32" if compute_dtype is None else str(compute_dtype)
+        print(f"test_fsdp_preserves_requires_grad[{tag}]: frozen sharded params stayed frozen.")
+
+    _cleanup_process_group()
+
+
+# ---------------------------------------------------------------------------
 # Runners (script equivalents of the pytest-parametrized entry points)
 # ---------------------------------------------------------------------------
 
@@ -530,11 +607,16 @@ def test_fsdp_activation_dtype(compute_dtype) -> None:
     _spawn(_test_fsdp_activation_dtype, compute_dtype)
 
 
+def test_fsdp_preserves_requires_grad(compute_dtype) -> None:
+    _spawn(_test_fsdp_preserves_requires_grad, compute_dtype)
+
+
 def main() -> None:
     for compute_dtype in (None, torch.float16):
         test_fsdp_correctness(compute_dtype)
         test_fsdp_gradient_sync(compute_dtype)
         test_fsdp_activation_dtype(compute_dtype)
+        test_fsdp_preserves_requires_grad(compute_dtype)
 
 
 if __name__ == "__main__":

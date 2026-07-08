@@ -175,11 +175,12 @@ class FSDP(torch.nn.Module):
             if param is None:
                 continue
 
+            # inherit the requires_grad from the original parameter
             local_shard, metadata = self._get_local_shard_and_metadata(param)
             param_state = FSDPParamState(
                 name=param_name,
                 metadata=metadata,
-                local_param=torch.nn.Parameter(local_shard),
+                local_param=torch.nn.Parameter(local_shard, requires_grad=param.requires_grad),
             )
             param_states[param_name] = param_state
             setattr(layer, param_name, param_state.local_param)
@@ -256,8 +257,10 @@ class FSDP(torch.nn.Module):
             if local_param is None or metadata is None:
                 continue
             handle, buffer = self._all_gather_param_async(local_param, metadata)
-            param_state.full_param = torch.nn.Parameter(buffer)
-            param_state.full_param.register_post_accumulate_grad_hook(self._make_reduce_scatter_hook(layer, param_name))
+            # inherit the requires_grad from the original parameter and add the post-accumulate-grad hook if it requires grad
+            param_state.full_param = torch.nn.Parameter(buffer, requires_grad=local_param.requires_grad)
+            if param_state.full_param.requires_grad:
+                param_state.full_param.register_post_accumulate_grad_hook(self._make_reduce_scatter_hook(layer, param_name))
             param_state.forward_gather_handle = handle
 
     def _use_prefetched_layer_forward(self, layer: torch.nn.Module) -> None:
