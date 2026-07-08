@@ -21,7 +21,8 @@ class FSDPParamState:
     metadata: ShardMetadata
     local_param: torch.nn.Parameter
     full_param: torch.nn.Parameter | None = None
-    gather_handle: dist.Work | None = None
+    forward_gather_handle: dist.Work | None = None
+    backward_gather_handle: dist.Work | None = None
 
 @dataclass
 class FSDPLayerState:
@@ -228,9 +229,24 @@ class FSDP(torch.nn.Module):
         handle = dist.all_gather_into_tensor(buffer, local_shard, async_op=True)
         return handle, buffer
 
-    def _prefetch_layer(self, layer: torch.nn.Module) -> None:
+    def _prefetch_layer_backward(self, layer: torch.nn.Module) -> None:
         """
-        Issue an async all-gather operation for the layers params.
+        Issue an async all-gather operation for the layers params for the backward pass.
+        """
+        for param_name, param_state in self._layer_states[layer].param_states.items():
+            if param_state.full_param is not None and param_state.full_param.data.numel() > 0:
+                continue
+            local_param = getattr(layer, param_name, None)
+            metadata = param_state.metadata
+            if local_param is None or metadata is None:
+                continue
+            handle, buffer = self._all_gather_param_async(local_param, metadata)
+            param_state.full_param.data = buffer
+            param_state.backward_gather_handle = handle
+
+    def _prefetch_layer_forward(self, layer: torch.nn.Module) -> None:
+        """
+        Issue an async all-gather operation for the layers params for the forward pass.
         """
         for param_name, param_state in self._layer_states[layer].param_states.items():
             if param_state.full_param is not None and param_state.full_param.data.numel() > 0:
@@ -242,19 +258,29 @@ class FSDP(torch.nn.Module):
             handle, buffer = self._all_gather_param_async(local_param, metadata)
             param_state.full_param = torch.nn.Parameter(buffer)
             param_state.full_param.register_post_accumulate_grad_hook(self._make_reduce_scatter_hook(layer, param_name))
-            param_state.gather_handle = handle
+            param_state.forward_gather_handle = handle
 
-    def _use_prefetched_layer(self, layer: torch.nn.Module) -> None:
+    def _use_prefetched_layer_forward(self, layer: torch.nn.Module) -> None:
         """
         Wait for the all-gathers, trim the padding, reshape the parameter, and attach it to the layer.
         """
         for param_name, param_state in self._layer_states[layer].param_states.items():
-            if param_state.gather_handle is not None:
-                param_state.gather_handle.wait()
+            if param_state.forward_gather_handle is not None:
+                param_state.forward_gather_handle.wait()
             full_param = param_state.full_param
             full_param.data = full_param.data[:param_state.metadata.num_elements].view(param_state.metadata.shape)
             setattr(layer, param_name, full_param)
-            param_state.gather_handle = None
+            param_state.forward_gather_handle = None
+
+    def _use_prefetched_layer_backward(self, layer: torch.nn.Module) -> None:
+        """
+        Wait for the all-gathers, trim the padding, reshape the parameter, and attach it to the layer.
+        """
+        for param_name, param_state in self._layer_states[layer].param_states.items():
+            if param_state.backward_gather_handle is not None:
+                param_state.backward_gather_handle.wait()
+            param_state.full_param.data = param_state.full_param.data[:param_state.metadata.num_elements].view(param_state.metadata.shape)
+            param_state.backward_gather_handle = None
 
     def _pre_forward_hook(self, layer: torch.nn.Module, inputs: tuple[torch.Tensor, ...]):
         """
@@ -262,7 +288,7 @@ class FSDP(torch.nn.Module):
         We should do the all-gather of the parameters for the forward pass.
         Also cast the inputs to the compute dtype.
         """
-        self._use_prefetched_layer(layer)
+        self._use_prefetched_layer_forward(layer)
         if self.compute_dtype is None:
             return None
         self._layer_states[layer].restore_dtype = _infer_restore_dtype(layer, inputs)
@@ -279,7 +305,7 @@ class FSDP(torch.nn.Module):
 
         next_2_index = self._layer_index[layer] + 2
         if next_2_index < len(self.fsdp_layers):
-            self._prefetch_layer(self.fsdp_layers[next_2_index])
+            self._prefetch_layer_forward(self.fsdp_layers[next_2_index])
 
         if self.compute_dtype is None:
             return None
@@ -334,25 +360,18 @@ class FSDP(torch.nn.Module):
             
             param.grad = None
             param.data = torch.empty(0, dtype=param.dtype, device=param.device)
-        return hook
-
-    def _gather_layer_params_for_backward(self, layer: torch.nn.Module) -> None:
-        """
-        Rematerialize the full parameters for layer just before the backward pass.
-        These are the same full_param autograd saved.
-        """
-        for param_name, param_state in self._layer_states[layer].param_states.items():
-            if param_state.full_param is None:
-                continue
-            param_state.full_param.data = self._all_gather_param_jit(param_state.local_param, param_state.metadata)
-            
+        return hook        
 
     def _pre_backward_hook(self, layer: torch.nn.Module, grad_output: torch.Tensor):
         """
         Pre-backward hook for the FSDP layers.
         We should gather the parameters before the backward pass.
         """
-        self._gather_layer_params_for_backward(layer)
+        self._use_prefetched_layer_backward(layer)
+
+        prev_2_index = self._layer_index[layer] - 2
+        if prev_2_index >= 0:
+            self._prefetch_layer_backward(self.fsdp_layers[prev_2_index])
 
     def _register_backward_hooks(self) -> None:
         """
@@ -380,8 +399,13 @@ class FSDP(torch.nn.Module):
         Prefetch the first two FSDP layers params for the forward pass.
         """
         for layer in self.fsdp_layers[:2]:
-            self._prefetch_layer(layer)
-        return self.module(*inputs, **kwargs)
+            self._prefetch_layer_forward(layer)
+        outputs = self.module(*inputs, **kwargs)
+
+        for layer in reversed(self.fsdp_layers[-2:]):
+            self._prefetch_layer_backward(layer)
+
+        return outputs
 
     def finish_gradient_synchronization(self):
         """
