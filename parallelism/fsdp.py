@@ -80,6 +80,9 @@ class FSDP(torch.nn.Module):
             self.world_size = 1
             self.rank = 0
 
+        self._prefetch_window_size = 1
+        self._reduce_scatter_window_size = 2
+
         self._broadcast_initial_state()
 
         self._layer_states: dict[torch.nn.Module, FSDPLayerState] = {}
@@ -197,25 +200,6 @@ class FSDP(torch.nn.Module):
         for layer in self.fsdp_layers:
             self._layer_states[layer] = self._create_layer_state(layer)
 
-    def _all_gather_param_jit(self, local_param: torch.nn.Parameter, metadata: ShardMetadata) -> torch.Tensor:
-        """
-        All-gather the parameter using JIT.
-        We need to all-gather the parameter for the forward and backward pass.
-        We need to discard the padding elements.
-        """
-        local_shard = local_param.detach()
-        if self.compute_dtype is not None:
-            local_shard = local_shard.to(self.compute_dtype)
-        if self.world_size == 1:
-            full_flattened_param = local_shard
-        else:
-            gathered_shards = [torch.empty_like(local_shard) for _ in range(self.world_size)]
-            dist.all_gather(gathered_shards, local_shard, async_op=False)
-            full_flattened_param = torch.cat(gathered_shards, dim=0)
-
-        full_flattened_param = full_flattened_param[:metadata.num_elements]
-        return full_flattened_param.view(metadata.shape)
-
     def _all_gather_param_async(self, local_param: torch.nn.Parameter, 
                             metadata: ShardMetadata) -> tuple[dist.Work | None, torch.Tensor]:
         """
@@ -245,6 +229,69 @@ class FSDP(torch.nn.Module):
             param_state.full_param.data = buffer
             param_state.backward_gather_handle = handle
 
+    def _reduce_scatter_grad_async(self, full_grad: torch.Tensor, metadata: ShardMetadata) -> PendingReduceScatter:
+        """
+        We issue an async reduce scatter operation.
+        """
+        flattened_grad = full_grad.flatten()
+        if metadata.padded_num_elements > metadata.num_elements:
+            padding = torch.zeros(metadata.padded_num_elements - metadata.num_elements, dtype=full_grad.dtype, device=full_grad.device)
+            flattened_grad = torch.cat([flattened_grad, padding])
+
+        if self.world_size == 1:
+            return PendingReduceScatter(
+                handle=None,
+                output=flattened_grad,
+                input_keepalive=flattened_grad,
+                local_param=None,
+            )
+        else:
+            output = torch.empty(metadata.shard_size, dtype=full_grad.dtype, device=full_grad.device)
+            handle = dist.reduce_scatter_tensor(output=output, input=flattened_grad, op=dist.ReduceOp.SUM, async_op=True)
+            return PendingReduceScatter(
+                handle=handle,
+                output=output,
+                input_keepalive=flattened_grad,
+                local_param=None,
+            )
+
+    def _finalize_reduce_scatter(self, pending: PendingReduceScatter) -> None:
+        if pending.handle is not None:
+            pending.handle.wait()
+
+        local_grad = pending.output.to(pending.local_param.dtype).div_(self.world_size)
+
+        if pending.local_param.grad is None:
+            pending.local_param.grad = local_grad
+        else:
+            pending.local_param.grad.add_(local_grad)
+
+    def _drain_reduce_scatters(self) -> None:
+        """
+        Drain the reduce scatters.
+        """
+        while len(self._pending_reduce_scatters) > self._reduce_scatter_window_size:
+            pending = self._pending_reduce_scatters.pop(0)
+            self._finalize_reduce_scatter(pending)
+
+    def _make_reduce_scatter_hook(self, layer: torch.nn.Module, param_name: str):
+        """
+        Return a post-accumulate-grad hook that reduce scatters the full
+        weight's gradient into the local shard, then frees the full weight.
+        """
+        def hook(param: torch.nn.Parameter):
+            param_state = self._layer_states[layer].param_states[param_name]
+            if param.grad is not None:
+                pending_reduce_scatter = self._reduce_scatter_grad_async(param.grad, param_state.metadata)
+                # we do pending.local_param is param_state.local_param
+                pending_reduce_scatter.local_param = param_state.local_param
+                self._pending_reduce_scatters.append(pending_reduce_scatter)
+                self._drain_reduce_scatters()
+            
+            param.grad = None
+            param.data = torch.empty(0, dtype=param.dtype, device=param.device)
+        return hook
+
     def _prefetch_layer_forward(self, layer: torch.nn.Module) -> None:
         """
         Issue an async all-gather operation for the layers params for the forward pass.
@@ -258,6 +305,9 @@ class FSDP(torch.nn.Module):
                 continue
             handle, buffer = self._all_gather_param_async(local_param, metadata)
             # inherit the requires_grad from the original parameter and add the post-accumulate-grad hook if it requires grad
+            # we add the hook here because hook needs to be attached to the full param before the forward pass.
+            # if we were to wait till the prefetch backward pass, then the autograd would have already built the graph from forward pass
+            # the hooks need to be attached to the object that participates in the forward pass.
             param_state.full_param = torch.nn.Parameter(buffer, requires_grad=local_param.requires_grad)
             if param_state.full_param.requires_grad:
                 param_state.full_param.register_post_accumulate_grad_hook(self._make_reduce_scatter_hook(layer, param_name))
@@ -306,9 +356,9 @@ class FSDP(torch.nn.Module):
             setattr(layer, param_name, param_state.local_param)
             param_state.full_param.data = torch.empty(0, dtype=param_state.full_param.dtype, device=param_state.full_param.device)
 
-        next_2_index = self._layer_index[layer] + 2
-        if next_2_index < len(self.fsdp_layers):
-            self._prefetch_layer_forward(self.fsdp_layers[next_2_index])
+        next_index = self._layer_index[layer] + self._prefetch_window_size
+        if next_index < len(self.fsdp_layers):
+            self._prefetch_layer_forward(self.fsdp_layers[next_index])
 
         if self.compute_dtype is None:
             return None
@@ -322,49 +372,6 @@ class FSDP(torch.nn.Module):
             self._forward_hook_handles.append(layer.register_forward_pre_hook(self._pre_forward_hook))
             self._forward_hook_handles.append(layer.register_forward_hook(self._post_forward_hook))
 
-    def _reduce_scatter_grad_async(self, full_grad: torch.Tensor, metadata: ShardMetadata) -> PendingReduceScatter:
-        """
-        We issue an async reduce scatter operation.
-        """
-        flattened_grad = full_grad.flatten()
-        if metadata.padded_num_elements > metadata.num_elements:
-            padding = torch.zeros(metadata.padded_num_elements - metadata.num_elements, dtype=full_grad.dtype, device=full_grad.device)
-            flattened_grad = torch.cat([flattened_grad, padding])
-
-        if self.world_size == 1:
-            return PendingReduceScatter(
-                handle=None,
-                output=flattened_grad,
-                input_keepalive=flattened_grad,
-                local_param=None,
-            )
-        else:
-            output = torch.empty(metadata.shard_size, dtype=full_grad.dtype, device=full_grad.device)
-            handle = dist.reduce_scatter_tensor(output=output, input=flattened_grad, op=dist.ReduceOp.SUM, async_op=True)
-            return PendingReduceScatter(
-                handle=handle,
-                output=output,
-                input_keepalive=flattened_grad,
-                local_param=None,
-            )
-
-
-    def _make_reduce_scatter_hook(self, layer: torch.nn.Module, param_name: str):
-        """
-        Return a post-accumulate-grad hook that reduce scatters the full
-        weight's gradient into the local shard, then frees the full weight.
-        """
-        def hook(param: torch.nn.Parameter):
-            param_state = self._layer_states[layer].param_states[param_name]
-            if param.grad is not None:
-                pending_reduce_scatter = self._reduce_scatter_grad_async(param.grad, param_state.metadata)
-                pending_reduce_scatter.local_param = param_state.local_param
-                self._pending_reduce_scatters.append(pending_reduce_scatter)
-            
-            param.grad = None
-            param.data = torch.empty(0, dtype=param.dtype, device=param.device)
-        return hook        
-
     def _pre_backward_hook(self, layer: torch.nn.Module, grad_output: torch.Tensor):
         """
         Pre-backward hook for the FSDP layers.
@@ -372,9 +379,9 @@ class FSDP(torch.nn.Module):
         """
         self._use_prefetched_layer_backward(layer)
 
-        prev_2_index = self._layer_index[layer] - 2
-        if prev_2_index >= 0:
-            self._prefetch_layer_backward(self.fsdp_layers[prev_2_index])
+        prev_index = self._layer_index[layer] - self._prefetch_window_size
+        if prev_index >= 0:
+            self._prefetch_layer_backward(self.fsdp_layers[prev_index])
 
     def _register_backward_hooks(self) -> None:
         """
@@ -401,11 +408,11 @@ class FSDP(torch.nn.Module):
         """
         Prefetch the first two FSDP layers params for the forward pass.
         """
-        for layer in self.fsdp_layers[:2]:
+        for layer in self.fsdp_layers[:self._prefetch_window_size]:
             self._prefetch_layer_forward(layer)
         outputs = self.module(*inputs, **kwargs)
 
-        for layer in reversed(self.fsdp_layers[-2:]):
+        for layer in reversed(self.fsdp_layers[-self._prefetch_window_size:]):
             self._prefetch_layer_backward(layer)
 
         return outputs
@@ -414,14 +421,8 @@ class FSDP(torch.nn.Module):
         """
         Wait for all the reduce scatter operations to complete.
         """
-        for pending_reduce_scatter in self._pending_reduce_scatters:
-            if pending_reduce_scatter.handle is not None:
-                pending_reduce_scatter.handle.wait()
-            local_grad = pending_reduce_scatter.output.to(pending_reduce_scatter.local_param.dtype).div_(self.world_size)
-            if pending_reduce_scatter.local_param.grad is None:
-                pending_reduce_scatter.local_param.grad = local_grad
-            else:
-                pending_reduce_scatter.local_param.grad.copy_(local_grad)
-            
-        self._pending_reduce_scatters.clear()
+        while self._pending_reduce_scatters:
+            pending = self._pending_reduce_scatters.pop(0)
+            self._finalize_reduce_scatter(pending)
+
         self._sync_grads_of_replicated_parameters()
