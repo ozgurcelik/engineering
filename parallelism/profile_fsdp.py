@@ -29,6 +29,7 @@ import os
 import shutil
 import threading
 import time
+import weakref
 from collections import defaultdict
 
 import psutil
@@ -426,7 +427,66 @@ def _tensor_bytes(tensor: torch.Tensor | None) -> int:
     return tensor.numel() * tensor.element_size()
 
 
-def _fsdp_internal_breakdown(model: nn.Module) -> dict[str, int]:
+class FullWeightTracker:
+    """Track the STORAGES of each FSDP layer's all-gathered full weight at the
+    moment it is used in the forward pass.
+
+    This exists because inspecting ``param_state.full_param.data`` alone
+    understates FSDP's real peak: the post-forward hook resets the full param to
+    ``empty(0)``, but autograd's saved tensors still pin the original forward
+    all-gather buffer alive until that layer's backward runs. Those pinned
+    buffers are the single biggest FSDP-specific memory cost (they accumulate
+    across the whole forward pass), yet they are invisible to a ``.data`` scan.
+
+    We register a forward *pre*-hook that runs AFTER FSDP's own pre-hook (so the
+    full weight is already attached to the layer) and remember a weakref to its
+    storage. At sample time we sum the storages that are still alive."""
+
+    def __init__(self, model: nn.Module) -> None:
+        # (storage_weakref, nbytes) per full-weight storage seen in a forward.
+        self._entries: list[tuple[weakref.ref, int]] = []
+        self._handles: list[torch.utils.hooks.RemovableHandle] = []
+        if not isinstance(model, FSDP):
+            return
+        for layer in model.fsdp_layers:
+            self._handles.append(layer.register_forward_pre_hook(self._make_hook()))
+
+    def _make_hook(self):
+        def hook(module, args):
+            for param_name in ("weight", "bias"):
+                param = getattr(module, param_name, None)
+                if param is None or param.data.numel() == 0:
+                    continue
+                storage = param.data.untyped_storage()
+                self._entries.append((weakref.ref(storage), storage.nbytes()))
+
+        return hook
+
+    def resident_pinned_bytes(self, exclude_ptrs: set[int]) -> int:
+        """Bytes of full-weight storages still alive but NOT currently attached
+        to a layer (i.e. kept alive only by autograd / pending work). Storages in
+        ``exclude_ptrs`` are already counted elsewhere, so we skip them to keep
+        the breakdown a non-overlapping sum. Also prunes dead weakrefs."""
+        alive: list[tuple[weakref.ref, int]] = []
+        seen: set[int] = set()
+        total = 0
+        for ref, nbytes in self._entries:
+            storage = ref()
+            if storage is None:
+                continue
+            alive.append((ref, nbytes))
+            ptr = storage.data_ptr()
+            if ptr in exclude_ptrs or ptr in seen:
+                continue
+            seen.add(ptr)
+            total += nbytes
+        self._entries = alive
+        return total
+
+
+def _fsdp_internal_breakdown(
+    model: nn.Module, tracker: FullWeightTracker | None = None
+) -> dict[str, int]:
     """Semantic memory counters from this learning FSDP's own state.
 
     PyTorch's profiler categories are useful but generic; they infer labels from
@@ -440,6 +500,7 @@ def _fsdp_internal_breakdown(model: nn.Module) -> dict[str, int]:
     forward_all_gather = 0
     backward_all_gather = 0
     active_full_params = 0
+    attached_full_ptrs: set[int] = set()
 
     for layer_state in model._layer_states.values():
         for param_state in layer_state.param_states.values():
@@ -447,15 +508,23 @@ def _fsdp_internal_breakdown(model: nn.Module) -> dict[str, int]:
             local_shard_grads += _tensor_bytes(param_state.local_param.grad)
 
             full_param = param_state.full_param
-            if full_param is None:
+            if full_param is None or full_param.data.numel() == 0:
                 continue
             full_bytes = _tensor_bytes(full_param.data)
+            attached_full_ptrs.add(full_param.data.untyped_storage().data_ptr())
             if param_state.forward_gather_handle is not None:
                 forward_all_gather += full_bytes
             elif param_state.backward_gather_handle is not None:
                 backward_all_gather += full_bytes
             else:
                 active_full_params += full_bytes
+
+    # Full weights kept resident ONLY by autograd's saved tensors (the forward
+    # buffers survive `data = empty(0)` until backward). Not attached to any
+    # layer right now, so they don't overlap the buckets above.
+    autograd_pinned_full_weights = (
+        tracker.resident_pinned_bytes(attached_full_ptrs) if tracker is not None else 0
+    )
 
     pending_reduce_scatter_input = sum(
         _tensor_bytes(pending.input_keepalive)
@@ -472,6 +541,7 @@ def _fsdp_internal_breakdown(model: nn.Module) -> dict[str, int]:
         "forward_all_gather_buffers": forward_all_gather,
         "backward_all_gather_buffers": backward_all_gather,
         "active_full_params": active_full_params,
+        "autograd_pinned_full_weights": autograd_pinned_full_weights,
         "pending_reduce_scatter_full_grad_inputs": pending_reduce_scatter_input,
         "pending_reduce_scatter_shard_outputs": pending_reduce_scatter_output,
         "tracked_total": (
@@ -480,6 +550,7 @@ def _fsdp_internal_breakdown(model: nn.Module) -> dict[str, int]:
             + forward_all_gather
             + backward_all_gather
             + active_full_params
+            + autograd_pinned_full_weights
             + pending_reduce_scatter_input
             + pending_reduce_scatter_output
         ),
@@ -490,10 +561,11 @@ def _record_fsdp_internal_sample(
     samples: list[dict[str, int | str]] | None,
     label: str,
     model: nn.Module,
+    tracker: FullWeightTracker | None = None,
 ) -> None:
     if samples is None:
         return
-    breakdown = _fsdp_internal_breakdown(model)
+    breakdown = _fsdp_internal_breakdown(model, tracker)
     if breakdown:
         samples.append({"point": label, **breakdown})
 
@@ -511,32 +583,37 @@ def _train_step(
     x,
     y,
     fsdp_samples: list[dict[str, int | str]] | None = None,
+    tracker: FullWeightTracker | None = None,
 ) -> None:
     optimizer.zero_grad(set_to_none=True)
-    _record_fsdp_internal_sample(fsdp_samples, "after_zero_grad", model)
+    _record_fsdp_internal_sample(fsdp_samples, "after_zero_grad", model, tracker)
     with record_function("forward"):
         logits = model(x)
         loss = F.cross_entropy(logits.reshape(-1, VOCAB).float(), y.reshape(-1))
-    _record_fsdp_internal_sample(fsdp_samples, "after_forward", model)
+    _record_fsdp_internal_sample(fsdp_samples, "after_forward", model, tracker)
     with record_function("backward"):
         loss.backward()
-    _record_fsdp_internal_sample(fsdp_samples, "after_backward_before_finish", model)
+    _record_fsdp_internal_sample(fsdp_samples, "after_backward_before_finish", model, tracker)
     if is_fsdp:
         with record_function("finish_grad_sync"):
             model.finish_gradient_synchronization()
-        _record_fsdp_internal_sample(fsdp_samples, "after_finish_grad_sync", model)
+        _record_fsdp_internal_sample(fsdp_samples, "after_finish_grad_sync", model, tracker)
     with record_function("optimizer_step"):
         optimizer.step()
-    _record_fsdp_internal_sample(fsdp_samples, "after_optimizer_step", model)
+    _record_fsdp_internal_sample(fsdp_samples, "after_optimizer_step", model, tracker)
 
 
 def run_phase(rank: int, mode: str, world_size: int) -> None:
     proc = psutil.Process()
-    rss_before = proc.memory_info().rss  # interpreter + torch import overhead
     device = torch.device("cpu")
 
     if mode == "fsdp":
         _setup(rank, world_size)
+
+    # Capture the baseline AFTER the process group is initialized, so gloo's
+    # comm buffers count as pre-model overhead (not as model/training memory).
+    # This keeps 'peak-overhead' a fair model+training comparison across modes.
+    rss_before = proc.memory_info().rss  # interpreter + torch + comm-init overhead
 
     torch.manual_seed(0)
     if mode == "fsdp":
@@ -545,6 +622,11 @@ def run_phase(rank: int, mode: str, world_size: int) -> None:
     else:
         model = ToyModel().to(device)
         is_fsdp = False
+
+    # Tracks full-weight storages pinned alive by autograd until backward, which
+    # a `full_param.data` scan misses. Only rank 0 records samples, so only rank
+    # 0 needs it; the forward pre-hooks it installs are cheap (append a weakref).
+    tracker = FullWeightTracker(model) if mode == "fsdp" and rank == 0 else None
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     x, y = _make_batch(device)
@@ -556,7 +638,7 @@ def run_phase(rank: int, mode: str, world_size: int) -> None:
         for step in range(STEPS):
             samples = fsdp_internal_samples if mode == "fsdp" and rank == 0 and step == 0 else None
             with record_function("step"):
-                _train_step(model, optimizer, is_fsdp, x, y, samples)
+                _train_step(model, optimizer, is_fsdp, x, y, samples, tracker)
             if step == 0:
                 footprint = _footprint_bytes(model, optimizer)
     peak_rss = peak.peak
@@ -686,7 +768,16 @@ def _report_categories(base: dict | None, fsdp0: dict | None) -> None:
         "      the SUM of all live tensors at one instant (categories don't co-peak).\n"
         "      FSDP shards PARAMETER/OPTIMIZER_STATE (~1/world_size) but GRADIENT\n"
         "      stays high — the async reduce-scatter keeps full grads live until\n"
-        "      finish_gradient_synchronization."
+        "      finish_gradient_synchronization.\n"
+        "\n"
+        "      CAUTION (FSDP category labels): torch infers PARAMETER from the\n"
+        "      optimizer's update loop, which here only touches the local SHARDS.\n"
+        "      So for FSDP, PARAMETER = shards only; the all-gathered full weights\n"
+        "      are recreated by collectives each step and never seen by the\n"
+        "      optimizer, so they land under INPUT (~full model), and their\n"
+        "      saved-for-backward copies under AUTOGRAD_DETAIL. Read INPUT/\n"
+        "      AUTOGRAD_DETAIL here as 'gathered full weights', not literal inputs.\n"
+        "      The FSDP INTERNAL table below is the trustworthy per-buffer view."
     )
 
 
@@ -704,6 +795,7 @@ def _report_fsdp_internal(fsdp0: dict | None) -> None:
         ("forward_all_gather_buffers", "fwd all-gather"),
         ("backward_all_gather_buffers", "bwd all-gather"),
         ("active_full_params", "active full params"),
+        ("autograd_pinned_full_weights", "pinned full W"),
         ("pending_reduce_scatter_full_grad_inputs", "RS full-grad inputs"),
         ("pending_reduce_scatter_shard_outputs", "RS shard outputs"),
         ("tracked_total", "tracked total"),
@@ -712,19 +804,26 @@ def _report_fsdp_internal(fsdp0: dict | None) -> None:
     print("\n" + "#" * 78)
     print("# FSDP INTERNAL TRANSIENT BUFFERS  (rank 0, sampled during first step)")
     print("#" * 78)
-    header = f"{'point':<30}" + "".join(f"{label:>16}" for _, label in fields)
+    col = 20
+    header = f"{'point':<30}" + "".join(f"{label:>{col}}" for _, label in fields)
     print(header)
     print("-" * len(header))
     for sample in samples:
         row = f"{sample['point']:<30}"
         for key, _ in fields:
-            row += f"{_fmt(sample.get(key, 0)):>16}"
+            row += f"{_fmt(sample.get(key, 0)):>{col}}"
         print(row)
     print("-" * len(header))
     print(
         "note: these are FSDP-specific tensors only. The reduce-scatter input is\n"
         "      the full flattened gradient that must stay alive until the async\n"
-        "      collective completes; the shard output becomes the local grad."
+        "      collective completes; the shard output becomes the local grad.\n"
+        "      'autograd-pinned full W' = full weights whose forward all-gather\n"
+        "      buffer is kept resident by autograd's saved tensors until backward,\n"
+        "      even though the post-forward hook reset full_param.data to empty(0).\n"
+        "      It peaks right after forward (~full model) — this is the memory the\n"
+        "      earlier '.data'-only counters missed, and matches the profiler's\n"
+        "      INPUT/AUTOGRAD_DETAIL bytes above."
     )
 
 
