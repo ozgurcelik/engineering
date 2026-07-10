@@ -427,24 +427,34 @@ def _tensor_bytes(tensor: torch.Tensor | None) -> int:
     return tensor.numel() * tensor.element_size()
 
 
-class FullWeightTracker:
-    """Track the STORAGES of each FSDP layer's all-gathered full weight at the
-    moment it is used in the forward pass.
+def _storage_bytes(tensor: torch.Tensor | None) -> int:
+    """Actual resident bytes of a tensor's storage. For FSDP full params this is
+    the truth: they are freed by resizing the storage to 0 while keeping [out,in]
+    sizes, so ``numel() * element_size()`` would wrongly report the full size for
+    an already-freed weight. Always ask the storage."""
+    if tensor is None:
+        return 0
+    return tensor.untyped_storage().nbytes()
 
-    This exists because inspecting ``param_state.full_param.data`` alone
-    understates FSDP's real peak: the post-forward hook resets the full param to
-    ``empty(0)``, but autograd's saved tensors still pin the original forward
-    all-gather buffer alive until that layer's backward runs. Those pinned
-    buffers are the single biggest FSDP-specific memory cost (they accumulate
-    across the whole forward pass), yet they are invisible to a ``.data`` scan.
+
+class FullWeightTracker:
+    """Track the STORAGES of each FSDP layer's all-gathered full weight seen in
+    the forward pass, so we can detect full weights that stay resident past the
+    point where ``full_param`` no longer references them as an attached buffer.
+
+    Why it exists: autograd saves the forward weight for backward. If FSDP frees
+    it by pointing the param at a new empty storage (``data = empty(0)``), the
+    saved copy keeps the ORIGINAL storage alive — invisible to a ``.data`` scan —
+    so the whole forward stack of weights stays resident until backward. Freeing
+    instead via ``storage().resize_(0)`` (which the saved copy shares) makes this
+    number collapse to ~0, which is exactly how we confirm the fix works.
 
     We register a forward *pre*-hook that runs AFTER FSDP's own pre-hook (so the
-    full weight is already attached to the layer) and remember a weakref to its
-    storage. At sample time we sum the storages that are still alive."""
+    full weight is already attached) and remember a weakref to its storage. At
+    sample time we sum the storages that are still alive AND still hold bytes."""
 
     def __init__(self, model: nn.Module) -> None:
-        # (storage_weakref, nbytes) per full-weight storage seen in a forward.
-        self._entries: list[tuple[weakref.ref, int]] = []
+        self._entries: list[weakref.ref] = []
         self._handles: list[torch.utils.hooks.RemovableHandle] = []
         if not isinstance(model, FSDP):
             return
@@ -455,26 +465,31 @@ class FullWeightTracker:
         def hook(module, args):
             for param_name in ("weight", "bias"):
                 param = getattr(module, param_name, None)
-                if param is None or param.data.numel() == 0:
+                if param is None:
                     continue
-                storage = param.data.untyped_storage()
-                self._entries.append((weakref.ref(storage), storage.nbytes()))
+                storage = param.untyped_storage()
+                if storage.nbytes() > 0:
+                    self._entries.append(weakref.ref(storage))
 
         return hook
 
     def resident_pinned_bytes(self, exclude_ptrs: set[int]) -> int:
-        """Bytes of full-weight storages still alive but NOT currently attached
-        to a layer (i.e. kept alive only by autograd / pending work). Storages in
-        ``exclude_ptrs`` are already counted elsewhere, so we skip them to keep
-        the breakdown a non-overlapping sum. Also prunes dead weakrefs."""
-        alive: list[tuple[weakref.ref, int]] = []
+        """Bytes of forward full-weight storages that are still alive and still
+        allocated, but NOT currently an attached full param (``exclude_ptrs``).
+        After the resize_(0) fix this should be ~0; a large value means forward
+        weights are still pinned (e.g. by autograd). Reads CURRENT storage bytes
+        (a resized-to-0 storage contributes nothing) and prunes dead weakrefs."""
+        alive: list[weakref.ref] = []
         seen: set[int] = set()
         total = 0
-        for ref, nbytes in self._entries:
+        for ref in self._entries:
             storage = ref()
             if storage is None:
                 continue
-            alive.append((ref, nbytes))
+            alive.append(ref)
+            nbytes = storage.nbytes()
+            if nbytes == 0:
+                continue
             ptr = storage.data_ptr()
             if ptr in exclude_ptrs or ptr in seen:
                 continue
@@ -508,10 +523,13 @@ def _fsdp_internal_breakdown(
             local_shard_grads += _tensor_bytes(param_state.local_param.grad)
 
             full_param = param_state.full_param
-            if full_param is None or full_param.data.numel() == 0:
+            # Use STORAGE bytes, not data.numel(): a full param freed via
+            # storage().resize_(0) keeps its [out,in] sizes, so numel() would
+            # report the full size for a weight that is actually gone.
+            full_bytes = _storage_bytes(full_param.data) if full_param is not None else 0
+            if full_bytes == 0:
                 continue
-            full_bytes = _tensor_bytes(full_param.data)
-            attached_full_ptrs.add(full_param.data.untyped_storage().data_ptr())
+            attached_full_ptrs.add(full_param.untyped_storage().data_ptr())
             if param_state.forward_gather_handle is not None:
                 forward_all_gather += full_bytes
             elif param_state.backward_gather_handle is not None:
@@ -519,9 +537,9 @@ def _fsdp_internal_breakdown(
             else:
                 active_full_params += full_bytes
 
-    # Full weights kept resident ONLY by autograd's saved tensors (the forward
-    # buffers survive `data = empty(0)` until backward). Not attached to any
-    # layer right now, so they don't overlap the buckets above.
+    # Forward full weights still resident but no longer an attached full param
+    # (e.g. pinned by autograd's saved tensors). ~0 once freeing uses
+    # storage().resize_(0); large means the forward stack is still pinned.
     autograd_pinned_full_weights = (
         tracker.resident_pinned_bytes(attached_full_ptrs) if tracker is not None else 0
     )
@@ -771,12 +789,14 @@ def _report_categories(base: dict | None, fsdp0: dict | None) -> None:
         "      finish_gradient_synchronization.\n"
         "\n"
         "      CAUTION (FSDP category labels): torch infers PARAMETER from the\n"
-        "      optimizer's update loop, which here only touches the local SHARDS.\n"
-        "      So for FSDP, PARAMETER = shards only; the all-gathered full weights\n"
-        "      are recreated by collectives each step and never seen by the\n"
-        "      optimizer, so they land under INPUT (~full model), and their\n"
-        "      saved-for-backward copies under AUTOGRAD_DETAIL. Read INPUT/\n"
-        "      AUTOGRAD_DETAIL here as 'gathered full weights', not literal inputs.\n"
+        "      optimizer's update loop, which here only touches the local SHARDS,\n"
+        "      so PARAMETER = shards only. A transient all-gathered full weight\n"
+        "      (recreated by collectives, never seen by the optimizer) is labeled\n"
+        "      INPUT while it's live; because we now free it per-layer via\n"
+        "      storage().resize_(0), INPUT stays small (~prefetch window) instead\n"
+        "      of ~full model. AUTOGRAD_DETAIL is dominated by gradient-shard\n"
+        "      tensors produced by the backward + reduce-scatter path (they peak\n"
+        "      during backward/grad-sync), not by full weights anymore.\n"
         "      The FSDP INTERNAL table below is the trustworthy per-buffer view."
     )
 
@@ -818,12 +838,11 @@ def _report_fsdp_internal(fsdp0: dict | None) -> None:
         "note: these are FSDP-specific tensors only. The reduce-scatter input is\n"
         "      the full flattened gradient that must stay alive until the async\n"
         "      collective completes; the shard output becomes the local grad.\n"
-        "      'autograd-pinned full W' = full weights whose forward all-gather\n"
-        "      buffer is kept resident by autograd's saved tensors until backward,\n"
-        "      even though the post-forward hook reset full_param.data to empty(0).\n"
-        "      It peaks right after forward (~full model) — this is the memory the\n"
-        "      earlier '.data'-only counters missed, and matches the profiler's\n"
-        "      INPUT/AUTOGRAD_DETAIL bytes above."
+        "      'pinned full W' = forward full-weight storages still resident but\n"
+        "      no longer an attached full param (e.g. pinned by autograd's saved\n"
+        "      tensors). With per-layer freeing via storage().resize_(0) this is\n"
+        "      ~0; a large value would mean the whole forward weight stack stayed\n"
+        "      resident until backward (the bug this counter was added to catch)."
     )
 
 

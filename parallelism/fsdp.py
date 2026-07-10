@@ -214,19 +214,72 @@ class FSDP(torch.nn.Module):
         handle = dist.all_gather_into_tensor(buffer, local_shard, async_op=True)
         return handle, buffer
 
+    @staticmethod
+    def _storage_allocated(param: torch.nn.Parameter | None) -> bool:
+        """A full param's memory is tracked by its STORAGE, not its tensor
+        sizes: we free by resizing the storage to 0 while keeping the [out, in]
+        sizes (so autograd still sees the right shape). So 'is it materialized?'
+        must ask the storage, not `.data.numel()`."""
+        return param is not None and param.untyped_storage().size() > 0
+
+    @staticmethod
+    def _free_full_param(full_param: torch.nn.Parameter | None) -> None:
+        """Release a full (unsharded) weight by resizing its storage to 0.
+
+        This actually reclaims the memory: autograd's saved-for-backward copy of
+        the weight shares this exact storage, so shrinking it frees the bytes for
+        real. (Assigning ``data = empty(0)`` does NOT — it just points the param
+        at a fresh empty storage and leaves the saved copy holding the old one,
+        which is why the forward weights used to stay resident until backward.)
+        The tensor keeps its [out, in] sizes so AccumulateGrad still accepts the
+        full-shaped gradient."""
+        if full_param is None:
+            return
+        with torch.no_grad():
+            full_param.untyped_storage().resize_(0)
+
+    def _regather_full_param_backward(
+        self,
+        full_param: torch.nn.Parameter,
+        local_param: torch.nn.Parameter,
+        metadata: ShardMetadata,
+    ) -> dist.Work | None:
+        """Re-materialize the full weight IN PLACE for backward by refilling the
+        same storage the forward pass freed. Because autograd's saved copy shares
+        that storage, this is what makes the saved weight valid again (it's the
+        backward ALL-GATHER box in the FSDP diagram), rather than allocating a
+        second, unused copy."""
+        local_shard = local_param.detach()
+        if self.compute_dtype is not None:
+            local_shard = local_shard.to(self.compute_dtype)
+
+        with torch.no_grad():
+            storage = full_param.untyped_storage()
+            storage.resize_(metadata.padded_num_elements * full_param.element_size())
+            flat = torch.empty(0, dtype=full_param.dtype, device=full_param.device)
+            flat.set_(storage, 0, (metadata.padded_num_elements,))
+            full_param.data = flat
+
+        if self.world_size == 1:
+            with torch.no_grad():
+                full_param.data.copy_(local_shard)
+            return None
+        return dist.all_gather_into_tensor(full_param.data, local_shard, async_op=True)
+
     def _prefetch_layer_backward(self, layer: torch.nn.Module) -> None:
         """
         Issue an async all-gather operation for the layers params for the backward pass.
         """
         for param_name, param_state in self._layer_states[layer].param_states.items():
-            if param_state.full_param is not None and param_state.full_param.data.numel() > 0:
+            full_param = param_state.full_param
+            if full_param is None or self._storage_allocated(full_param):
                 continue
-            local_param = getattr(layer, param_name, None)
             metadata = param_state.metadata
-            if local_param is None or metadata is None:
+            if metadata is None:
                 continue
-            handle, buffer = self._all_gather_param_async(local_param, metadata)
-            param_state.full_param.data = buffer
+            handle = self._regather_full_param_backward(
+                full_param, param_state.local_param, metadata
+            )
             param_state.backward_gather_handle = handle
 
     def _reduce_scatter_grad_async(self, full_grad: torch.Tensor, metadata: ShardMetadata) -> PendingReduceScatter:
@@ -289,7 +342,11 @@ class FSDP(torch.nn.Module):
                 self._drain_reduce_scatters()
             
             param.grad = None
-            param.data = torch.empty(0, dtype=param.dtype, device=param.device)
+            # Free the full weight now that this layer's backward has consumed
+            # it: resize the storage to 0 (the autograd-saved copy shares it, so
+            # the memory is actually reclaimed) rather than detaching to a new
+            # empty storage.
+            self._free_full_param(param)
         return hook
 
     def _prefetch_layer_forward(self, layer: torch.nn.Module) -> None:
@@ -297,7 +354,7 @@ class FSDP(torch.nn.Module):
         Issue an async all-gather operation for the layers params for the forward pass.
         """
         for param_name, param_state in self._layer_states[layer].param_states.items():
-            if param_state.full_param is not None and param_state.full_param.data.numel() > 0:
+            if self._storage_allocated(param_state.full_param):
                 continue
             local_param = getattr(layer, param_name, None)
             metadata = param_state.metadata
@@ -354,7 +411,10 @@ class FSDP(torch.nn.Module):
         """
         for param_name, param_state in self._layer_states[layer].param_states.items():
             setattr(layer, param_name, param_state.local_param)
-            param_state.full_param.data = torch.empty(0, dtype=param_state.full_param.dtype, device=param_state.full_param.device)
+            # Free the forward all-gather buffer. Its storage is shared with the
+            # weight autograd saved for backward, so resizing to 0 truly reclaims
+            # it; the pre-backward hook re-gathers into the same storage.
+            self._free_full_param(param_state.full_param)
 
         next_index = self._layer_index[layer] + self._prefetch_window_size
         if next_index < len(self.fsdp_layers):
