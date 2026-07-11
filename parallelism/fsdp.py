@@ -81,7 +81,7 @@ class FSDP(torch.nn.Module):
             self.rank = 0
 
         self._prefetch_window_size = 1
-        self._reduce_scatter_window_size = 2
+        self._reduce_scatter_window_size = 0
 
         self._broadcast_initial_state()
 
