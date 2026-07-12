@@ -28,3 +28,6 @@ The forward pass is given by `y = Wx`.
 And we have the loss function `L` with `dL/dy` available to us.
 Then, the gradients for this layer is given by `dL/dW = dL/dy * x^T` and this does not need us to have the full `W` in memory.
 But, the input gradients `dL/dx = W^T * dL/dy` does need us to have the full `W` in memory.
+This means, before we can the backward pass over a layer, we will need to do another all-gather operation to get the full `W` in memory.
+And after doing the backward pass, we can free the memory of the parameters just like we did in the forward pass.
+Once we have computed the gradients for a layer, we need to do reduce-scatter operation so that each GPU can get the gradients for its shard of the model.

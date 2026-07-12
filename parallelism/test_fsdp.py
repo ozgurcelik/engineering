@@ -183,6 +183,16 @@ def fsdp_gather_full_params(fsdp_model: FSDP) -> dict[str, torch.Tensor]:
 def _setup_process_group(rank: int, world_size: int, backend: str = "gloo") -> torch.device:
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ.setdefault("MASTER_PORT", "12357")
+    # Set FSDP_TEST_DEVICE=cuda to run the same tests on GPU (one rank per GPU
+    # over NCCL); anything else keeps the default single-host CPU/gloo path.
+    use_cuda = (
+        os.environ.get("FSDP_TEST_DEVICE", "cpu") == "cuda" and torch.cuda.is_available()
+    )
+    if use_cuda:
+        device = torch.device(f"cuda:{rank}")
+        torch.cuda.set_device(device)
+        dist.init_process_group("nccl", rank=rank, world_size=world_size, device_id=device)
+        return device
     dist.init_process_group(backend, rank=rank, world_size=world_size)
     return torch.device("cpu")
 

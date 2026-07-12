@@ -23,6 +23,7 @@ Run (CPU / gloo):
 
 from __future__ import annotations
 
+import argparse
 import glob
 import json
 import os
@@ -55,7 +56,7 @@ BATCH_PER_RANK = 8
 SEQ_LEN = 32
 MB = 1024 * 1024
 
-RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
+RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results", "mlp")
 
 # Order (and friendly labels) for the granular per-category memory breakdown.
 # These are exactly the buckets torch's memory profiler assigns every live
@@ -83,7 +84,7 @@ CATEGORY_COLORS = {
 }
 
 
-def _categorized_memory(memprof) -> dict[str, int]:
+def _categorized_memory(memprof, device: str | None = None) -> dict[str, int]:
     """Walk the profiler's memory timeline and return the PEAK live bytes per
     category (PARAMETER / OPTIMIZER_STATE / GRADIENT / ACTIVATION /
     AUTOGRAD_DETAIL / TEMPORARY / INPUT / UNKNOWN), plus a co-peak TOTAL.
@@ -91,7 +92,11 @@ def _categorized_memory(memprof) -> dict[str, int]:
     torch categorizes every allocation from the recorded op + autograd graph, so
     this splits the coarse RSS number into where the bytes actually live. Each
     category peak is its own high-water mark; ``TOTAL`` is the max of the *sum*
-    of all live tensors at a single instant (they don't all peak together)."""
+    of all live tensors at a single instant (they don't all peak together).
+
+    ``device`` (e.g. ``"cuda:0"``) restricts the walk to tensors on that device,
+    so a GPU run reports only device memory (and ignores the small host-side
+    allocations that share the timeline)."""
     # Track current size per storage key so in-place version bumps don't double
     # count. key -> (nbytes, category_name).
     live: dict[object, tuple[int, str]] = {}
@@ -100,6 +105,8 @@ def _categorized_memory(memprof) -> dict[str, int]:
 
     for _t, action, key_ver, nbytes in memprof.timeline:
         key, version = key_ver
+        if device is not None and str(getattr(key, "device", "")) != device:
+            continue
         cat = memprof._categories.get(key, version)
         cname = cat.name if cat is not None else "UNKNOWN"
         a = action.name
@@ -123,8 +130,11 @@ def _categorized_memory(memprof) -> dict[str, int]:
     return result
 
 
-def _memory_timeline_points(memprof) -> dict[str, object]:
-    """Build browser-friendly timeline points from the profiler memory timeline."""
+def _memory_timeline_points(memprof, device: str | None = None) -> dict[str, object]:
+    """Build browser-friendly timeline points from the profiler memory timeline.
+
+    ``device`` restricts the walk to tensors on that device (see
+    ``_categorized_memory``)."""
     live: dict[object, tuple[int, str]] = {}
     category_names = [name for name, _ in CATEGORY_ORDER]
     start_time = next((t for t, *_ in memprof.timeline if t >= 0), 0)
@@ -133,6 +143,8 @@ def _memory_timeline_points(memprof) -> dict[str, object]:
 
     for t, action, key_ver, nbytes in memprof.timeline:
         key, version = key_ver
+        if device is not None and str(getattr(key, "device", "")) != device:
+            continue
         cat = memprof._categories.get(key, version)
         cname = cat.name if cat is not None else "UNKNOWN"
         a = action.name
@@ -161,8 +173,8 @@ def _memory_timeline_points(memprof) -> dict[str, object]:
     }
 
 
-def _write_memory_timeline_html(path: str, mode: str, memprof) -> None:
-    data = _memory_timeline_points(memprof)
+def _write_memory_timeline_html(path: str, mode: str, memprof, device: str | None = None) -> None:
+    data = _memory_timeline_points(memprof, device)
     data["mode"] = mode
     payload = json.dumps(data)
     html = """<!doctype html>
@@ -392,10 +404,26 @@ class PeakRSS:
             self._thread.join()
 
 
-def _setup(rank: int, world_size: int) -> None:
+def _resolve_device_type(device: str = "cpu") -> str:
+    """Normalize a requested device to what will actually be used: 'cuda' (NCCL,
+    one rank per GPU) only when requested AND a GPU is present, otherwise 'cpu'
+    (gloo). The default keeps the original single-host CPU run unchanged."""
+    if device == "cuda":
+        if torch.cuda.is_available():
+            return "cuda"
+        print("warning: device='cuda' requested but no GPU is available; falling back to CPU.")
+    return "cpu"
+
+
+def _setup(rank: int, world_size: int, device_type: str = "cpu") -> None:
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ.setdefault("MASTER_PORT", "12413")
-    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+    if device_type == "cuda":
+        device = torch.device(f"cuda:{rank}")
+        torch.cuda.set_device(device)
+        dist.init_process_group("nccl", rank=rank, world_size=world_size, device_id=device)
+    else:
+        dist.init_process_group("gloo", rank=rank, world_size=world_size)
 
 
 def _cleanup() -> None:
@@ -621,16 +649,22 @@ def _train_step(
     _record_fsdp_internal_sample(fsdp_samples, "after_optimizer_step", model, tracker)
 
 
-def run_phase(rank: int, mode: str, world_size: int) -> None:
+def run_phase(rank: int, mode: str, world_size: int, device_type: str = "cpu") -> None:
     proc = psutil.Process()
-    device = torch.device("cpu")
+    if device_type == "cuda":
+        device = torch.device(f"cuda:{rank}")
+        torch.cuda.set_device(device)
+    else:
+        device = torch.device("cpu")
 
     if mode == "fsdp":
-        _setup(rank, world_size)
+        _setup(rank, world_size, device_type)
 
-    # Capture the baseline AFTER the process group is initialized, so gloo's
-    # comm buffers count as pre-model overhead (not as model/training memory).
-    # This keeps 'peak-overhead' a fair model+training comparison across modes.
+    # Capture the baseline AFTER the process group is initialized, so comm
+    # buffers count as pre-model overhead (not as model/training memory). This
+    # keeps 'peak-overhead' a fair model+training comparison across modes. On
+    # CUDA the analogue is the allocator's peak-allocated high-water mark, which
+    # already excludes the fixed CUDA context, so its 'before' baseline is 0.
     rss_before = proc.memory_info().rss  # interpreter + torch + comm-init overhead
 
     torch.manual_seed(0)
@@ -649,23 +683,45 @@ def run_phase(rank: int, mode: str, world_size: int) -> None:
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     x, y = _make_batch(device)
 
-    # --- Pass 1: clean peak-RSS run (no profiler, to avoid contaminating RSS) ---
+    # --- Pass 1: clean peak-memory run (no profiler, to avoid contaminating it) ---
+    # CPU: sample process RSS on a thread. CUDA: reset the allocator peak stats
+    # (after the model is resident, so params are included) and read the
+    # high-water mark of allocated / reserved bytes at the end.
     footprint: dict[str, int] = {}
     fsdp_internal_samples: list[dict[str, int | str]] = []
-    with PeakRSS() as peak:
+
+    def _run_pass1() -> None:
+        nonlocal footprint
         for step in range(STEPS):
             samples = fsdp_internal_samples if mode == "fsdp" and rank == 0 and step == 0 else None
             with record_function("step"):
                 _train_step(model, optimizer, is_fsdp, x, y, samples, tracker)
             if step == 0:
                 footprint = _footprint_bytes(model, optimizer)
-    peak_rss = peak.peak
+
+    if device_type == "cuda":
+        torch.cuda.synchronize(device)
+        torch.cuda.reset_peak_memory_stats(device)
+        _run_pass1()
+        torch.cuda.synchronize(device)
+        peak_alloc = torch.cuda.max_memory_allocated(device)
+        peak_reserved = torch.cuda.max_memory_reserved(device)
+        peak_rss = 0
+    else:
+        with PeakRSS() as peak:
+            _run_pass1()
+        peak_rss = peak.peak
+        peak_alloc = 0
+        peak_reserved = 0
 
     # --- Pass 2: profiler run for the granular per-category memory breakdown ---
     # record_shapes + with_stack are REQUIRED for the memory profiler to walk the
     # op/autograd graph and label allocations (activation vs grad vs autograd ...).
+    activities = [ProfilerActivity.CPU]
+    if device_type == "cuda":
+        activities.append(ProfilerActivity.CUDA)
     with profile(
-        activities=[ProfilerActivity.CPU],
+        activities=activities,
         profile_memory=True,
         record_shapes=True,
         with_stack=True,
@@ -675,7 +731,9 @@ def run_phase(rank: int, mode: str, world_size: int) -> None:
                 _train_step(model, optimizer, is_fsdp, x, y)
 
     memprof = prof._memory_profile()
-    categorized = _categorized_memory(memprof)
+    # On CUDA only count tensors that live on this rank's device.
+    cat_device = str(device) if device_type == "cuda" else None
+    categorized = _categorized_memory(memprof, cat_device)
 
     if rank == 0:
         prof.export_chrome_trace(os.path.join(RESULTS_DIR, f"{mode}_rank0_trace.json"))
@@ -683,17 +741,21 @@ def run_phase(rank: int, mode: str, world_size: int) -> None:
             os.path.join(RESULTS_DIR, f"{mode}_rank0_memory.html"),
             mode,
             memprof,
+            cat_device,
         )
         prof.export_memory_timeline(
             os.path.join(RESULTS_DIR, f"{mode}_rank0_memory.raw.json.gz"),
-            device="cpu",
+            device=str(device),
         )
 
     result = {
         "mode": mode,
         "rank": rank,
+        "device_type": device_type,
         "rss_before": rss_before,
         "peak_rss": peak_rss,
+        "peak_cuda_alloc": peak_alloc,
+        "peak_cuda_reserved": peak_reserved,
         **footprint,
         **categorized,
         "fsdp_internal_samples": fsdp_internal_samples,
@@ -702,9 +764,11 @@ def run_phase(rank: int, mode: str, world_size: int) -> None:
         json.dump(result, f)
 
     if rank == 0:
+        sort_key = "self_cuda_memory_usage" if device_type == "cuda" else "self_cpu_memory_usage"
+        mem_kind = "CUDA" if device_type == "cuda" else "CPU"
         tag = f"{mode.upper()} (rank {rank})"
-        print(f"\n{'=' * 78}\n{tag} — top ops by self CPU memory (transient)\n{'=' * 78}")
-        print(prof.key_averages().table(sort_by="self_cpu_memory_usage", row_limit=8))
+        print(f"\n{'=' * 78}\n{tag} — top ops by self {mem_kind} memory (transient)\n{'=' * 78}")
+        print(prof.key_averages().table(sort_by=sort_key, row_limit=8))
 
     if mode == "fsdp":
         _cleanup()
@@ -728,35 +792,72 @@ def _report() -> None:
     base = next((r for r in rows if r["mode"] == "baseline"), None)
     fsdp0 = next((r for r in rows if r["mode"] == "fsdp" and r["rank"] == 0), None)
 
+    device_type = (fsdp0 or base or {}).get("device_type", "cpu")
+
     with torch.device("meta"):
         n_params = sum(p.numel() for p in ToyModel().parameters())
     print("\n" + "#" * 78)
     print(f"# TOTAL TRAINING MEMORY  (world_size={WORLD_SIZE}, {STEPS} steps, batch/rank={BATCH_PER_RANK})")
-    print(f"# model: {NUM_LAYERS} blocks, d_model={D_MODEL}, d_ff={D_FF}, params={n_params / 1e6:.1f}M")
+    print(f"# device: {device_type}  |  model: {NUM_LAYERS} blocks, d_model={D_MODEL}, "
+          f"d_ff={D_FF}, params={n_params / 1e6:.1f}M")
     print("#" * 78)
-    header = f"{'phase':<20}{'peak RSS':>14}{'peak-overhead':>16}{'resident(P+G+O)':>18}{'activations~':>16}"
-    print(header)
-    print("-" * len(header))
-    for r in (base, fsdp0):
-        if r is None:
-            continue
-        peak_minus_overhead = r["peak_rss"] - r["rss_before"]
-        activations = peak_minus_overhead - r["resident_total"]
-        label = "baseline (full)" if r["mode"] == "baseline" else "fsdp (per rank)"
-        print(
-            f"{label:<20}{_fmt(r['peak_rss']):>14}{_fmt(peak_minus_overhead):>16}"
-            f"{_fmt(r['resident_total']):>18}{_fmt(activations):>16}"
-        )
 
-    if base and fsdp0:
-        bd = base["peak_rss"] - base["rss_before"]
-        fd = fsdp0["peak_rss"] - fsdp0["rss_before"]
+    if device_type == "cuda":
+        # On CUDA the peak-allocated high-water mark already excludes the fixed
+        # CUDA context, so it IS the model+training footprint (no overhead to
+        # subtract). 'peak reserved' is the caching allocator's reservation.
+        def _peak(r: dict) -> int:
+            return r["peak_cuda_alloc"]
+
+        header = (
+            f"{'phase':<20}{'peak allocated':>16}{'peak reserved':>16}"
+            f"{'resident(P+G+O)':>18}{'transient~':>14}"
+        )
+        print(header)
         print("-" * len(header))
-        print(f"peak-overhead ratio baseline/fsdp: {bd / max(fd, 1):.2f}x")
-        print(
+        for r in (base, fsdp0):
+            if r is None:
+                continue
+            peak = _peak(r)
+            transient = peak - r["resident_total"]
+            label = "baseline (full)" if r["mode"] == "baseline" else "fsdp (per rank)"
+            print(
+                f"{label:<20}{_fmt(peak):>16}{_fmt(r['peak_cuda_reserved']):>16}"
+                f"{_fmt(r['resident_total']):>18}{_fmt(transient):>14}"
+            )
+        note = (
+            "note: 'peak allocated' = torch.cuda.max_memory_allocated (live tensors "
+            "high-water mark,\n      excludes the fixed CUDA context); 'peak reserved' "
+            "= allocator reservation;\n      'transient~' = peak allocated - resident."
+        )
+    else:
+        def _peak(r: dict) -> int:
+            return r["peak_rss"] - r["rss_before"]
+
+        header = f"{'phase':<20}{'peak RSS':>14}{'peak-overhead':>16}{'resident(P+G+O)':>18}{'activations~':>16}"
+        print(header)
+        print("-" * len(header))
+        for r in (base, fsdp0):
+            if r is None:
+                continue
+            peak_minus_overhead = _peak(r)
+            activations = peak_minus_overhead - r["resident_total"]
+            label = "baseline (full)" if r["mode"] == "baseline" else "fsdp (per rank)"
+            print(
+                f"{label:<20}{_fmt(r['peak_rss']):>14}{_fmt(peak_minus_overhead):>16}"
+                f"{_fmt(r['resident_total']):>18}{_fmt(activations):>16}"
+            )
+        note = (
             "note: 'peak RSS' includes ~torch/interpreter overhead (~rss_before); "
             "'peak-overhead' isolates model+training; 'activations~' = peak-overhead - resident."
         )
+
+    if base and fsdp0:
+        bd = _peak(base)
+        fd = _peak(fsdp0)
+        print("-" * len(header))
+        print(f"peak ratio baseline/fsdp: {bd / max(fd, 1):.2f}x")
+        print(note)
 
     _report_categories(base, fsdp0)
     _report_fsdp_internal(fsdp0)
@@ -846,16 +947,25 @@ def _report_fsdp_internal(fsdp0: dict | None) -> None:
     )
 
 
-def main() -> None:
+def main(device: str = "cpu") -> None:
+    device_type = _resolve_device_type(device)
+
     shutil.rmtree(RESULTS_DIR, ignore_errors=True)
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
-    # Separate processes so each phase gets a clean RSS high-water mark.
-    mp.spawn(run_phase, args=("baseline", 1), nprocs=1, join=True)
-    mp.spawn(run_phase, args=("fsdp", WORLD_SIZE), nprocs=WORLD_SIZE, join=True)
+    # Separate processes so each phase gets a clean peak-memory high-water mark.
+    mp.spawn(run_phase, args=("baseline", 1, device_type), nprocs=1, join=True)
+    mp.spawn(run_phase, args=("fsdp", WORLD_SIZE, device_type), nprocs=WORLD_SIZE, join=True)
 
     _report()
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--device",
+        choices=["cpu", "cuda"],
+        default="cpu",
+        help="cpu (gloo, default) or cuda (NCCL, one rank per GPU).",
+    )
+    main(device=parser.parse_args().device)

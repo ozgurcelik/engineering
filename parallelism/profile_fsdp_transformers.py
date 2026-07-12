@@ -22,12 +22,12 @@ Run (CPU / gloo):
 
 from __future__ import annotations
 
+import argparse
 import glob
 import json
 import math
 import os
 import shutil
-import sys
 
 import psutil
 import torch
@@ -46,6 +46,7 @@ from profile_fsdp import (
     _categorized_memory,
     _footprint_bytes,
     _record_fsdp_internal_sample,
+    _resolve_device_type,
     _report_categories,
     _report_fsdp_internal,
     _write_memory_timeline_html,
@@ -67,7 +68,7 @@ SEQ_LENS = [128, 256, 512, 1024]
 MAX_SEQ = max(SEQ_LENS)
 
 RESULTS_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "results_transformers"
+    os.path.dirname(os.path.abspath(__file__)), "results", "transformer"
 )
 
 
@@ -160,10 +161,15 @@ class ToyTransformerLM(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-def _setup(rank: int, world_size: int) -> None:
+def _setup(rank: int, world_size: int, device_type: str = "cpu") -> None:
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ.setdefault("MASTER_PORT", "12533")
-    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+    if device_type == "cuda":
+        device = torch.device(f"cuda:{rank}")
+        torch.cuda.set_device(device)
+        dist.init_process_group("nccl", rank=rank, world_size=world_size, device_id=device)
+    else:
+        dist.init_process_group("gloo", rank=rank, world_size=world_size)
 
 
 def _cleanup() -> None:
@@ -203,15 +209,22 @@ def _train_step(
     _record_fsdp_internal_sample(fsdp_samples, "after_optimizer_step", model, tracker)
 
 
-def run_phase(rank: int, mode: str, world_size: int, seq_len: int) -> None:
+def run_phase(
+    rank: int, mode: str, world_size: int, seq_len: int, device_type: str = "cpu"
+) -> None:
     proc = psutil.Process()
-    device = torch.device("cpu")
+    if device_type == "cuda":
+        device = torch.device(f"cuda:{rank}")
+        torch.cuda.set_device(device)
+    else:
+        device = torch.device("cpu")
 
     if mode == "fsdp":
-        _setup(rank, world_size)
+        _setup(rank, world_size, device_type)
 
-    # Capture the pre-model baseline AFTER comm init so gloo overhead is not
-    # charged to model/training memory (fair across modes).
+    # Capture the pre-model baseline AFTER comm init so comm overhead is not
+    # charged to model/training memory (fair across modes). On CUDA the analogue
+    # is the allocator's peak-allocated high-water mark (context excluded).
     rss_before = proc.memory_info().rss
 
     torch.manual_seed(0)
@@ -229,10 +242,12 @@ def run_phase(rank: int, mode: str, world_size: int, seq_len: int) -> None:
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     x, y = _make_batch(seq_len, device)
 
-    # --- Pass 1: clean peak-RSS run (no profiler) ---
+    # --- Pass 1: clean peak-memory run (no profiler) ---
     footprint: dict[str, int] = {}
     fsdp_internal_samples: list[dict[str, int | str]] = []
-    with PeakRSS() as peak:
+
+    def _run_pass1() -> None:
+        nonlocal footprint
         for step in range(STEPS):
             samples = (
                 fsdp_internal_samples
@@ -243,11 +258,28 @@ def run_phase(rank: int, mode: str, world_size: int, seq_len: int) -> None:
                 _train_step(model, optimizer, is_fsdp, x, y, samples, tracker)
             if step == 0:
                 footprint = _footprint_bytes(model, optimizer)
-    peak_rss = peak.peak
+
+    if device_type == "cuda":
+        torch.cuda.synchronize(device)
+        torch.cuda.reset_peak_memory_stats(device)
+        _run_pass1()
+        torch.cuda.synchronize(device)
+        peak_alloc = torch.cuda.max_memory_allocated(device)
+        peak_reserved = torch.cuda.max_memory_reserved(device)
+        peak_rss = 0
+    else:
+        with PeakRSS() as peak:
+            _run_pass1()
+        peak_rss = peak.peak
+        peak_alloc = 0
+        peak_reserved = 0
 
     # --- Pass 2: profiler run for the per-category live-memory breakdown ---
+    activities = [ProfilerActivity.CPU]
+    if device_type == "cuda":
+        activities.append(ProfilerActivity.CUDA)
     with profile(
-        activities=[ProfilerActivity.CPU],
+        activities=activities,
         profile_memory=True,
         record_shapes=True,
         with_stack=True,
@@ -257,25 +289,29 @@ def run_phase(rank: int, mode: str, world_size: int, seq_len: int) -> None:
                 _train_step(model, optimizer, is_fsdp, x, y)
 
     memprof = prof._memory_profile()
-    categorized = _categorized_memory(memprof)
+    cat_device = str(device) if device_type == "cuda" else None
+    categorized = _categorized_memory(memprof, cat_device)
 
     top_ops = ""
     if rank == 0:
-        top_ops = prof.key_averages().table(
-            sort_by="self_cpu_memory_usage", row_limit=10
-        )
+        sort_key = "self_cuda_memory_usage" if device_type == "cuda" else "self_cpu_memory_usage"
+        top_ops = prof.key_averages().table(sort_by=sort_key, row_limit=10)
         _write_memory_timeline_html(
             os.path.join(RESULTS_DIR, f"{mode}_seq{seq_len}_rank0_memory.html"),
             f"{mode} seq={seq_len}",
             memprof,
+            cat_device,
         )
 
     result = {
         "mode": mode,
         "rank": rank,
         "seq_len": seq_len,
+        "device_type": device_type,
         "rss_before": rss_before,
         "peak_rss": peak_rss,
+        "peak_cuda_alloc": peak_alloc,
+        "peak_cuda_reserved": peak_reserved,
         **footprint,
         **categorized,
         "fsdp_internal_samples": fsdp_internal_samples,
@@ -383,11 +419,24 @@ def _report(seq_lens: list[int]) -> None:
             row += f"{_fmt(f[f'cat_{c}']):>16}"
         print(row)
 
-    # --- Table 3: peak process RSS (everything, incl. allocator churn) ---
+    # --- Table 3: peak process memory (everything, incl. allocator churn) ---
+    device_type = (fsdp0 or base0 or {}).get("device_type", "cpu")
+    is_cuda = device_type == "cuda"
+
+    def _peak_above_overhead(r: dict) -> int:
+        # CUDA: max_memory_allocated already excludes the fixed context. CPU:
+        # subtract the pre-model RSS overhead.
+        return r["peak_cuda_alloc"] if is_cuda else r["peak_rss"] - r["rss_before"]
+
     print("\n" + "=" * 92)
-    print("Peak process RSS above overhead vs sequence length (MB)   [OS resident, all memory]")
+    if is_cuda:
+        print("Peak CUDA memory allocated vs sequence length (MB)   [torch.cuda.max_memory_allocated]")
+    else:
+        print("Peak process RSS above overhead vs sequence length (MB)   [OS resident, all memory]")
     print("=" * 92)
-    header = f"{'seq_len':>8}{'RSS base':>13}{'RSS fsdp':>13}{'RSS ratio':>13}"
+    col = "CUDA base" if is_cuda else "RSS base"
+    colf = "CUDA fsdp" if is_cuda else "RSS fsdp"
+    header = f"{'seq_len':>8}{col:>13}{colf:>13}{'ratio':>13}"
     print(header)
     print("-" * len(header))
     for t in seq_lens:
@@ -395,17 +444,24 @@ def _report(seq_lens: list[int]) -> None:
         f = rows.get(("fsdp", t))
         if not b or not f:
             continue
-        bo = b["peak_rss"] - b["rss_before"]
-        fo = f["peak_rss"] - f["rss_before"]
+        bo = _peak_above_overhead(b)
+        fo = _peak_above_overhead(f)
         print(
             f"{t:>8}{_fmt(bo):>13}{_fmt(fo):>13}{bo / max(fo, 1):>11.2f}x"
         )
     print("-" * len(header))
-    print(
-        "note: RSS includes live tensors + CPU-allocator caching/fragmentation +\n"
-        "      transient spikes, so it tracks the live-tensor ratio only loosely\n"
-        "      (FSDP's gather/reduce-scatter/resize churn inflates it)."
-    )
+    if is_cuda:
+        print(
+            "note: max_memory_allocated is the high-water mark of LIVE device tensors\n"
+            "      (excludes the fixed CUDA context and the allocator's reserved-but-\n"
+            "      unused blocks), so it tracks the live-tensor co-peak closely."
+        )
+    else:
+        print(
+            "note: RSS includes live tensors + CPU-allocator caching/fragmentation +\n"
+            "      transient spikes, so it tracks the live-tensor ratio only loosely\n"
+            "      (FSDP's gather/reduce-scatter/resize churn inflates it)."
+        )
 
 
 def _report_detail(seq_len: int) -> None:
@@ -434,18 +490,19 @@ def _report_detail(seq_len: int) -> None:
         print(r["top_ops"])
 
 
-def main() -> None:
-    # Optional CLI: pass one or more sequence lengths to run only those, e.g.
-    #   python profile_fsdp_transformers.py 1024
-    requested = [int(a) for a in sys.argv[1:]] or SEQ_LENS
+def main(device: str = "cpu", seq_lens: list[int] | None = None) -> None:
+    device_type = _resolve_device_type(device)
+    requested = seq_lens or SEQ_LENS
 
     shutil.rmtree(RESULTS_DIR, ignore_errors=True)
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
     for seq_len in requested:
-        # Separate processes per phase so each gets a clean RSS high-water mark.
-        mp.spawn(run_phase, args=("baseline", 1, seq_len), nprocs=1, join=True)
-        mp.spawn(run_phase, args=("fsdp", WORLD_SIZE, seq_len), nprocs=WORLD_SIZE, join=True)
+        # Separate processes per phase so each gets a clean peak-memory mark.
+        mp.spawn(run_phase, args=("baseline", 1, seq_len, device_type), nprocs=1, join=True)
+        mp.spawn(
+            run_phase, args=("fsdp", WORLD_SIZE, seq_len, device_type), nprocs=WORLD_SIZE, join=True
+        )
 
     if len(requested) > 1:
         _report(requested)
@@ -454,4 +511,18 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--device",
+        choices=["cpu", "cuda"],
+        default="cpu",
+        help="cpu (gloo, default) or cuda (NCCL, one rank per GPU).",
+    )
+    parser.add_argument(
+        "seq_lens",
+        nargs="*",
+        type=int,
+        help="Optional sequence lengths to run (default: the built-in sweep).",
+    )
+    args = parser.parse_args()
+    main(device=args.device, seq_lens=args.seq_lens or None)
