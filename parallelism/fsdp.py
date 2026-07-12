@@ -34,7 +34,6 @@ class FSDPLayerState:
 class PendingReduceScatter:
     handle: dist.Work # async Work handle (None when world_size == 1)
     output: torch.Tensor # the local shard grad. valid after the wait()
-    input_keepalive: torch.Tensor # keep the reduce scatters input alive until we are done with it
     local_param: torch.nn.Parameter | None = None # for the finalized grad
 
 def _cast_floating(obj, dtype: torch.dtype):
@@ -295,7 +294,6 @@ class FSDP(torch.nn.Module):
             return PendingReduceScatter(
                 handle=None,
                 output=flattened_grad,
-                input_keepalive=flattened_grad,
                 local_param=None,
             )
         else:
@@ -304,7 +302,6 @@ class FSDP(torch.nn.Module):
             return PendingReduceScatter(
                 handle=handle,
                 output=output,
-                input_keepalive=flattened_grad,
                 local_param=None,
             )
 

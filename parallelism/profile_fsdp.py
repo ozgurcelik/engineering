@@ -572,10 +572,6 @@ def _fsdp_internal_breakdown(
         tracker.resident_pinned_bytes(attached_full_ptrs) if tracker is not None else 0
     )
 
-    pending_reduce_scatter_input = sum(
-        _tensor_bytes(pending.input_keepalive)
-        for pending in model._pending_reduce_scatters
-    )
     pending_reduce_scatter_output = sum(
         _tensor_bytes(pending.output)
         for pending in model._pending_reduce_scatters
@@ -588,7 +584,6 @@ def _fsdp_internal_breakdown(
         "backward_all_gather_buffers": backward_all_gather,
         "active_full_params": active_full_params,
         "autograd_pinned_full_weights": autograd_pinned_full_weights,
-        "pending_reduce_scatter_full_grad_inputs": pending_reduce_scatter_input,
         "pending_reduce_scatter_shard_outputs": pending_reduce_scatter_output,
         "tracked_total": (
             local_shard_params
@@ -597,7 +592,6 @@ def _fsdp_internal_breakdown(
             + backward_all_gather
             + active_full_params
             + autograd_pinned_full_weights
-            + pending_reduce_scatter_input
             + pending_reduce_scatter_output
         ),
     }
@@ -917,7 +911,6 @@ def _report_fsdp_internal(fsdp0: dict | None) -> None:
         ("backward_all_gather_buffers", "bwd all-gather"),
         ("active_full_params", "active full params"),
         ("autograd_pinned_full_weights", "pinned full W"),
-        ("pending_reduce_scatter_full_grad_inputs", "RS full-grad inputs"),
         ("pending_reduce_scatter_shard_outputs", "RS shard outputs"),
         ("tracked_total", "tracked total"),
     ]
@@ -936,9 +929,12 @@ def _report_fsdp_internal(fsdp0: dict | None) -> None:
         print(row)
     print("-" * len(header))
     print(
-        "note: these are FSDP-specific tensors only. The reduce-scatter input is\n"
-        "      the full flattened gradient that must stay alive until the async\n"
-        "      collective completes; the shard output becomes the local grad.\n"
+        "note: these are FSDP-specific tensors only. The reduce-scatter shard\n"
+        "      output becomes the local grad. The collectives' INPUT buffers (the\n"
+        "      casted all-gather shard / the full flattened reduce-scatter grad)\n"
+        "      are not held by an explicit reference — PyTorch's NCCL keeps them\n"
+        "      alive until the op completes (recordStream) — so they aren't listed\n"
+        "      here.\n"
         "      'pinned full W' = forward full-weight storages still resident but\n"
         "      no longer an attached full param (e.g. pinned by autograd's saved\n"
         "      tensors). With per-layer freeing via storage().resize_(0) this is\n"
