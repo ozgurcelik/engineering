@@ -90,11 +90,11 @@ class FSDP(torch.nn.Module):
 
         self._pending_reduce_scatters: list[PendingReduceScatter] = []
 
-        self.fsdp_layers: list[torch.nn.Module] = []
+        self._fsdp_layers: list[torch.nn.Module] = []
         self._replicate_parameters: list[torch.nn.Parameter] = []
         self._find_fsdp_layers_and_replicated_parameters()
         self._cast_replicated_params_to_float32()
-        self._layer_index = {layer: i for i, layer in enumerate(self.fsdp_layers)}
+        self._layer_index = {layer: i for i, layer in enumerate(self._fsdp_layers)}
         self._create_layer_states()
         self._register_forward_hooks()
         self._register_backward_hooks()
@@ -119,7 +119,7 @@ class FSDP(torch.nn.Module):
         """
         for submodule in self.module.modules():
             if isinstance(submodule, (torch.nn.Linear, torch.nn.Embedding)):
-                self.fsdp_layers.append(submodule)
+                self._fsdp_layers.append(submodule)
             else:
                 for param in submodule.parameters(recurse=False):
                     if param.requires_grad:
@@ -196,7 +196,7 @@ class FSDP(torch.nn.Module):
         """
         Create the states for the FSDP layers.
         """
-        for layer in self.fsdp_layers:
+        for layer in self._fsdp_layers:
             self._layer_states[layer] = self._create_layer_state(layer)
 
     def _all_gather_param_async(self, local_param: torch.nn.Parameter, 
@@ -414,8 +414,8 @@ class FSDP(torch.nn.Module):
             self._free_full_param(param_state.full_param)
 
         next_index = self._layer_index[layer] + self._prefetch_window_size
-        if next_index < len(self.fsdp_layers):
-            self._prefetch_layer_forward(self.fsdp_layers[next_index])
+        if next_index < len(self._fsdp_layers):
+            self._prefetch_layer_forward(self._fsdp_layers[next_index])
 
         if self.compute_dtype is None:
             return None
@@ -425,7 +425,7 @@ class FSDP(torch.nn.Module):
         """
         Register the forward hooks for the FSDP layers.
         """
-        for layer in self.fsdp_layers:
+        for layer in self._fsdp_layers:
             self._forward_hook_handles.append(layer.register_forward_pre_hook(self._pre_forward_hook))
             self._forward_hook_handles.append(layer.register_forward_hook(self._post_forward_hook))
 
@@ -438,13 +438,13 @@ class FSDP(torch.nn.Module):
 
         prev_index = self._layer_index[layer] - self._prefetch_window_size
         if prev_index >= 0:
-            self._prefetch_layer_backward(self.fsdp_layers[prev_index])
+            self._prefetch_layer_backward(self._fsdp_layers[prev_index])
 
     def _register_backward_hooks(self) -> None:
         """
         Register the backward hooks for the FSDP layers.
         """
-        for layer in self.fsdp_layers:
+        for layer in self._fsdp_layers:
             self._backward_hook_handles.append(layer.register_full_backward_pre_hook(self._pre_backward_hook))
 
 
@@ -463,13 +463,13 @@ class FSDP(torch.nn.Module):
 
     def forward(self, *inputs, **kwargs):
         """
-        Prefetch the first two FSDP layers params for the forward pass.
+        Prefetch first FSDP layers params for the forward pass.
         """
-        for layer in self.fsdp_layers[:self._prefetch_window_size]:
+        for layer in self._fsdp_layers[:self._prefetch_window_size]:
             self._prefetch_layer_forward(layer)
         outputs = self.module(*inputs, **kwargs)
 
-        for layer in reversed(self.fsdp_layers[-self._prefetch_window_size:]):
+        for layer in reversed(self._fsdp_layers[-self._prefetch_window_size:]):
             self._prefetch_layer_backward(layer)
 
         return outputs
