@@ -33,7 +33,7 @@ class FSDPLayerState:
 @dataclass
 class PendingReduceScatter:
     handle: dist.Work # async Work handle (None when world_size == 1)
-    output: torch.Tensor # the local shard grad. valid after the wait()
+    local_grad: torch.Tensor # the local shard grad. valid after the wait()
     local_param: torch.nn.Parameter | None = None # for the finalized grad
 
 def _cast_floating(obj, dtype: torch.dtype):
@@ -80,7 +80,7 @@ class FSDP(torch.nn.Module):
             self.rank = 0
 
         self._prefetch_window_size = 1
-        self._reduce_scatter_window_size = 0
+        self._reduce_scatter_window_size = 2
 
         self._broadcast_initial_state()
 
@@ -293,15 +293,15 @@ class FSDP(torch.nn.Module):
         if self.world_size == 1:
             return PendingReduceScatter(
                 handle=None,
-                output=flattened_grad,
+                local_grad=flattened_grad,
                 local_param=None,
             )
         else:
-            output = torch.empty(metadata.shard_size, dtype=full_grad.dtype, device=full_grad.device)
-            handle = dist.reduce_scatter_tensor(output=output, input=flattened_grad, op=dist.ReduceOp.SUM, async_op=True)
+            local_grad = torch.empty(metadata.shard_size, dtype=full_grad.dtype, device=full_grad.device)
+            handle = dist.reduce_scatter_tensor(output=local_grad, input=flattened_grad, op=dist.ReduceOp.SUM, async_op=True)
             return PendingReduceScatter(
                 handle=handle,
-                output=output,
+                local_grad=local_grad,
                 local_param=None,
             )
 
@@ -309,7 +309,7 @@ class FSDP(torch.nn.Module):
         if pending.handle is not None:
             pending.handle.wait()
 
-        local_grad = pending.output.to(pending.local_param.dtype).div_(self.world_size)
+        local_grad = pending.local_grad.to(pending.local_param.dtype).div_(self.world_size)
 
         if pending.local_param.grad is None:
             pending.local_param.grad = local_grad

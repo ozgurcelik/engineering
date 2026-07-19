@@ -486,7 +486,7 @@ class FullWeightTracker:
         self._handles: list[torch.utils.hooks.RemovableHandle] = []
         if not isinstance(model, FSDP):
             return
-        for layer in model.fsdp_layers:
+        for layer in model._fsdp_layers:
             self._handles.append(layer.register_forward_pre_hook(self._make_hook()))
 
     def _make_hook(self):
@@ -573,7 +573,7 @@ def _fsdp_internal_breakdown(
     )
 
     pending_reduce_scatter_output = sum(
-        _tensor_bytes(pending.output)
+        _tensor_bytes(pending.local_grad)
         for pending in model._pending_reduce_scatters
     )
 

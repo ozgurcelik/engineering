@@ -370,6 +370,8 @@ So, the mental model is not that the prefecth last layers for the backward pass 
 
 ### Backward Pass
 
+#### All-Gather for Backward Pass
+
 We start again by doing the all-gather operation for the parameters of the layer before we can do the backward pass.
 Remember that `dL/dx = W^T * dL/dy` so we need the full `W` in memory to compute the input gradients.
 ```python
@@ -405,3 +407,158 @@ In the forward pass, when we run this layer, autograd saved the weight tensor fo
 Then, with the post-forward hook, we freed the storage of the weight tensor by resizing it to 0.
 So the tensor saved by the autograd is now pointing to an empty storage.
 To do backward pass, we need to re-materialize the full weight in the same storage so autograd can use it now.
+So, in the all-gather for the backward pass, we pick up the storage of the full parameter (which is now pointing to an empty storage) and resize it to the padded number of elements.
+Note that when we did the forward pass over the layer, the shape of the parameter was [out, in], and full_param still thinks it is so.
+So, we build a flat tensor of the correct size, [padded_num_elements,], and assign it to the data of the full parameter.
+Remember that padded_num_elements is the size we need because we have world_size number of GPUs, and each GPU has shard_size number of elements.
+And total size is the world_size times the shard_size which is padded_num_elements.
+Afterwards, the prefetch is quite similar to the forward pass.
+```python
+    def _prefetch_layer_backward(self, layer: torch.nn.Module) -> None:
+        """
+        Issue an async all-gather operation for the layers params for the backward pass.
+        """
+        for param_name, param_state in self._layer_states[layer].param_states.items():
+            full_param = param_state.full_param
+            if full_param is None or self._storage_allocated(full_param):
+                continue
+            metadata = param_state.metadata
+            if metadata is None:
+                continue
+            handle = self._regather_full_param_backward(
+                full_param, param_state.local_param, metadata
+            )
+            param_state.backward_gather_handle = handle
+```
+We then add it as a backward hook for the layer.
+```python
+    def _pre_backward_hook(self, layer: torch.nn.Module, grad_output: torch.Tensor):
+        """
+        Pre-backward hook for the FSDP layers.
+        We should gather the parameters before the backward pass.
+        """
+        self._use_prefetched_layer_backward(layer)
+
+        prev_index = self._layer_index[layer] - self._prefetch_window_size
+        if prev_index >= 0:
+            self._prefetch_layer_backward(self._fsdp_layers[prev_index])
+
+    def _register_backward_hooks(self) -> None:
+        """
+        Register the backward hooks for the FSDP layers.
+        """
+        for layer in self._fsdp_layers:
+            self._backward_hook_handles.append(layer.register_full_backward_pre_hook(self._pre_backward_hook))
+```
+This concludes the all-gather operation for the backward pass.
+Now, we need to do the reduce-scatter operation for the gradients.
+
+#### Reduce-Scatter for Backward Pass
+
+Why do we need to do the reduce-scatter operation for the gradients?
+Remember that FSDP is data-parallel, meaning each rank uses its own microbatch of data and the gradients are computed on that microbatch.
+So, we need to sum the gradients across all the ranks to get the global gradient and this is conceptually the reduce part.
+Also, remember that in FSDP, each rank only holds a shard of the parameters, so each rank only needs the gradients for its own shard of the parameters.
+So, we need to pass each rank its own gradient and this is conceptually the scatter part.
+In the implementation, we first define the data structure for the reduce-scatter operation.
+```python
+@dataclass
+class PendingReduceScatter:
+    handle: dist.Work # async Work handle (None when world_size == 1)
+    local_grad: torch.Tensor # the local shard grad. valid after the wait()
+    local_param: torch.nn.Parameter | None = None # for the finalized grad
+```
+We store the handle for the reduce-scatter operation so that we can reference to it later.
+The local grad is the gradient for the local shard of the parameters and it is valid after the wait() is called on the handle.
+The local param is the parameter for which we are computing the gradient and it is used to finalize the gradient.
+```python
+    def _reduce_scatter_grad_async(self, full_grad: torch.Tensor, metadata: ShardMetadata) -> PendingReduceScatter:
+        """
+        We issue an async reduce scatter operation.
+        """
+        flattened_grad = full_grad.flatten()
+        if metadata.padded_num_elements > metadata.num_elements:
+            padding = torch.zeros(metadata.padded_num_elements - metadata.num_elements, dtype=full_grad.dtype, device=full_grad.device)
+            flattened_grad = torch.cat([flattened_grad, padding])
+
+        if self.world_size == 1:
+            return PendingReduceScatter(
+                handle=None,
+                local_grad=flattened_grad,
+                local_param=None,
+            )
+        else:
+            local_grad = torch.empty(metadata.shard_size, dtype=full_grad.dtype, device=full_grad.device)
+            handle = dist.reduce_scatter_tensor(output=local_grad, input=flattened_grad, op=dist.ReduceOp.SUM, async_op=True)
+            return PendingReduceScatter(
+                handle=handle,
+                local_grad=local_grad,
+                local_param=None,
+            )
+```
+The full_grad there is the gradient of the full parameter from a rank.
+We first flatten and pad it just like we do to the parameter itself.
+Then, we create an empty tensor for the local grad and issue the reduce-scatter operation asynchronously.
+Note that the empty tensor is shard_size in size since when we do the reduce-scatter operation, we get the output tensor for the local rank which only owns the shard_size number of elements from the parameter.
+```python
+    def _make_reduce_scatter_hook(self, layer: torch.nn.Module, param_name: str):
+        """
+        Return a post-accumulate-grad hook that reduce scatters the full
+        weight's gradient into the local shard, then frees the full weight.
+        """
+        def hook(param: torch.nn.Parameter):
+            param_state = self._layer_states[layer].param_states[param_name]
+            if param.grad is not None:
+                pending_reduce_scatter = self._reduce_scatter_grad_async(param.grad, param_state.metadata)
+                # we do pending.local_param is param_state.local_param
+                pending_reduce_scatter.local_param = param_state.local_param
+                self._pending_reduce_scatters.append(pending_reduce_scatter)
+                self._drain_reduce_scatters()
+            
+            param.grad = None
+            # Free the full weight now that this layer's backward has consumed
+            # it: resize the storage to 0 (the autograd-saved copy shares it, so
+            # the memory is actually reclaimed) rather than detaching to a new
+            # empty storage.
+            self._free_full_param(param)
+        return hook
+```
+We can now discuss the _make_reduce_scatter_hook that we have attached to the parameter when we were doing the forward pass.
+In there, we first issue the async reduce-scatter operation.
+For ease, we also do the pending.local_param is param_state.local_param so that we can reference to the parameter later.
+Note that this does not mean replicating the parameter, but just adding a reference to the parameter to the pending reduce scatter object.
+Afterwards, we add the pending reduce scatter object to the list of pending reduce scatters and call the _drain_reduce_scatters function.
+A question that might arise is are we deleting/freeing the tensors that are needed for reduce-scatter operation before it takes place when we do param.grad = None and self._free_full_param(param)?
+The answer is no, the operation is safe.
+There are a few things we need to understand here:
+1. Async op does not mean that the operation is deferred.
+The operation is enqueued on hte nccl stream immediately while the param.grad still has the valid data.
+Async there means that cpu thread does not block waiting for completion of the operation and gpu-side read of flattened grad is already scheduled.
+2. Setting the param.grad to None drops the reference to the tensor but the data stays alive as long as something references to it.
+3. The work handle still references to the tensor until the operation is completed.
+Additionaly, the padding allocates a new tensor so for the padding branch, the param.grad part is more obvious.
+And in that case, the param.grad does actually free the memory there and then since the referenced tensor is now the padded one.
+This also means padding momentarily increases the memory usage until param.grad is set to None.
+And the padded tensor's memory is freed when we wait for the handle to complete.
+And, the _free_full_param frees the weight, and not the grad.
+Now lets look at how we drain the reduce scatters.
+```python
+    def _finalize_reduce_scatter(self, pending: PendingReduceScatter) -> None:
+        if pending.handle is not None:
+            pending.handle.wait()
+
+        local_grad = pending.local_grad.to(pending.local_param.dtype).div_(self.world_size)
+
+        if pending.local_param.grad is None:
+            pending.local_param.grad = local_grad
+        else:
+            pending.local_param.grad.add_(local_grad)
+
+    def _drain_reduce_scatters(self) -> None:
+        """
+        Drain the reduce scatters.
+        """
+        while len(self._pending_reduce_scatters) > self._reduce_scatter_window_size:
+            pending = self._pending_reduce_scatters.pop(0)
+            self._finalize_reduce_scatter(pending)
+```
