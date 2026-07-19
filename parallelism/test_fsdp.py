@@ -7,7 +7,7 @@ adapted to run against this repo's ``FSDP`` class as a standalone script
 
     conda run -n distvenv python parallelism/test_fsdp.py
 
-Two checks, each run for compute_dtype in {None (fp32), torch.float16}:
+The checks run for compute_dtype in {None (fp32), torch.float16}:
   * test_fsdp_correctness  - sharded FSDP matches a single-process baseline
     (with matching mixed-precision behavior when compute_dtype is set).
   * test_fsdp_gradient_sync - after sync, every parameter has a correctly
@@ -29,15 +29,17 @@ from fsdp import FSDP
 
 
 def _cast_floating(obj, dtype: torch.dtype):
-    """Cast every floating-point tensor in obj (Tensor / tuple / list) to
+    """Cast every floating-point tensor in obj (Tensor / tuple / list / dict) to
     dtype via a differentiable ``.to()``; leave integer/bool tensors and
-    non-tensors untouched. Mirrors the helper the FSDP activation casting uses."""
+    non-tensors untouched. Mirrors the helper FSDP uses at the model boundary."""
     if torch.is_tensor(obj):
         return obj.to(dtype) if obj.is_floating_point() else obj
     if isinstance(obj, tuple):
         return tuple(_cast_floating(o, dtype) for o in obj)
     if isinstance(obj, list):
         return [_cast_floating(o, dtype) for o in obj]
+    if isinstance(obj, dict):
+        return {key: _cast_floating(value, dtype) for key, value in obj.items()}
     return obj
 
 
@@ -90,11 +92,10 @@ class ToyFSDPModel(nn.Module):
 
 class ToyMLPModel(nn.Module):
     """An MLP fed *raw fp32 activations*: the very first FSDP layer is a Linear
-    that receives fp32 input, so nothing casts the activation down to
-    compute_dtype before it meets a low-precision weight. This is the case that
-    crashes a weight-only-casting FSDP ("float != Half"), and the one that
-    activation-boundary casting is meant to fix. Also contains a real fp32
-    ``nn.LayerNorm`` to exercise a replicated norm on the low-precision path."""
+    that would otherwise receive fp32 input alongside a low-precision weight.
+    FSDP should cast the model input once and then let low-precision activations
+    flow through the model. Also contains a real fp32 ``nn.LayerNorm`` to
+    exercise a replicated norm on the low-precision path."""
 
     def __init__(self, d_in: int = 16, d_hidden: int = 32, d_out: int = 16) -> None:
         super().__init__()
@@ -260,74 +261,6 @@ def _apply_mixed_precision_hooks(model: nn.Module, compute_dtype: torch.dtype) -
         )
 
 
-def _apply_boundary_mixed_precision_hooks(model: nn.Module, compute_dtype: torch.dtype) -> None:
-    """Single-process reference for FSDP's *transparent activation-boundary*
-    mixed precision. In addition to casting each Linear/Embedding weight to
-    compute_dtype (like ``_apply_mixed_precision_hooks``), this also casts the
-    layer's floating-point *inputs* to compute_dtype on entry and casts the
-    floating-point *outputs* back to the incoming dtype on exit (for Embedding,
-    whose input is integer, outputs are restored to the fp32 master dtype).
-
-    This is exactly what the activation-aware FSDP does at each wrapped layer,
-    so an FSDP model must match a single-process model with these hooks."""
-    for mod in model.modules():
-        if not isinstance(mod, (nn.Linear, nn.Embedding)):
-            continue
-        master_dtype = mod.weight.dtype  # fp32
-
-        def make_fwd_pre(dt, master):
-            def hook(m, args):
-                m._saved_fp32 = m.weight.data
-                m.weight.data = m.weight.data.to(dt)
-                restore = master
-                for a in args:
-                    if torch.is_tensor(a) and a.is_floating_point():
-                        restore = a.dtype
-                        break
-                m._restore_dtype = restore
-                return _cast_floating(args, dt)
-
-            return hook
-
-        def make_fwd_post():
-            def hook(m, args, out):
-                m.weight.data = m._saved_fp32
-                del m._saved_fp32
-                m.weight.grad = None
-                return _cast_floating(out, m._restore_dtype)
-
-            return hook
-
-        mod.register_forward_pre_hook(make_fwd_pre(compute_dtype, master_dtype))
-        mod.register_forward_hook(make_fwd_post())
-
-        if isinstance(mod, nn.Linear):
-
-            def make_bwd_pre(dt):
-                def hook(m, grad_output):
-                    m._saved_fp32_bwd = m.weight.data
-                    m.weight.data = m.weight.data.to(dt)
-                    m.weight.grad = None
-
-                return hook
-
-            mod.register_full_backward_pre_hook(make_bwd_pre(compute_dtype))
-
-        def make_grad_hook(m, is_linear):
-            def hook(param):
-                if is_linear and hasattr(m, "_saved_fp32_bwd"):
-                    m.weight.data = m._saved_fp32_bwd
-                    del m._saved_fp32_bwd
-                if param.grad is not None:
-                    param.grad = param.grad.to(torch.float32)
-
-            return hook
-
-        mod.weight.register_post_accumulate_grad_hook(
-            make_grad_hook(mod, isinstance(mod, nn.Linear))
-        )
-
-
 # ---------------------------------------------------------------------------
 # Correctness: sharded FSDP == single-process baseline
 # ---------------------------------------------------------------------------
@@ -464,15 +397,14 @@ def _test_fsdp_gradient_sync(rank: int, world_size: int, compute_dtype) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Robustness: activation-dtype handling for arbitrary (fp32-activation) models
+# Robustness: cast model inputs once and keep low-precision activations
 # ---------------------------------------------------------------------------
 
 
 def _test_fsdp_activation_dtype(rank: int, world_size: int, compute_dtype) -> None:
-    """FSDP must run a model whose activations are NOT already in compute_dtype
-    (here, a Linear-first MLP fed fp32 input) and match a single-process model
-    with matching boundary mixed-precision hooks. Also checks masters/grads
-    stay fp32."""
+    """FSDP must cast a raw fp32 model input once, keep model activations in
+    compute_dtype, and match a single-process model using the same policy.
+    Also checks that master parameters and finalized gradients stay fp32."""
     torch.use_deterministic_algorithms(True)
     device = _setup_process_group(rank=rank, world_size=world_size, backend="gloo")
     dist.barrier()
@@ -482,7 +414,7 @@ def _test_fsdp_activation_dtype(rank: int, world_size: int, compute_dtype) -> No
 
     ref_model = deepcopy(base_model)
     if compute_dtype is not None:
-        _apply_boundary_mixed_precision_hooks(ref_model, compute_dtype)
+        _apply_mixed_precision_hooks(ref_model, compute_dtype)
 
     fsdp_model = get_fsdp(deepcopy(base_model), compute_dtype=compute_dtype)
 
@@ -499,7 +431,8 @@ def _test_fsdp_activation_dtype(rank: int, world_size: int, compute_dtype) -> No
         fsdp_optimizer.zero_grad(set_to_none=True)
         ref_optimizer.zero_grad(set_to_none=True)
 
-        ref_out = ref_model(all_x)
+        ref_x = _cast_floating(all_x, compute_dtype) if compute_dtype is not None else all_x
+        ref_out = ref_model(x=ref_x)
         ref_loss = F.mse_loss(ref_out.float(), all_y)
         ref_loss.backward()
         ref_optimizer.step()
@@ -507,7 +440,10 @@ def _test_fsdp_activation_dtype(rank: int, world_size: int, compute_dtype) -> No
         offset = rank * local_bs
         local_x = all_x[offset : offset + local_bs]
         local_y = all_y[offset : offset + local_bs]
-        fsdp_out = fsdp_model(local_x)
+        fsdp_out = fsdp_model(x=local_x)
+        expected_output_dtype = compute_dtype if compute_dtype is not None else torch.float32
+        assert fsdp_out.dtype == expected_output_dtype
+        assert ref_out.dtype == expected_output_dtype
         fsdp_loss = F.mse_loss(fsdp_out.float(), local_y)
         fsdp_loss.backward()
 
@@ -532,7 +468,7 @@ def _test_fsdp_activation_dtype(rank: int, world_size: int, compute_dtype) -> No
 
     if rank == 0:
         tag = "fp32" if compute_dtype is None else str(compute_dtype)
-        print(f"test_fsdp_activation_dtype[{tag}]: fp32-activation MLP ran and matched reference.")
+        print(f"test_fsdp_activation_dtype[{tag}]: cast-once MLP ran and matched reference.")
 
     _cleanup_process_group()
 

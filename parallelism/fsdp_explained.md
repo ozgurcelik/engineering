@@ -122,7 +122,6 @@ class FSDPParamState:
 class FSDPLayerState:
     layer: torch.nn.Module
     param_states: dict[str, FSDPParamState] = field(default_factory=dict)
-    restore_dtype: torch.dtype | None = None
 ```
 The `ShardMetadata` object lets us describe how the sharding of a parameter will be done.
 To understand what is going on in it, it helps us to look at the code where we get the shard metadata.
@@ -159,9 +158,6 @@ We also store the handles for the forward and backward gather operations which a
 
 In the LayerState object, we have the param_states dictionary to store the ParamState objects for each parameter in the layer.
 Remember that linear layer has weight and bias parameters each with their own ParamState object.
-Restore dtype records the activation-boundary dtype to which floating-point outputs are cast after the layer runs.
-Normally this is the dtype of the first floating-point input.
-For a layer such as an embedding whose inputs are integer indices, we use the dtype of its persistent FP32 master weight shard.
 
 We populate the layer states like this:
 ```python
@@ -306,26 +302,12 @@ We also clear the forward gather handle so that we know that the all-gather is d
     def _pre_forward_hook(self, layer: torch.nn.Module, inputs: tuple[torch.Tensor, ...]):
         """
         Pre-forward hook for the FSDP layers.
-        We should do the all-gather of the parameters for the forward pass.
-        Also cast the inputs to the compute dtype.
+        Wait for the prefetched parameters before the layer's forward pass.
         """
-        layer_state = self._layer_states[layer]
-        if self.compute_dtype is not None:
-            master_dtype = layer_state.param_states["weight"].local_param.dtype
-            layer_state.restore_dtype = _infer_restore_dtype(
-                inputs,
-                fallback_dtype=master_dtype,
-            )
-
         self._use_prefetched_layer_forward(layer)
-        if self.compute_dtype is None:
-            return None
-        return _cast_floating(inputs, self.compute_dtype)
 ```
-In the pre-forward hook, we first record the dtype to which floating-point outputs should be restored.
-We read the fallback from the persistent local master weight rather than `layer.weight`, because `layer.weight` is replaced by the gathered compute-dtype parameter before the layer runs.
-This distinction matters for embeddings: their integer inputs do not supply a floating-point activation dtype, so their outputs fall back to the FP32 master dtype instead of the temporary compute dtype.
-We then use the prefetched layer forward function to get the parameters in memory and cast floating-point inputs to the compute dtype.
+The pre-forward hook waits for the asynchronous all-gather and installs the materialized full parameters on the layer.
+It does not cast activations at every layer boundary; we cast the model's floating-point inputs once in `FSDP.forward`, as shown below.
 This concludes the operations we need to do before the forward pass.
 But, after the forward pass is over, we need to free the memory of the parameters.
 For that, we use the post-forward hook.
@@ -345,10 +327,6 @@ For that, we use the post-forward hook.
         next_index = self._layer_index[layer] + self._prefetch_window_size
         if next_index < len(self._fsdp_layers):
             self._prefetch_layer_forward(self._fsdp_layers[next_index])
-
-        if self.compute_dtype is None:
-            return None
-        return _cast_floating(outputs, self._layer_states[layer].restore_dtype)
 ```
 We set the layer's parameters to the local parameters and free the full parameter data.
 We also prefetch the next layer's parameters so that we can continue the prefetching process.
@@ -358,7 +336,6 @@ So, if the prefetch window size is 1, then the next index is the next layer in t
 If the prefetch window size is 2, then we start prefetching the 2 layers ahead and so on.
 Something to note here is that since we are starting the all-gather operation for layer i+1 in the post-forward hook of layer i, the computation of layer i and all-gather of i+1 does not overlap.
 But, if we set the window size to 2, then the computation of layer i+1 and all-gather of i+2 does overlap.
-We also restore the outputs to the original dtype if we are using the compute dtype.
 And this is how we free the memory:
 ```python
     @staticmethod
@@ -396,17 +373,27 @@ We initialize their prefetching in the forward function directly.
 ```python
     def forward(self, *inputs, **kwargs):
         """
-        Prefetch first FSDP layers params for the forward pass.
+        Prefetch the first FSDP layers and cast model inputs once for mixed
+        precision. Activations remain in compute_dtype unless the model itself
+        explicitly changes their dtype.
         """
         for layer in self._fsdp_layers[:self._prefetch_window_size]:
             self._prefetch_layer_forward(layer)
+
+        if self.compute_dtype is not None:
+            inputs = _cast_floating(inputs, self.compute_dtype)
+            kwargs = _cast_floating(kwargs, self.compute_dtype)
+
         outputs = self.module(*inputs, **kwargs)
 
         for layer in reversed(self._fsdp_layers[-self._prefetch_window_size:]):
             self._prefetch_layer_backward(layer)
         return outputs
 ```
-As we can see, before we run the forward pass of the model (self.module(*inputs, **kwargs)), we prefetch the first few layers.
+As we can see, before we run the model, we prefetch the first few layers and cast floating-point model inputs to `compute_dtype` once.
+The helper recursively handles tensors in positional arguments, lists, tuples, and keyword-argument dictionaries, while leaving integer and boolean tensors such as embedding indices unchanged.
+We do not cast each sharded layer's output back to its incoming dtype, so activations normally remain in `compute_dtype` as they flow through the model.
+This avoids repeated FP32-to-low-precision-to-FP32 conversions and is closer to the usual module-level FSDP mixed-precision policy.
 We will cover the backward pass in the next section, but we do the initial prefetching of the first few layers (which are the last layers in the list) in the backward pass in this code block as well.
 Important thing to note here is that the initial prefetching for the backwards layers is done only after the forward pass is over.
 So, the mental model is not that we prefetch the last layers for the backward pass at the start of the forward. Its that the forward pass just finished, and the backward pass is imminent, so we prefetch for the first few layers the backward pass will need.
