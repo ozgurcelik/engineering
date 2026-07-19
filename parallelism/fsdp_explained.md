@@ -562,3 +562,34 @@ Now lets look at how we drain the reduce scatters.
             pending = self._pending_reduce_scatters.pop(0)
             self._finalize_reduce_scatter(pending)
 ```
+Finalizing a reduce scatter simply means waiting for the operation to complete and then dividing the summed gradient by the world size.
+We then attach the gradient to the parameter.
+Remember that pending.local_param is the parameter_state.local_param.
+The last part is the replicated parameters part.
+```python
+    def _sync_grads_of_replicated_parameters(self) -> None:
+        """
+        Sync the gradients of the replicated parameters.
+        The replicated parameters are not sharded, so we can just all-reduce the gradients.
+        """
+        if self.world_size == 1:
+            return
+        for param in self._replicate_parameters:
+            if param.grad is not None:
+                dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, async_op=False)
+                param.grad.div_(self.world_size)
+```
+Since the replicated parameters are not sharded, we can just all-reduce the gradients.
+Additionally, we do
+```python
+    def finish_gradient_synchronization(self):
+        """
+        Wait for all the reduce scatter operations to complete.
+        """
+        while self._pending_reduce_scatters:
+            pending = self._pending_reduce_scatters.pop(0)
+            self._finalize_reduce_scatter(pending)
+
+        self._sync_grads_of_replicated_parameters()
+```
+before the optimizer step where we finish any hanging reduce scatter operations and sync the gradients of the replicated parameters.
