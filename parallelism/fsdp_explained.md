@@ -18,6 +18,12 @@ With FSDP, we can reduce this to (2 + 2 + K) * N_params / N_gpus bytes of memory
 Please note that this doesnt take into account activations, prefetching, master weight, and other overheads.
 But, it gives us a rough idea of the memory savings that we can achieve with FSDP.
 
+In our implementation, we will look at a simplified version of FSDP where we will assume a strictly linear and single-use execution order.
+Additionally, we will be sharding each parameter separately.
+On the other hand, on the production FSDP, PyTorch FSDP1 concatenates the parameters managed by an FSDP unit into a FlatParameter.
+FSDP2 uses per-parameter DTensor shards, but still groups parameters so each group uses one all-gather and one reduce-scatter.
+
+
 ## How does FSDP work?
 
 As we run the FSDP, each GPU will hold a shard of the model parameters.
@@ -32,18 +38,20 @@ The forward pass is given by `y = Wx`.
 And we have the loss function `L` with `dL/dy` available to us.
 Then, the gradients for this layer is given by `dL/dW = dL/dy * x^T` and this does not need us to have the full `W` in memory.
 But, the input gradients `dL/dx = W^T * dL/dy` does need us to have the full `W` in memory.
-This means, before we can the backward pass over a layer, we will need to do another all-gather operation to get the full `W` in memory.
+This means, before we can do the backward pass over a layer, we will need to do another all-gather operation to get the full `W` in memory.
 Also, FSDP generally unshards before backward because it is a generic mechanism operating on full parameters and ordinary autograd.
 And after doing the backward pass, we can free the memory of the parameters just like we did in the forward pass.
 Once we have computed the gradients for a layer, we need to do reduce-scatter operation so that each GPU can get the gradients for its shard of the model.
 So, in total, we will do 2 all-gathers and 1 reduce-scatter operations leading to 3 * N_params communication cost.
-In data parallel, we would have done 1 all-gather and 1 all-reduce operations leading to 2 * N_params communication cost, so FSDP has 1.5 times the communication cost of data parallel.
+In data parallel, we would have done 1 all-reduce operation which is equivalent to 1 reduce-scatter operation followed by 1 all-gather operation leading to 2 * N_params communication cost, so FSDP has 1.5 times the communication cost of data parallel.
 
 ## The implementation
 
 ### Initializations
 
-First of all, we need to find all the layers that are going to be sharded.
+First of all, all ranks must agree on the initial weights and buffers, so we start by broadcasting from rank 0.
+
+Then, we need to find all the layers that are going to be sharded.
 Why are we not sharding everything?
 Thats because some layers are not large enough to justify the communication overhead and latency costs.
 In our implementation, we will be sharding the linear and embedding layers.
@@ -68,6 +76,18 @@ Then, we iterate over all the submodules of the model and check if it belongs to
 Doing this at module level helps us with keeping the logic simple.
 For example, the weight and bias parameters of a linear layer are going to be visited together.
 And since this loop visits every module in the model, the recurse=False avoids double counting.
+
+Once we have collected the replicated parameters, we cast them to float32.
+```python
+    def _cast_replicated_params_to_float32(self) -> None:
+        """
+        Cast the replicated parameters to float32.
+        """
+        for param in self._replicate_parameters:
+            param.data = param.data.to(torch.float32)
+```
+This mirrors the master-weight choice we make for the sharded parameters: even when we train in a lower compute dtype, the replicated parameters (typically normalization weights) are kept in float32 so that their gradients are accumulated and all-reduced in full precision.
+This is important because normalization layers are numerically sensitive, and they are small enough that keeping a float32 copy costs us almost nothing.
 
 Now, we need to do some bookkeeping.
 For each layer, we will define a `FSDPLayerState` object to store everything we will need related to that layer.
@@ -200,6 +220,12 @@ We always store the master weight in float32.
 So, the parameters we use in the forward and backward pass computation might be lower precision, but we accumulate the gradients on the master weight which is in float32.
 Also, we set the layer's parameters to the local parameter instead of the full parameter.
 
+This local parameter is what closes the training loop.
+The optimizer steps on the FP32 local shards (`local_param`), never on the full or compute-dtype parameters.
+Each rank owns a disjoint shard, so each rank's optimizer only updates its own slice of the master weights, and there is no redundant work across ranks.
+This is exactly why the optimizer states (for example Adam's moments) end up sharded too: they are created and kept per `local_param`, so each rank only stores the optimizer state for its own shard.
+After the step, the updated FP32 values live in `local_param`, and they are re-cast to the compute dtype the next time we all-gather that layer, so the following forward pass automatically sees the freshly updated weights.
+
 ### Forward Pass
 
 In the forward pass, we need to do an all-gather operation for the parameters of the layer before we can do the forward pass.
@@ -249,7 +275,7 @@ So, the buffer's storage is fully allocated, but it just has uninitialized garba
                 param_state.full_param.register_post_accumulate_grad_hook(self._make_reduce_scatter_hook(layer, param_name))
             param_state.forward_gather_handle = handle
 ```
-In the prefecth function, we iterate over all the parameters of the layer (such as weight and bias of a linear layer) and check if the full parameter is already allocated.
+In the prefetch function, we iterate over all the parameters of the layer (such as weight and bias of a linear layer) and check if the full parameter is already allocated.
 If it is, we skip it.
 Otherwise, we wrap the buffer in a Parameter object and attach the post-accumulate-grad hook if the parameter requires grad.
 Had we done this after the forward pass, then the autograd graph would refer to the old object, and not to the tensor in the buffer.
@@ -329,6 +355,8 @@ This is how the overlap between the forward pass and the all-gather operation is
 Also note that, the next index is not necessarily the next layer in the list, but it depends on the prefetch window size.
 So, if the prefetch window size is 1, then the next index is the next layer in the list.
 If the prefetch window size is 2, then we start prefetching the 2 layers ahead and so on.
+Something to note here is that since we are starting the all-gather operation for layer i+1 in the post-forward hook of layer i, the computation of layer i and all-gather of i+1 does not overlap.
+But, if we set the window size to 2, then the computation of layer i+1 and all-gather of i+2 does overlap.
 We also restore the outputs to the original dtype if we are using the compute dtype.
 And this is how we free the memory:
 ```python
@@ -362,7 +390,7 @@ We then register the forward hooks for the FSDP layers.
 One open question might be if we are doing the prefetching for the next index layer, how do we do it for the first layers in the list?
 Because if the prefetch window size is 3, then when we run the forward pass for the first layer, we start the prefetching for the 4th layer.
 But neither 2nd nor 3rd will have their parameters prefetched when its their turn.
-We initialize their prefecting in the forward function directly.
+We initialize their prefetching in the forward function directly.
 ```python
     def forward(self, *inputs, **kwargs):
         """
@@ -379,7 +407,7 @@ We initialize their prefecting in the forward function directly.
 As we can see, before we run the forward pass of the model (self.module(*inputs, **kwargs)), we prefetch the first few layers.
 We will cover the backward pass in the next section, but we do the initial prefetching of the first few layers (which are the last layers in the list) in the backward pass in this code block as well.
 Important thing to note here is that the initial prefetching for the backwards layers is done only after the forward pass is over.
-So, the mental model is not that the prefecth last layers for the backward pass at the start of the forward. Its forward pass just finished, and backwards pass is imminent, so prefetch for the first few layers backwards will need.
+So, the mental model is not that we prefetch the last layers for the backward pass at the start of the forward. Its that the forward pass just finished, and the backward pass is imminent, so we prefetch for the first few layers the backward pass will need.
 
 ### Backward Pass
 
@@ -545,11 +573,11 @@ A question that might arise is are we deleting/freeing the tensors that are need
 The answer is no, the operation is safe.
 There are a few things we need to understand here:
 1. Async op does not mean that the operation is deferred.
-The operation is enqueued on hte nccl stream immediately while the param.grad still has the valid data.
+The operation is enqueued on the nccl stream immediately while the param.grad still has the valid data.
 Async there means that cpu thread does not block waiting for completion of the operation and gpu-side read of flattened grad is already scheduled.
 2. Setting the param.grad to None drops the reference to the tensor but the data stays alive as long as something references to it.
 3. The work handle still references to the tensor until the operation is completed.
-Additionaly, the padding allocates a new tensor so for the padding branch, the param.grad part is more obvious.
+Additionally, the padding allocates a new tensor so for the padding branch, the param.grad part is more obvious.
 And in that case, the param.grad does actually free the memory there and then since the referenced tensor is now the padded one.
 This also means padding momentarily increases the memory usage until param.grad is set to None.
 And the padded tensor's memory is freed when we wait for the handle to complete.
@@ -578,6 +606,17 @@ Now lets look at how we drain the reduce scatters.
 Finalizing a reduce scatter simply means waiting for the operation to complete and then dividing the summed gradient by the world size.
 We then attach the gradient to the parameter.
 Remember that pending.local_param is the parameter_state.local_param.
+
+The key thing to understand here is why we keep a window of pending reduce-scatters instead of finalizing each one immediately.
+Finalizing a reduce-scatter calls `wait()` on its handle, which blocks the CPU until that collective actually completes on the GPU.
+If we called `wait()` right after issuing the reduce-scatter for a layer, we would stall and lose the overlap.
+Instead, we let the reduce-scatter for layer L run in the background while the backward compute of the earlier layers proceeds, and we only `wait()` on it once `_reduce_scatter_window_size` newer reduce-scatters have been queued behind it.
+This is the backward-pass analogue of the prefetching we do in the forward pass: there we overlap an all-gather with earlier compute, here we overlap a reduce-scatter with later compute.
+The window size controls the trade-off: a larger window gives more slack for the collective to finish before we block on it, at the cost of holding more in-flight gradient buffers in memory.
+
+Because we keep this window, some reduce-scatters are still in flight when the backward pass ends.
+So before the optimizer step we call `finish_gradient_synchronization` to drain every remaining pending reduce-scatter and only then sync the replicated parameters.
+
 The last part is the replicated parameters part.
 ```python
     def _sync_grads_of_replicated_parameters(self) -> None:
@@ -605,4 +644,4 @@ Additionally, we do
 
         self._sync_grads_of_replicated_parameters()
 ```
-before the optimizer step where we finish any hanging reduce scatter operations and sync the gradients of the replicated parameters.
+This is called once before the optimizer step.
