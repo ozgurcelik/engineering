@@ -140,7 +140,9 @@ We also store the handles for the forward and backward gather operations which a
 
 In the LayerState object, we have the param_states dictionary to store the ParamState objects for each parameter in the layer.
 Remember that linear layer has weight and bias parameters each with their own ParamState object.
-Restore dtype is so that we can remember the dtype of the parameters of the layer.
+Restore dtype records the activation-boundary dtype to which floating-point outputs are cast after the layer runs.
+Normally this is the dtype of the first floating-point input.
+For a layer such as an embedding whose inputs are integer indices, we use the dtype of its persistent FP32 master weight shard.
 
 We populate the layer states like this:
 ```python
@@ -280,15 +282,23 @@ We also clear the forward gather handle so that we know that the all-gather is d
         We should do the all-gather of the parameters for the forward pass.
         Also cast the inputs to the compute dtype.
         """
+        layer_state = self._layer_states[layer]
+        if self.compute_dtype is not None:
+            master_dtype = layer_state.param_states["weight"].local_param.dtype
+            layer_state.restore_dtype = _infer_restore_dtype(
+                inputs,
+                fallback_dtype=master_dtype,
+            )
+
         self._use_prefetched_layer_forward(layer)
         if self.compute_dtype is None:
             return None
-        self._layer_states[layer].restore_dtype = _infer_restore_dtype(layer, inputs)
         return _cast_floating(inputs, self.compute_dtype)
 ```
-In the pre-forward hook, we use the prefetched layer forward function to get the parameters in memory.
-If we are using the compute dtype, we also cast the inputs to the compute dtype.
-We also remember the restore dtype so that we can restore the inputs to the original dtype after the forward pass.
+In the pre-forward hook, we first record the dtype to which floating-point outputs should be restored.
+We read the fallback from the persistent local master weight rather than `layer.weight`, because `layer.weight` is replaced by the gathered compute-dtype parameter before the layer runs.
+This distinction matters for embeddings: their integer inputs do not supply a floating-point activation dtype, so their outputs fall back to the FP32 master dtype instead of the temporary compute dtype.
+We then use the prefetched layer forward function to get the parameters in memory and cast floating-point inputs to the compute dtype.
 This concludes the operations we need to do before the forward pass.
 But, after the forward pass is over, we need to free the memory of the parameters.
 For that, we use the post-forward hook.

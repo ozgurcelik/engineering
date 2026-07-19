@@ -50,17 +50,20 @@ def _cast_floating(obj, dtype: torch.dtype):
         return [_cast_floating(o, dtype) for o in obj]
     return obj
 
-def _infer_restore_dtype(layer: torch.nn.Module, inputs: tuple) -> torch.dtype:
+def _infer_restore_dtype(
+    inputs: tuple,
+    fallback_dtype: torch.dtype,
+) -> torch.dtype:
     """
     dtype that floating-point OUTPUTS are cast back to on exit. Use the first
     floating-point input's dtype (keeps FSDP transparent to the surrounding
     model). If there's no floating-point input (e.g. Embedding takes integer
-    indices), fall back to the layer's fp32 master weight dtype.
+    indices), fall back to the supplied fp32 master weight dtype.
     """
     for input in inputs:
         if torch.is_tensor(input) and input.is_floating_point():
             return input.dtype
-    return layer.weight.dtype
+    return fallback_dtype
 
 class FSDP(torch.nn.Module):
     def __init__(self, 
@@ -395,10 +398,17 @@ class FSDP(torch.nn.Module):
         We should do the all-gather of the parameters for the forward pass.
         Also cast the inputs to the compute dtype.
         """
+        layer_state = self._layer_states[layer]
+        if self.compute_dtype is not None:
+            master_dtype = layer_state.param_states["weight"].local_param.dtype
+            layer_state.restore_dtype = _infer_restore_dtype(
+                inputs,
+                fallback_dtype=master_dtype,
+            )
+
         self._use_prefetched_layer_forward(layer)
         if self.compute_dtype is None:
             return None
-        self._layer_states[layer].restore_dtype = _infer_restore_dtype(layer, inputs)
         return _cast_floating(inputs, self.compute_dtype)
 
     def _post_forward_hook(self, layer: torch.nn.Module, inputs: tuple[torch.Tensor, ...], outputs: torch.Tensor):
