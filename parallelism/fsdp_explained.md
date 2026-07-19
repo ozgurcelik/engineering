@@ -13,8 +13,10 @@ But one problem with the data parallellism is that each rank holds a full copy o
 This means that if a GPU cannot fit the model in its memory, then the data parallel approach is not feasible.
 FSDP solves this problem by sharding the model across the ranks so that no rank needs to hold a full copy of the model.
 Since FSDP shards the model parameters, we also shard the gradients and optimizer states across the ranks.
-This means if the model and gradients are in BF16, then in baseline we would have (2 + 2 + K) * N_params bytes of memory per GPU, where N_params is the number of parameters in the model and K is the optimizer state overhead per parameter.
+In a simplified analysis, this means if the model and gradients are in BF16, then in baseline we would have (2 + 2 + K) * N_params bytes of memory per GPU, where N_params is the number of parameters in the model and K is the optimizer state overhead per parameter.
 With FSDP, we can reduce this to (2 + 2 + K) * N_params / N_gpus bytes of memory per GPU, where N_gpus is the number of GPUs in the world.
+Please note that this doesnt take into account activations, prefetching, master weight, and other overheads.
+But, it gives us a rough idea of the memory savings that we can achieve with FSDP.
 
 ## How does FSDP work?
 
@@ -31,10 +33,11 @@ And we have the loss function `L` with `dL/dy` available to us.
 Then, the gradients for this layer is given by `dL/dW = dL/dy * x^T` and this does not need us to have the full `W` in memory.
 But, the input gradients `dL/dx = W^T * dL/dy` does need us to have the full `W` in memory.
 This means, before we can the backward pass over a layer, we will need to do another all-gather operation to get the full `W` in memory.
+Also, FSDP generally unshards before backward because it is a generic mechanism operating on full parameters and ordinary autograd.
 And after doing the backward pass, we can free the memory of the parameters just like we did in the forward pass.
 Once we have computed the gradients for a layer, we need to do reduce-scatter operation so that each GPU can get the gradients for its shard of the model.
 So, in total, we will do 2 all-gathers and 1 reduce-scatter operations leading to 3 * N_params communication cost.
-In data parallel, we would have done 1 all-gather and 1 reduce-scatter operations leading to 2 * N_params communication cost, so FSDP has 1.5 times the communication cost of data parallel.
+In data parallel, we would have done 1 all-gather and 1 all-reduce operations leading to 2 * N_params communication cost, so FSDP has 1.5 times the communication cost of data parallel.
 
 ## The implementation
 
