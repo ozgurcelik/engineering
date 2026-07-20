@@ -68,7 +68,7 @@ class FSDP(torch.nn.Module):
             self.world_size = 1
             self.rank = 0
 
-        self._prefetch_window_size = 1
+        self._prefetch_window_size = 2
         self._reduce_scatter_window_size = 2
 
         self._broadcast_initial_state()
@@ -414,6 +414,11 @@ class FSDP(torch.nn.Module):
         Pre-backward hook for the FSDP layers.
         We should gather the parameters before the backward pass.
         """
+        # Self-heal the first `window` layers of the backward pass: no later
+        # layer prefetched them, so gather them just-in-time here. For layers
+        # already prefetched by the chain below, this is a no-op because the
+        # storage is already allocated.
+        self._prefetch_layer_backward(layer)
         self._use_prefetched_layer_backward(layer)
 
         prev_index = self._layer_index[layer] - self._prefetch_window_size
@@ -455,9 +460,6 @@ class FSDP(torch.nn.Module):
             kwargs = _cast_floating(kwargs, self.compute_dtype)
 
         outputs = self.module(*inputs, **kwargs)
-
-        for layer in reversed(self._fsdp_layers[-self._prefetch_window_size:]):
-            self._prefetch_layer_backward(layer)
 
         return outputs
 

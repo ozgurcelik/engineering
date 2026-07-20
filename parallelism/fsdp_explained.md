@@ -387,17 +387,12 @@ We initialize their prefetching in the forward function directly.
 
         outputs = self.module(*inputs, **kwargs)
 
-        for layer in reversed(self._fsdp_layers[-self._prefetch_window_size:]):
-            self._prefetch_layer_backward(layer)
         return outputs
 ```
 As we can see, before we run the model, we prefetch the first few layers and cast floating-point model inputs to `compute_dtype` once.
 The helper recursively handles tensors in positional arguments, lists, tuples, and keyword-argument dictionaries, while leaving integer and boolean tensors such as embedding indices unchanged.
 We do not cast each sharded layer's output back to its incoming dtype, so activations normally remain in `compute_dtype` as they flow through the model.
 This avoids repeated FP32-to-low-precision-to-FP32 conversions and is closer to the usual module-level FSDP mixed-precision policy.
-We will cover the backward pass in the next section, but we do the initial prefetching of the first few layers (which are the last layers in the list) in the backward pass in this code block as well.
-Important thing to note here is that the initial prefetching for the backwards layers is done only after the forward pass is over.
-So, the mental model is not that we prefetch the last layers for the backward pass at the start of the forward. Its that the forward pass just finished, and the backward pass is imminent, so we prefetch for the first few layers the backward pass will need.
 
 ### Backward Pass
 
@@ -469,6 +464,11 @@ We then add it as a backward hook for the layer.
         Pre-backward hook for the FSDP layers.
         We should gather the parameters before the backward pass.
         """
+        # Self-heal the first `window` layers of the backward pass: no later
+        # layer prefetched them, so gather them just-in-time here. For layers
+        # already prefetched by the chain below, this is a no-op because the
+        # storage is already allocated.
+        self._prefetch_layer_backward(layer)
         self._use_prefetched_layer_backward(layer)
 
         prev_index = self._layer_index[layer] - self._prefetch_window_size
@@ -482,6 +482,14 @@ We then add it as a backward hook for the layer.
         for layer in self._fsdp_layers:
             self._backward_hook_handles.append(layer.register_full_backward_pre_hook(self._pre_backward_hook))
 ```
+The hook does three things.
+First, it calls `_prefetch_layer_backward(layer)` on the current layer.
+This is how the backward pass seeds itself instead of relying on `forward` to do it.
+For the first `window` layers of the backward pass, no later layer's hook has prefetched them yet, so this issues the all-gather just-in-time.
+For every other layer, the all-gather was already issued by a later layer's hook, so the guard `if full_param is None or self._storage_allocated(full_param): continue` in `_prefetch_layer_backward` makes this call a no-op.
+Second, it waits for the current layer's all-gather via `_use_prefetched_layer_backward` and installs the materialized full parameter.
+Third, it prefetches the layer `window` steps earlier in the backward order so that its all-gather can overlap with the current layer's backward computation.
+
 This concludes the all-gather operation for the backward pass.
 Now, we need to do the reduce-scatter operation for the gradients.
 
