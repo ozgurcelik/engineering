@@ -25,6 +25,7 @@ In our implementation, we will look at a simplified version of FSDP where we wil
 Additionally, we will be sharding each parameter separately.
 By contrast, [PyTorch FSDP1](https://docs.pytorch.org/docs/stable/fsdp.html) concatenates the parameters managed by an FSDP unit into a `FlatParameter`.
 [FSDP2](https://docs.pytorch.org/docs/main/distributed.fsdp.fully_shard.html) uses per-parameter `DTensor` shards, but still groups parameters so that each group uses one all-gather and one reduce-scatter.
+Also, the frozen and shared parameters are not supported.
 
 
 ## How does FSDP work?
