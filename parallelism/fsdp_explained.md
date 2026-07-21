@@ -305,8 +305,10 @@ We also clear the forward gather handle so that we know that the all-gather is d
         Pre-forward hook for the FSDP layers.
         Wait for the prefetched parameters before the layer's forward pass.
         """
+        self._prefetch_layer_forward(layer) # if the layer is already prefetched, this is a no-op
         self._use_prefetched_layer_forward(layer)
 ```
+Here, we once again have prefetch the layer operation but note that if everything goes according to plan, the layer is already prefetched and this is a no-op.
 The pre-forward hook waits for the asynchronous all-gather and installs the materialized full parameters on the layer.
 It does not cast activations at every layer boundary; we cast the model's floating-point inputs once in `FSDP.forward`, as shown below.
 This concludes the operations we need to do before the forward pass.

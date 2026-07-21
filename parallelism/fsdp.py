@@ -383,6 +383,7 @@ class FSDP(torch.nn.Module):
         Pre-forward hook for the FSDP layers.
         Wait for the prefetched parameters before the layer's forward pass.
         """
+        self._prefetch_layer_forward(layer) # if the layer is already prefetched, this is a no-op
         self._use_prefetched_layer_forward(layer)
 
     def _post_forward_hook(self, layer: torch.nn.Module, inputs: tuple[torch.Tensor, ...], outputs: torch.Tensor):
@@ -418,7 +419,7 @@ class FSDP(torch.nn.Module):
         # layer prefetched them, so gather them just-in-time here. For layers
         # already prefetched by the chain below, this is a no-op because the
         # storage is already allocated.
-        self._prefetch_layer_backward(layer)
+        self._prefetch_layer_backward(layer) # if the layer is already prefetched, this is a no-op
         self._use_prefetched_layer_backward(layer)
 
         prev_index = self._layer_index[layer] - self._prefetch_window_size
