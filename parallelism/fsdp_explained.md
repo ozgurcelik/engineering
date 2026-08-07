@@ -7,16 +7,14 @@ The purpose of this project is to learn how FSDP works and implement it from scr
 ## Why FSDP?
 
 FSDP stands for Fully Sharded Data Parallel.
-Data parallel part refers to the data parallelism in the algorithm.
-So, in each rank, we process a different subset of the data, and in that sense, it is works like the data parallel.
-But one problem with the data parallellism is that each rank holds a full copy of the model, does a full forward and backward pass, and then syncs the gradients before the optimizer step.
-This means that if a GPU cannot fit the model in its memory, then the data parallel approach is not feasible.
+Data parallel part refers to the data parallelism in the algorithm, so, in each rank, we process a different subset of the data.
+But one problem with the naive data parallellism is that each rank holds a full copy of the model, does a full forward and backward pass, and only then syncs the gradients before the optimizer step.
+This means that if a GPU cannot fit the model in its memory, then the naive data parallel approach is not feasible.
 FSDP solves this problem by sharding the model across the ranks so that no rank needs to hold a full copy of the model.
 Since FSDP shards the model parameters, we also shard the gradients and optimizer states across the ranks.
 In a simplified mixed-precision analysis, a data-parallel baseline uses `(2 + 2 + K) * N_params` bytes of persistent model state per GPU: 2 bytes per BF16 model parameter, 2 bytes per BF16 gradient, and `K` bytes of optimizer-side state per parameter.
 Here, `K` includes the FP32 master weight as well as the optimizer's other state.
-For Adam with an FP32 master weight and FP32 first- and second-moment estimates, `K = 4 + 4 + 4 = 12`, giving 16 bytes per parameter in total.
-If the Adam moments are stored in BF16 instead, `K = 4 + 2 + 2 = 8`, giving 12 bytes per parameter.
+For example, Adam with an FP32 master weight and FP32 first- and second-moment estimates, `K = 4 + 4 + 4 = 12`, giving 16 bytes per parameter in total.
 FSDP shards these persistent states, reducing this simplified estimate to `(2 + 2 + K) * N_params / N_gpus` bytes per GPU.
 This is a general memory-motivation model rather than an exact accounting of our implementation: our persistent parameter shard is the FP32 master shard, and the lower-precision full parameter is materialized only for computation.
 The estimate also omits activations, temporarily materialized full parameters and gradients, prefetching, padding, replicated parameters, and allocator overhead.
@@ -43,15 +41,15 @@ The forward pass is given by `y = Wx`.
 And we have the loss function `L` with `dL/dy` available to us.
 Then, the gradients for this layer is given by `dL/dW = dL/dy * x^T` and this does not need us to have the full `W` in memory.
 But the input gradient `dL/dx = W^T * dL/dy` needs the full `W` when an input gradient is required.
-Some backward paths do not need the parameter values: for example, a first linear layer whose input does not require a gradient, or an embedding backward, may not need `W` at all.
+Some backward paths do not need the parameter values: the first linear layer whose input does not need its gradient computed, or an embedding backward pass, may not need `W` at all.
 Our implementation nevertheless all-gathers every layer before backward because it uses a generic, layer-level mechanism rather than operator-specific knowledge.
 And after doing the backward pass, we can free the memory of the parameters just like we did in the forward pass.
-Once we have computed the gradients for a layer, we need to do reduce-scatter operation so that each GPU can get the gradients for its shard of the model.
-For the full-sharding policy used here, where parameters are resharded after forward, each sharded parameter therefore participates in two all-gathers and one reduce-scatter per training iteration.
+Once we have computed the gradients for a layer, we need to do reduce-scatter operation so that each GPU can get the gradients for its own shard.
+With the full-sharding policy we use here, each sharded parameter participates in two all-gathers and one reduce-scatter per training iteration.
 If the sharded parameters contain `N_params` elements and the world size is `P`, then, ignoring padding and the exact collective algorithm, the logical per-rank communication volume is approximately `3 * (P - 1) / P * N_params` elements.
 A data-parallel all-reduce is equivalent to a reduce-scatter followed by an all-gather and communicates approximately `2 * (P - 1) / P * N_params` elements per rank.
 Thus, under these assumptions, fully sharded data parallelism has 1.5 times the communication volume of data parallelism; `3 * N_params` versus `2 * N_params` is the large-`P` shorthand.
-This comparison covers the sharded parameters only: our replicated parameters add their own gradient all-reduces, and our per-parameter collectives add more latency and padding overhead than grouped production implementations.
+This comparison covers the sharded parameters only: our replicated parameters (typically normalization layer parameters) add their own gradient all-reduces, and our per-parameter collectives add more latency and padding overhead than grouped production implementations like PyTorch FSDPs.
 
 ## The implementation
 
@@ -60,10 +58,10 @@ This comparison covers the sharded parameters only: our replicated parameters ad
 First of all, all ranks must agree on the initial weights and buffers, so we start by broadcasting from rank 0.
 
 Then, we need to find all the layers that are going to be sharded.
-Why are we not sharding everything?
+A natural question to ask is why are we not sharding everything?
 Thats because some layers are not large enough to justify the communication overhead and latency costs.
-In our implementation, we will be sharding the linear and embedding layers.
-Every other trainable parameter will be replicated across all the GPUs.
+Because of that, in our implementation, we will be sharding the linear and embedding layers.
+Every other trainable parameter will be replicated across all the GPUs and their gradients will be all-reduced.
 These are typically normalization layer parameters.
 In FSDP class initializer, we first define the lists `_fsdp_layers` and `_replicate_parameters` to store the layers and parameters that are going to be sharded and replicated respectively.
 Then, we iterate over all the submodules of the model and check if it belongs to either of the lists.
@@ -149,10 +147,8 @@ To understand what is going on in it, it helps us to look at the code where we g
 As we can see, the num_elements is the actual number of elements in that parameter.
 But this number is not necessarily divisible by the number of GPUs, and we want all the GPUs to have the same number of elements in their shards.
 So, we pad the number of elements to the next multiple of the number of GPUs.
-This is how we get the shard size and padded number of elements, respectively.
 Shape is the shape of the parameter and we keep it so that we can reconstruct the full parameter later.
 `start` is the index of the first element in this rank's shard, while `end` is the exclusive endpoint of the half-open slice `[start, end)`.
-These two will have different values for each rank.
 
 In the ParamState object, we store the metadata for the parameter, the local parameter which is the shard of the parameter for this rank, and the full parameter which will be rematerialized later for the forward and backward passes and freed when we are done with it.
 We also store the handles for the forward and backward gather operations which are done asynchronously.
@@ -438,9 +434,7 @@ So the tensor saved by the autograd is now pointing to an empty storage.
 To do backward pass, we need to re-materialize the full weight in the same storage so autograd can use it now.
 So, in the all-gather for the backward pass, we pick up the storage of the full parameter (which is now pointing to an empty storage) and resize it to the padded number of elements.
 Note that when we did the forward pass over the layer, the shape of the parameter was [out, in], and full_param still thinks it is so.
-So, we build a flat tensor of the correct size, [padded_num_elements,], and assign it to the data of the full parameter.
-Remember that padded_num_elements is the size we need because we have world_size number of GPUs, and each GPU has shard_size number of elements.
-And total size is the world_size times the shard_size which is padded_num_elements.
+So, while here we allocate storage of size padded_num_elements (which is the cumulative size of all the shards), we will then trim it down to the actual number of elements in the parameter and reshape it back to the original shape.
 Afterwards, the prefetch is quite similar to the forward pass.
 ```python
     def _prefetch_layer_backward(self, layer: torch.nn.Module) -> None:
@@ -491,6 +485,21 @@ For the first `window` layers of the backward pass, no later layer's hook has pr
 For every other layer, the all-gather was already issued by a later layer's hook, so the guard `if full_param is None or self._storage_allocated(full_param): continue` in `_prefetch_layer_backward` makes this call a no-op.
 Second, it waits for the current layer's all-gather via `_use_prefetched_layer_backward` and installs the materialized full parameter.
 Third, it prefetches the layer `window` steps earlier in the backward order so that its all-gather can overlap with the current layer's backward computation.
+
+Let us look at `_use_prefetched_layer_backward` more closely, since it is what turns the flat, padded buffer from the all-gather back into a usable weight.
+```python
+    def _use_prefetched_layer_backward(self, layer: torch.nn.Module) -> None:
+        """
+        Wait for the all-gathers, trim the padding, reshape the parameter, and attach it to the layer.
+        """
+        for param_name, param_state in self._layer_states[layer].param_states.items():
+            if param_state.backward_gather_handle is not None:
+                param_state.backward_gather_handle.wait()
+            param_state.full_param.data = param_state.full_param.data[:param_state.metadata.num_elements].view(param_state.metadata.shape)
+            param_state.backward_gather_handle = None
+```
+It waits for the all-gather operation to complete and then trims the padding and reshapes the parameter back to its original shape.
+Then sets the backward gather handle to None.
 
 This concludes the all-gather operation for the backward pass.
 Now, we need to do the reduce-scatter operation for the gradients.
@@ -607,9 +616,9 @@ For a CPU collective, `Work.wait()` blocks the process until completion.
 For a CUDA collective, it normally inserts a dependency from the active CUDA stream to the communication stream without blocking the CPU; subsequent GPU work on that stream may still stall until the collective is ready.
 If we called `wait()` right after issuing every reduce-scatter, we would place that dependency into the compute stream immediately and lose potential overlap.
 Instead, we let a parameter's reduce-scatter run while backward computation for earlier layers proceeds, and only call `wait()` once `_reduce_scatter_window_size` newer reduce-scatters have been queued behind it.
-Because this implementation reduce-scatters each parameter separately, this window counts parameter collectives, not layers.
 This is the backward-pass analogue of forward prefetching: there we overlap an all-gather with computation, while here we overlap a reduce-scatter with subsequent backward computation.
 The window size controls the trade-off: a larger window gives more slack for the collective to progress before the compute stream must depend on it, at the cost of holding more in-flight gradient buffers in memory.
+Because this implementation reduce-scatters each parameter separately, this window counts parameter collectives, unlike the prefetching we had which was naturally batches by the layers.
 
 Because we keep this window, some reduce-scatters are still in flight when the backward pass ends.
 So before the optimizer step we call `finish_gradient_synchronization` to drain every remaining pending reduce-scatter and only then sync the replicated parameters.
