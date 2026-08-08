@@ -31,9 +31,9 @@ class FSDPLayerState:
 
 @dataclass
 class PendingReduceScatter:
-    handle: dist.Work # async Work handle (None when world_size == 1)
-    local_grad: torch.Tensor # the local shard grad. valid after the wait()
-    local_param: torch.nn.Parameter | None = None # for the finalized grad
+    handle: dist.Work | None  # async Work handle (None when world_size == 1)
+    local_grad: torch.Tensor  # the local shard grad; valid after wait()
+    local_param: torch.nn.Parameter | None = None  # receives the finalized grad
 
 def _cast_floating(obj, dtype: torch.dtype):
     """
@@ -214,13 +214,14 @@ class FSDP(torch.nn.Module):
     def _free_full_param(full_param: torch.nn.Parameter | None) -> None:
         """Release a full (unsharded) weight by resizing its storage to 0.
 
-        This actually reclaims the memory: autograd's saved-for-backward copy of
-        the weight shares this exact storage, so shrinking it frees the bytes for
-        real. (Assigning ``data = empty(0)`` does NOT — it just points the param
-        at a fresh empty storage and leaves the saved copy holding the old one,
-        which is why the forward weights used to stay resident until backward.)
-        The tensor keeps its [out, in] sizes so AccumulateGrad still accepts the
-        full-shaped gradient."""
+        Autograd's saved-for-backward copy of the weight shares this exact
+        storage, so shrinking it releases the shared allocation for reuse by the
+        allocator. Assigning ``data = empty(0)`` does not: it points the parameter
+        at a fresh empty storage while the saved copy keeps the old allocation
+        alive. On CUDA, releasing a live allocation for reuse does not necessarily
+        reduce the amount of memory reserved by the caching allocator. The tensor
+        keeps its [out, in] sizes so AccumulateGrad still accepts the full-shaped
+        gradient."""
         if full_param is None:
             return
         with torch.no_grad():
@@ -330,8 +331,8 @@ class FSDP(torch.nn.Module):
             param.grad = None
             # Free the full weight now that this layer's backward has consumed
             # it: resize the storage to 0 (the autograd-saved copy shares it, so
-            # the memory is actually reclaimed) rather than detaching to a new
-            # empty storage.
+            # the shared allocation is released for reuse) rather than detaching
+            # to a new empty storage.
             self._free_full_param(param)
         return hook
 
@@ -394,8 +395,9 @@ class FSDP(torch.nn.Module):
         for param_name, param_state in self._layer_states[layer].param_states.items():
             setattr(layer, param_name, param_state.local_param)
             # Free the forward all-gather buffer. Its storage is shared with the
-            # weight autograd saved for backward, so resizing to 0 truly reclaims
-            # it; the pre-backward hook re-gathers into the same storage.
+            # weight autograd saved for backward, so resizing to 0 releases that
+            # shared allocation; the pre-backward hook re-gathers into the same
+            # storage.
             self._free_full_param(param_state.full_param)
 
         next_index = self._layer_index[layer] + self._prefetch_window_size
@@ -410,7 +412,11 @@ class FSDP(torch.nn.Module):
             self._forward_hook_handles.append(layer.register_forward_pre_hook(self._pre_forward_hook))
             self._forward_hook_handles.append(layer.register_forward_hook(self._post_forward_hook))
 
-    def _pre_backward_hook(self, layer: torch.nn.Module, grad_output: torch.Tensor):
+    def _pre_backward_hook(
+        self,
+        layer: torch.nn.Module,
+        grad_output: tuple[torch.Tensor | None, ...],
+    ) -> None:
         """
         Pre-backward hook for the FSDP layers.
         We should gather the parameters before the backward pass.
