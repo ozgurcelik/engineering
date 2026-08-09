@@ -12,26 +12,23 @@ But one problem with the naive data parallellism is that each rank holds a full 
 This means that if a GPU cannot fit the model in its memory, then the naive data parallel approach is not feasible.
 FSDP solves this problem by sharding persistent model state across the ranks so that no rank needs to keep a full copy of all sharded parameters, gradients, and optimizer states resident throughout training.
 Each rank still materializes the full parameters for the layer it is computing, plus any layers being prefetched, so the saving applies to persistent state rather than eliminating every full-parameter allocation.
-In a simplified mixed-precision analysis, a data-parallel baseline uses `(2 + 2 + K) * N_params` bytes of persistent model state per GPU: 2 bytes per BF16 model parameter, 2 bytes per BF16 gradient, and `K` bytes of optimizer-side state per parameter.
-Here, `K` includes the FP32 master weight as well as the optimizer's other state.
-For example, Adam with an FP32 master weight and FP32 first- and second-moment estimates, `K = 4 + 4 + 4 = 12`, giving 16 bytes per parameter in total.
-FSDP shards these persistent states, reducing this simplified estimate to `(2 + 2 + K) * N_params / N_gpus` bytes per GPU.
-This is a general memory-motivation model rather than an exact accounting of our implementation: our persistent parameter shard is the FP32 master shard, and the lower-precision full parameter is materialized only for computation.
-The estimate also omits activations, temporarily materialized full parameters and gradients, prefetching, padding, replicated parameters, and allocator overhead.
+In a simplified mixed-precision analysis, a data-parallel baseline keeps `(2 + 2 + K) * N_params` bytes of persistent model state on *every* GPU: 2 bytes per BF16 parameter, 2 bytes per BF16 gradient, and `K` bytes of optimizer-side state per parameter. Here `K` includes the FP32 master weight plus the optimizer's own state; for Adam that is a 4-byte master weight and 4-byte first- and second-moment estimates, so `K = 4 + 4 + 4 = 12` and the total is 16 bytes per parameter.
+FSDP shards all of this persistent state across the `N_gpus` ranks, so the same estimate becomes `(2 + 2 + K) * N_params / N_gpus` bytes per GPU. In the Adam example that is 16 bytes/param on data parallelism versus 16/`N_gpus` bytes/param on FSDP.
+
+Two caveats keep this honest. First, it is a motivational model, not an exact accounting of this toy: our *persistent* per-rank state is only the FP32 master shard, while the lower-precision full parameter and full gradient are materialized transiently for computation rather than stored. Second, the estimate omits activations, the transiently materialized full parameters and gradients, prefetching, padding, replicated parameters, and allocator overhead.
 
 In our implementation, we will look at a simplified version of FSDP where we assume a strictly linear, single-use execution order: every sharded module is entered exactly once in a forward graph, and only one such graph is outstanding when backward begins.
-This rules out several patterns for different reasons. If two distinct modules share a parameter—for example, a tied input embedding and output projection—wrapping replaces each module's attribute with a separately created local shard, silently breaking the tie. If the same module is invoked twice in one graph, or if two forwards are run before either is backpropagated, its single `FSDPParamState` can remember only the most recently created `full_param` and gather handles. During backward, an earlier invocation may therefore still refer to a different full parameter whose storage is empty. Ordinary gradient accumulation using repeated `forward -> backward` pairs before one optimizer step is compatible with this lifecycle, although this implementation still communicates on every backward. Activation checkpointing is unsupported because recomputation invokes the forward hooks during backward and would require checkpoint-aware scheduling and per-invocation state. Supporting these cases requires alias-aware parameter ownership plus a stack or equivalent lifecycle record for each invocation; a simple reference count is not sufficient.
-So, our implementation is not a production-ready implementation of FSDP instead a simplified one to help us understand how FSDP works.
+This keeps the lifecycle of each parameter easy to reason about, at the cost of ruling out several patterns (shared/tied parameters, modules invoked more than once, activation checkpointing, and clean frozen-parameter memory handling). We defer the details to the [Limitations](#limitations) section at the end, once the mechanism is in place.
+So, our implementation is not a production-ready implementation of FSDP but rather a simplified one to help us understand how FSDP works.
 Additionally, we will flatten and shard each parameter separately.
 By contrast, [PyTorch FSDP1](https://docs.pytorch.org/docs/stable/fsdp.html) concatenates the parameters managed by an FSDP unit into a `FlatParameter`.
 [FSDP2](https://docs.pytorch.org/docs/main/distributed.fsdp.fully_shard.html) also represents shards per parameter, but it chunks each parameter along dimension 0 and represents the result as a `DTensor`; our implementation instead flattens the entire parameter before slicing it.
 FSDP2 still groups multiple parameters so that each group uses one all-gather and one reduce-scatter.
-Shared parameters and multiply invoked modules are not supported, as described above. Frozen parameters are numerically supported—the wrapper preserves `requires_grad=False`, they receive no gradient, and the optimizer does not update them—but their post-backward memory handling is incomplete. The post-forward hook releases every materialized full parameter. If backward later needs a frozen parameter's value, however, the pre-backward hook re-gathers it, and there is no post-accumulate-grad hook to release it again because that hook is registered only for trainable parameters. The re-gathered full storage then remains allocated after backward. A frozen parameter on a path that does not need its value in backward, such as some frozen embeddings, may never be re-gathered and does not encounter this particular issue.
 
 
 ## How does FSDP work?
 
-As we run the FSDP, each GPU will hold a shard of the model parameters.
+As we run FSDP, each GPU holds only a shard of every *sharded* parameter (the linear and embedding weights). A small set of replicated parameters, such as normalization weights, still lives in full on every rank; we return to them at the end.
 But to be able to do the forward and backward pass through a layer in a GPU, we will need all the parameters for a layer materialized in the GPU.
 This requires us to do an all-gather operation before the forward pass.
 Once the forward pass is done, we can free the memory of the parameters.
@@ -39,11 +36,13 @@ Without prefetching, this means that during the forward pass we can get away wit
 Prefetching deliberately materializes additional upcoming layers to overlap communication with computation, trading a higher transient memory peak for throughput.
 During the backward pass, we will need all the parameters for the layer that we are currently processing once again.
 Why is that?
-Imagine we have a linear layer with parameters `W` and input `x` generating output `y`.
-The forward pass is given by `y = Wx`, treating `x` as a column vector. (PyTorch's `nn.Linear` stores `W` as `[out, in]` and computes the row-major transpose `y = x W^T`, but the gradient structure below is the same.)
-And we have the loss function `L` with `dL/dy` available to us.
-Then, the gradients for this layer is given by `dL/dW = dL/dy * x^T` and this does not need us to have the full `W` in memory.
-But the input gradient `dL/dx = W^T * dL/dy` needs the full `W` when an input gradient is required.
+Imagine a linear layer with weight `W` of shape `[out, in]`, input `x`, and output `y`. We will reason with column-vector inputs, so `y = W x`; PyTorch's `nn.Linear` actually stores `W` as `[out, in]` and computes the equivalent `y = x W^T` for a batch of row vectors, but the gradient structure is identical.
+Given the loss `L` and the upstream gradient `dL/dy`, the two gradients this layer produces are:
+
+- the weight gradient `dL/dW = dL/dy · x^T`, which needs `dL/dy` and `x` but *not* `W`; and
+- the input gradient `dL/dx = W^T · dL/dy`, which *does* need the full `W`.
+
+So a layer needs its full weight materialized in backward exactly when its input gradient must be computed.
 Some backward paths do not need the parameter values: the first linear layer whose input does not need its gradient computed, or an embedding backward pass, may not need `W` at all.
 Our implementation nevertheless all-gathers every layer before backward because it uses a generic, layer-level mechanism rather than operator-specific knowledge.
 And after doing the backward pass, we can free the memory of the parameters just like we did in the forward pass.
@@ -79,7 +78,27 @@ full compute parameter -> backward computation -> rank-local full gradient
                                       optimizer updates local FP32 shard
 ```
 
-Forward processes layers in model order, while backward visits them in reverse order. `finish_gradient_synchronization()` waits for any reduce-scatters still in flight and synchronizes replicated gradients before the optimizer is allowed to update the persistent local shards.
+Forward processes layers in model order, while backward visits them in reverse order. `finish_gradient_synchronization()` waits for any reduce-scatters still in flight and synchronizes replicated gradients before the optimizer is allowed to update the persistent local shards. Replicated parameters (the normalization weights) skip this whole four-representation dance: they stay resident in FP32 on every rank, and their gradients are simply all-reduced once inside `finish_gradient_synchronization()`.
+
+### Using the wrapper
+
+From the caller's side the wrapper is small. Wrap the model, build the optimizer over the *wrapped* module's parameters, and call `finish_gradient_synchronization()` after `backward()` and before `optimizer.step()`:
+
+```python
+fsdp_model = FSDP(model, compute_dtype=torch.bfloat16)
+
+# IMPORTANT: build the optimizer AFTER wrapping.
+optimizer = torch.optim.AdamW(fsdp_model.parameters(), lr=3e-4)
+
+for input_ids, labels in loader:
+    optimizer.zero_grad(set_to_none=True)
+    loss = loss_fn(fsdp_model(input_ids), labels)
+    loss.backward()
+    fsdp_model.finish_gradient_synchronization()  # drain reduce-scatters + sync replicated grads
+    optimizer.step()
+```
+
+Two things here are load-bearing. First, the optimizer must be created *after* wrapping: `_create_layer_state` replaces each sharded layer's `weight`/`bias` attribute with a freshly created local shard via `setattr`, so an optimizer built beforehand would hold references to the now-orphaned full parameters and would silently update the wrong tensors. `fsdp_model.parameters()` returns exactly the right set — the per-rank FP32 local shards plus the replicated parameters. Second, `finish_gradient_synchronization()` must run every step before `optimizer.step()`, because the reduce-scatter window (explained later) intentionally leaves some gradient collectives in flight when `backward()` returns.
 
 ## The implementation
 
@@ -109,9 +128,8 @@ Then, we iterate over all the submodules of the model and check if it belongs to
                     if param.requires_grad:
                         self._replicate_parameters.append(param)
 ```
-Doing this at module level helps us with keeping the logic simple.
-For example, the weight and bias parameters of a linear layer are going to be visited together.
-And since this loop visits every module in the model, the recurse=False avoids double counting.
+Doing this at the module level keeps the logic simple: a `Linear` or `Embedding` is short-circuited into `_fsdp_layers` as a whole (so its `weight` and `bias` are handled together later), while every other module contributes only its own parameters.
+Because `module.modules()` also visits parent containers, `recurse=False` is what stops a parent from re-counting a child's parameters.
 
 Once we have collected the replicated parameters, we cast them to float32.
 ```python
@@ -124,6 +142,8 @@ Once we have collected the replicated parameters, we cast them to float32.
 ```
 This mirrors the master-weight choice we make for the sharded parameters: even when we train in a lower compute dtype, the replicated parameters (typically normalization weights) are kept in float32 so that their gradients are accumulated and all-reduced in full precision.
 This is important because normalization layers are numerically sensitive, and they are small enough that keeping a float32 copy costs us almost nothing.
+
+There is a subtlety worth calling out here. Because we cast the model's inputs to `compute_dtype` once and then let activations flow in that dtype, a replicated FP32 norm receives a low-precision activation while holding an FP32 weight. This only works if the norm itself handles the mixed dtypes: a well-behaved `RMSNorm` upcasts the activation to FP32 internally and casts the result back to the incoming dtype, and `nn.LayerNorm` promotes internally as well. A naive norm that assumed its input and weight share a dtype could hit a dtype-mismatch error on this path.
 
 Now, we need to do some bookkeeping.
 For each layer, we will define a `FSDPLayerState` object to store everything we will need related to that layer.
@@ -199,7 +219,7 @@ During backward, let `g[r][i]` mean rank `r`'s gradient for element `i`. Each ra
 [Σ_r g[r][4], Σ_r g[r][5], Σ_r g[r][6], Σ_r g[r][7]]
 ```
 
-The implementation then divides this result by 3, converts it to the local FP32 shard's dtype, and attaches it to rank 1's `[w4, w5, w6, w7]` shard. The two padding slots owned by rank 2 receive zero gradients and remain zeros under ordinary optimizers, including standard SGD or AdamW weight decay. They are not removed from the local shard: the optimizer may still allocate state for them and perform wasted elementwise work on them. We trim them away only when we all-gather and reshape back to the original parameter.
+The implementation then divides this result by 3, converts it to the local FP32 shard's dtype, and attaches it to rank 1's `[w4, w5, w6, w7]` shard. The two padding slots owned by rank 2 start at zero and always receive a zero gradient, so they stay zero under any optimizer whose update is a function of `(param, grad)` with `f(0, 0) = 0` — which includes plain SGD (with or without momentum) and AdamW, decoupled weight decay included. They are not removed from the local shard: the optimizer may still allocate state for them and perform wasted elementwise work on them. We trim them away only when we all-gather and reshape back to the original parameter.
 
 In the ParamState object, we store the metadata for the parameter, the local parameter which is the shard of the parameter for this rank, and the full parameter which will be rematerialized later for the forward and backward passes and freed when we are done with it.
 We also store the handles for the forward and backward gather operations which are done asynchronously.
@@ -355,7 +375,7 @@ We also clear the forward gather handle so that we know that the all-gather is d
         self._prefetch_layer_forward(layer) # if the layer is already prefetched, this is a no-op
         self._use_prefetched_layer_forward(layer)
 ```
-Here, we once again have prefetch the layer operation but note that if everything goes according to plan, the layer is already prefetched and this is a no-op.
+Here, we once again call the prefetch operation, but note that if everything goes according to plan the layer is already prefetched and this is a no-op.
 The pre-forward hook waits for the asynchronous all-gather and installs the materialized full parameters on the layer.
 It does not cast activations at every layer boundary; we cast the model's floating-point inputs once in `FSDP.forward`, as shown below.
 This concludes the operations we need to do before the forward pass.
@@ -406,6 +426,8 @@ prefetched gather:  AG0, AG1       [ AG2 ]     [ AG3 ]
 
 So a larger window creates more opportunity for overlap, but holds more full or in-flight parameter buffers at once.
 
+One implementation detail is worth making explicit: this code never creates a CUDA stream of its own. The overlap comes entirely from issuing collectives with `async_op=True` and only calling `wait()` later. On CUDA/NCCL the collective runs on NCCL's own communication stream and `Work.wait()` inserts the cross-stream dependency that makes the compute stream wait for it; on a CPU/gloo backend the async op makes progress on a background thread. So "overlap" here means "the backend is free to progress the collective while Python moves on to the next layer's compute", not that we are hand-managing streams the way production FSDP does.
+
 Backward mirrors this schedule in reverse. For a four-layer model and a window of 2, `L3` and `L2` are gathered just in time when they are first encountered in backward. The pre-backward hook for `L3` also starts `AG(L1)`, and the hook for `L2` starts `AG(L0)`, allowing those gathers to overlap with the backward computation of later layers.
 
 And this is how we free the memory:
@@ -429,7 +451,20 @@ And this is how we free the memory:
 ```
 This deserves a careful look, because the same storage trick shows up in three places (freeing after forward, refilling before backward, and freeing again after the backward reduce-scatter), and the whole design hinges on it.
 
-A materialized full parameter is just a tensor whose `[out, in]` view points into an all-gather buffer's storage. When autograd needs the weight for backward, it saves a tensor that shares *that exact storage*. So to actually free the weight we must shrink the storage itself, not merely repoint `full_param`: assigning a fresh empty tensor to `full_param.data` would leave the autograd-saved copy holding the old allocation alive. Resizing the storage to 0 releases the shared allocation for reuse while keeping the tensor's `[out, in]` sizes intact, so `AccumulateGrad` still accepts a full-shaped gradient later. This is safe only because we control exactly which tensors share the storage and when the hooks run; it is not a general-purpose way to mutate autograd-tracked tensors.
+A materialized full parameter is just a tensor whose `[out, in]` view points into an all-gather buffer's storage. When autograd needs the weight for backward, it saves a tensor that shares *that exact storage*. Three things therefore point at one allocation:
+
+```text
+one allocation (untyped storage)
+   ^              ^                     ^
+   |              |                     |
+full_param        full_param.data       autograd-saved tensor
+(the Parameter)   ([out, in] view)      (shares the SAME storage)
+
+free     = storage.resize_(0)        -> every view now points at empty storage
+regather = storage.resize_(n*bytes)  -> refills in place; the saved tensor is valid again
+```
+
+So to actually free the weight we must shrink the storage itself, not merely repoint `full_param`: assigning a fresh empty tensor to `full_param.data` would leave the autograd-saved copy holding the old allocation alive. Resizing the storage to 0 releases the shared allocation for reuse while keeping the tensor's `[out, in]` sizes intact, so `AccumulateGrad` still accepts a full-shaped gradient later. This is safe only because we control exactly which tensors share the storage and when the hooks run; it is not a general-purpose way to mutate autograd-tracked tensors.
 
 The mirror image of "free by resizing to 0" is the question "is this parameter currently materialized?", which we answer by asking the storage, not the tensor shape:
 ```python
@@ -456,7 +491,7 @@ We then register the forward hooks for the FSDP layers.
 One open question might be if we are doing the prefetching for the next index layer, how do we do it for the first layers in the list?
 Because if the prefetch window size is 3, then when we run the forward pass for the first layer, we start the prefetching for the 4th layer.
 But neither 2nd nor 3rd will have their parameters prefetched when its their turn.
-We initialize their prefetching in the forward function directly.
+We initialize their prefetching in the forward function directly. (The backward pass has the same problem at its own start — the first `window` layers it visits were never prefetched by a later layer — but it self-heals inside the pre-backward hook instead; we return to this below.)
 ```python
     def forward(self, *inputs, **kwargs):
         """
@@ -647,7 +682,7 @@ Note that the empty tensor is shard_size in size since when we do the reduce-sca
             param_state = self._layer_states[layer].param_states[param_name]
             if param.grad is not None:
                 pending_reduce_scatter = self._reduce_scatter_grad_async(param.grad, param_state.metadata)
-                # we do pending.local_param is param_state.local_param
+                # share the same object (a reference, not a copy)
                 pending_reduce_scatter.local_param = param_state.local_param
                 self._pending_reduce_scatters.append(pending_reduce_scatter)
                 self._drain_reduce_scatters()
@@ -665,13 +700,8 @@ In there, we first issue the async reduce-scatter operation.
 For convenience, we also set `pending.local_param = param_state.local_param` so that we can reference the parameter later.
 Note that this does not mean replicating the parameter, but just adding a reference to the parameter to the pending reduce scatter object.
 Afterwards, we add the pending reduce scatter object to the list of pending reduce scatters and call the _drain_reduce_scatters function.
-A question that might arise is are we deleting/freeing the tensors that are needed for reduce-scatter operation before it takes place when we do param.grad = None and self._free_full_param(param)?
-The operation has already been enqueued before `param.grad` is cleared; `async_op=True` means that the caller does not synchronously wait for the communication to finish.
-With CUDA/NCCL, PyTorch's stream and allocator bookkeeping prevents the input storage from being recycled while the communication stream is still using it.
-When padding is needed, `torch.cat` creates a separate padded input buffer, which temporarily increases memory use.
-Dropping the last Python reference makes a tensor eligible for deallocation, but its physical storage may not be reusable until the in-flight stream work is complete; calling `wait()` synchronizes use of the result but does not itself free the tensor.
-This is backend and implementation behavior rather than an invariant expressed by our own data structure. To make the lifetime requirement explicit and backend-independent, `PendingReduceScatter` could retain `flattened_grad` until finalization.
-Finally, `_free_full_param` frees the full weight's storage, not the gradient's storage.
+A question that might arise: by the time the hook runs `param.grad = None` and `self._free_full_param(param)`, are we freeing something the still-in-flight reduce-scatter needs? The object to worry about is not `param.grad`, and not the full weight — `_free_full_param` frees the weight's storage, which the collective never touches. The fragile object is `flattened_grad`, the reduce-scatter's *input* buffer, which is a local variable inside `_reduce_scatter_grad_async` and goes out of scope as soon as that function returns. (`PendingReduceScatter` stores the *output* shard, not this input.)
+The collective is already enqueued (`async_op=True`) before any of this, so correctness hinges on that input buffer staying alive until the collective actually reads it. With CUDA/NCCL, PyTorch's stream and allocator bookkeeping keeps the input storage from being recycled while the communication stream is still using it: dropping the last Python reference makes a tensor eligible for deallocation, but its physical storage is not reused until the in-flight stream work completes, and `wait()` synchronizes use of the *result* rather than freeing the input. On a CPU/gloo backend this is far less guaranteed. Because this is backend behavior rather than an invariant of our own data structure, the robust fix is to have `PendingReduceScatter` retain `flattened_grad` until finalization. (Note also that when padding is needed, `torch.cat` allocates a separate padded input buffer, temporarily increasing memory use.)
 Now lets look at how we drain the reduce scatters.
 ```python
     def _finalize_reduce_scatter(self, pending: PendingReduceScatter) -> None:
@@ -706,7 +736,7 @@ Instead, we let a parameter's reduce-scatter run while backward computation for 
 This is the backward-pass analogue of forward prefetching: there we overlap an all-gather with computation, while here we overlap a reduce-scatter with subsequent backward computation.
 The window size controls the trade-off: a larger window gives more slack for the collective to progress before the compute stream must depend on it, at the cost of holding more in-flight gradient buffers in memory.
 Concretely, after each new reduce-scatter is appended, `_drain_reduce_scatters` finalizes the oldest operations until at most `_reduce_scatter_window_size` remain un-waited. With a window of 2, for example, the first operation is finalized when the third is appended, at which point two newer operations are queued behind it.
-Because this implementation reduce-scatters each parameter separately, this window counts individual parameter collectives (a layer's weight and bias reduce-scatter independently), whereas the forward and backward all-gather windows were counted in whole layers. The two window sizes are therefore not in the same units.
+> **Note — the two window sizes are not in the same units.** Because this implementation reduce-scatters each parameter separately, the reduce-scatter window counts individual parameter collectives (a layer's weight and bias reduce-scatter independently), whereas the forward and backward all-gather windows are counted in whole layers.
 
 Because we keep this window, some reduce-scatters are still in flight when the backward pass ends.
 So before the optimizer step we call `finish_gradient_synchronization` to drain every remaining pending reduce-scatter and only then sync the replicated parameters.
@@ -739,3 +769,17 @@ Additionally, we do
         self._sync_grads_of_replicated_parameters()
 ```
 This is called once before the optimizer step.
+
+## Limitations
+
+This implementation is deliberately simplified. It assumes a strictly linear, single-use execution order — every sharded module is entered exactly once per forward graph, and only one such graph is outstanding when backward begins. That assumption rules out several patterns:
+
+- **Shared / tied parameters.** If two modules share a parameter — for example a tied input embedding and output projection — wrapping replaces each module's attribute with a *separately created* local shard, silently breaking the tie.
+- **Modules invoked more than once per graph (or two forwards before a backward).** Each parameter has a single `FSDPParamState`, which can only remember the most recently created `full_param` and gather handles. During backward, an earlier invocation may still refer to a different full parameter whose storage has already been freed.
+- **Activation checkpointing.** Recomputation re-invokes the forward hooks *during* backward, which would require checkpoint-aware scheduling and per-invocation state.
+
+Supporting these cases needs alias-aware parameter ownership plus a stack (or equivalent per-invocation lifecycle record); a simple reference count is not enough. Ordinary gradient accumulation (repeated `forward -> backward` pairs before a single `optimizer.step()`) *is* compatible with this lifecycle, though this implementation still communicates on every backward.
+
+**Frozen parameters** are numerically supported — the wrapper preserves `requires_grad=False`, they receive no gradient, and the optimizer does not update them — but their post-backward memory handling is incomplete. The post-forward hook releases every materialized full parameter; if backward later needs a frozen parameter's value, the pre-backward hook re-gathers it, and because the releasing post-accumulate-grad hook is only registered for *trainable* parameters, the re-gathered full storage stays allocated after backward. A frozen parameter on a path that never needs its value in backward (such as some frozen embeddings) is simply never re-gathered and avoids this issue.
+
+Finally, this is a learning implementation, not a production one: we flatten and shard each parameter separately and issue a collective per parameter, which adds latency and padding overhead compared to grouped implementations like PyTorch FSDP1/FSDP2.

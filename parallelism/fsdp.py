@@ -323,7 +323,7 @@ class FSDP(torch.nn.Module):
             param_state = self._layer_states[layer].param_states[param_name]
             if param.grad is not None:
                 pending_reduce_scatter = self._reduce_scatter_grad_async(param.grad, param_state.metadata)
-                # we do pending.local_param is param_state.local_param
+                # share the same object (a reference, not a copy)
                 pending_reduce_scatter.local_param = param_state.local_param
                 self._pending_reduce_scatters.append(pending_reduce_scatter)
                 self._drain_reduce_scatters()
