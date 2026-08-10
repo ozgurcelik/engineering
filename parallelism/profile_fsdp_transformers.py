@@ -11,9 +11,9 @@ Why sweep sequence length?
   advantage shrinks. This sweep makes that trade-off visible.
 
 We reuse the model-agnostic measurement helpers from ``profile_fsdp.py``:
-  * peak process RSS (everything: live tensors + allocator caching + transient),
+  * exact persistent parameter, gradient, and optimizer-state bytes per rank;
   * the profiler's per-category LIVE tensor co-peak (params/optimizer/grad/
-    activation/autograd/...), which is the "true" live-memory view.
+    activation/autograd/...), which captures transient tensor memory.
 
 Run (CPU / gloo):
 
@@ -29,7 +29,6 @@ import math
 import os
 import shutil
 
-import psutil
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -42,7 +41,6 @@ from profile_fsdp import (
     MB,
     CATEGORY_ORDER,
     FullWeightTracker,
-    PeakRSS,
     _categorized_memory,
     _footprint_bytes,
     _record_fsdp_internal_sample,
@@ -212,7 +210,6 @@ def _train_step(
 def run_phase(
     rank: int, mode: str, world_size: int, seq_len: int, device_type: str = "cpu"
 ) -> None:
-    proc = psutil.Process()
     if device_type == "cuda":
         device = torch.device(f"cuda:{rank}")
         torch.cuda.set_device(device)
@@ -221,11 +218,6 @@ def run_phase(
 
     if mode == "fsdp":
         _setup(rank, world_size, device_type)
-
-    # Capture the pre-model baseline AFTER comm init so comm overhead is not
-    # charged to model/training memory (fair across modes). On CUDA the analogue
-    # is the allocator's peak-allocated high-water mark (context excluded).
-    rss_before = proc.memory_info().rss
 
     torch.manual_seed(0)
     if mode == "fsdp":
@@ -242,7 +234,7 @@ def run_phase(
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     x, y = _make_batch(seq_len, device)
 
-    # --- Pass 1: clean peak-memory run (no profiler) ---
+    # --- Pass 1: collect exact persistent state and FSDP-internal samples ---
     footprint: dict[str, int] = {}
     fsdp_internal_samples: list[dict[str, int | str]] = []
 
@@ -259,20 +251,7 @@ def run_phase(
             if step == 0:
                 footprint = _footprint_bytes(model, optimizer)
 
-    if device_type == "cuda":
-        torch.cuda.synchronize(device)
-        torch.cuda.reset_peak_memory_stats(device)
-        _run_pass1()
-        torch.cuda.synchronize(device)
-        peak_alloc = torch.cuda.max_memory_allocated(device)
-        peak_reserved = torch.cuda.max_memory_reserved(device)
-        peak_rss = 0
-    else:
-        with PeakRSS() as peak:
-            _run_pass1()
-        peak_rss = peak.peak
-        peak_alloc = 0
-        peak_reserved = 0
+    _run_pass1()
 
     # --- Pass 2: profiler run for the per-category live-memory breakdown ---
     activities = [ProfilerActivity.CPU]
@@ -308,10 +287,6 @@ def run_phase(
         "rank": rank,
         "seq_len": seq_len,
         "device_type": device_type,
-        "rss_before": rss_before,
-        "peak_rss": peak_rss,
-        "peak_cuda_alloc": peak_alloc,
-        "peak_cuda_reserved": peak_reserved,
         **footprint,
         **categorized,
         "fsdp_internal_samples": fsdp_internal_samples,
@@ -419,50 +394,6 @@ def _report(seq_lens: list[int]) -> None:
             row += f"{_fmt(f[f'cat_{c}']):>16}"
         print(row)
 
-    # --- Table 3: peak process memory (everything, incl. allocator churn) ---
-    device_type = (fsdp0 or base0 or {}).get("device_type", "cpu")
-    is_cuda = device_type == "cuda"
-
-    def _peak_above_overhead(r: dict) -> int:
-        # CUDA: max_memory_allocated already excludes the fixed context. CPU:
-        # subtract the pre-model RSS overhead.
-        return r["peak_cuda_alloc"] if is_cuda else r["peak_rss"] - r["rss_before"]
-
-    print("\n" + "=" * 92)
-    if is_cuda:
-        print("Peak CUDA memory allocated vs sequence length (MB)   [torch.cuda.max_memory_allocated]")
-    else:
-        print("Peak process RSS above overhead vs sequence length (MB)   [OS resident, all memory]")
-    print("=" * 92)
-    col = "CUDA base" if is_cuda else "RSS base"
-    colf = "CUDA fsdp" if is_cuda else "RSS fsdp"
-    header = f"{'seq_len':>8}{col:>13}{colf:>13}{'ratio':>13}"
-    print(header)
-    print("-" * len(header))
-    for t in seq_lens:
-        b = rows.get(("baseline", t))
-        f = rows.get(("fsdp", t))
-        if not b or not f:
-            continue
-        bo = _peak_above_overhead(b)
-        fo = _peak_above_overhead(f)
-        print(
-            f"{t:>8}{_fmt(bo):>13}{_fmt(fo):>13}{bo / max(fo, 1):>11.2f}x"
-        )
-    print("-" * len(header))
-    if is_cuda:
-        print(
-            "note: max_memory_allocated is the high-water mark of LIVE device tensors\n"
-            "      (excludes the fixed CUDA context and the allocator's reserved-but-\n"
-            "      unused blocks), so it tracks the live-tensor co-peak closely."
-        )
-    else:
-        print(
-            "note: RSS includes live tensors + CPU-allocator caching/fragmentation +\n"
-            "      transient spikes, so it tracks the live-tensor ratio only loosely\n"
-            "      (FSDP's gather/reduce-scatter/resize churn inflates it)."
-        )
-
 
 def _report_detail(seq_len: int) -> None:
     """Fine-grained, single-seq-length view — the same breakdown the plain
@@ -498,7 +429,7 @@ def main(device: str = "cpu", seq_lens: list[int] | None = None) -> None:
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
     for seq_len in requested:
-        # Separate processes per phase so each gets a clean peak-memory mark.
+        # Separate processes keep each phase's model state and profiler timeline isolated.
         mp.spawn(run_phase, args=("baseline", 1, seq_len, device_type), nprocs=1, join=True)
         mp.spawn(
             run_phase, args=("fsdp", WORLD_SIZE, seq_len, device_type), nprocs=WORLD_SIZE, join=True

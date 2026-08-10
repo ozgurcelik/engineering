@@ -733,3 +733,83 @@ During forward, autograd may save a tensor that shares the full parameter's stor
 We therefore shrink the shared storage itself to zero after forward. This releases the full allocation while leaving the existing tensor objects, shapes, and autograd graph intact. Before backward, we grow that same storage and all-gather the weight into it again. Because autograd's saved tensor still refers to that storage, it sees the newly gathered values and backward can proceed. After the full gradient has been reduce-scattered, we shrink the storage once more.
 
 We could avoid this low-level technique by retaining every gathered weight until backward, but then the full parameters would accumulate throughout forward and largely defeat reshard-after-forward memory savings. A more robust alternative would be custom autograd logic that explicitly regathers parameters during backward, but that would be more operator-specific and substantially more complex. This implementation uses storage resizing as a compact teaching mechanism; mutating `.data` and raw storage this way is fragile and should not be treated as a general PyTorch pattern.
+
+## Results
+
+We profiled two models: the parameter-heavy residual MLP from `profile_fsdp.py`, and the small causal Transformer from `profile_fsdp_transformers.py`. Both experiments ran on CPU with Gloo, two FSDP ranks, FP32 parameters and computation, and Adam. The baseline uses one process with a complete model replica; the FSDP number is the memory used by rank 0.
+
+Each script makes two measurement passes. The first directly counts the persistent parameters, finalized gradients, and optimizer state held by the model and optimizer. The profiler pass reconstructs the timeline of live tensor allocations, including activations and FSDP's temporary communication tensors. `Live tensor co-peak` is the largest sum of simultaneously live, profiler-visible tensors.
+
+There is one more subtlety in the granular tables. Each category is shown at its own high-water mark, and the categories do not necessarily reach those peaks at the same instant. The rows therefore should not be added together. `Live tensor co-peak` is the maximum of their actual sum at one instant.
+
+### Parameter-heavy MLP
+
+The MLP contains 24 residual blocks with `d_model=1024` and `d_ff=4096`, for 205.6 million parameters. We used a per-rank batch size of 8, sequence length 32, and five training steps. This intentionally keeps activations small relative to the parameters and Adam state, which is the regime in which FSDP's sharding should be most visible.
+
+| Measurement | Full replica | FSDP per rank | Full / FSDP |
+|---|---:|---:|---:|
+| Resident parameters + gradients + optimizer state | 3,137.19 MiB | 1,568.98 MiB | 2.00x |
+| Live tensor co-peak | 3,171.16 MiB | 1,676.05 MiB | 1.89x |
+
+The persistent model state is almost exactly halved. After including live activations and FSDP's transient all-gather and reduce-scatter tensors, the profiler's live-tensor co-peak shows a 1.89x reduction.
+
+The granular live-tensor peaks are:
+
+| Category | Full replica | FSDP per rank | Full / FSDP |
+|---|---:|---:|---:|
+| Parameters | 800.30 MiB | 392.25 MiB | 2.04x |
+| Optimizer state | 1,568.59 MiB | 784.49 MiB | 2.00x |
+| Gradients | 784.30 MiB | 404.33 MiB | 1.94x |
+| Activations | 149.96 MiB | 148.96 MiB | 1.01x |
+| Autograd internals | 9.00 MiB | 426.16 MiB | 0.02x |
+| Temporaries | 0.08 MiB | 0.08 MiB | 1.00x |
+| Inputs | &lt;0.01 MiB | 65.04 MiB | &lt;0.01x |
+| Uncategorized | 32.02 MiB | 27.91 MiB | 1.15x |
+| **Live tensor co-peak** | **3,171.16 MiB** | **1,676.05 MiB** | **1.89x** |
+
+The apparent 2.04x parameter reduction is a profiler-classification artifact, not super-linear sharding. Directly counting the tensors in `model.parameters()` gives 784.30 MiB for the baseline and 392.25 MiB for FSDP, which is just under 2x because LayerNorm parameters stay replicated. Padding can add further overhead when a parameter is not divisible by the world size, although these MLP dimensions divide evenly across two ranks. The generic profiler assigned one additional 16 MiB baseline allocation to its `PARAMETER` category.
+
+The gradient category has the opposite-looking effect. Final resident gradients are also 784.30 MiB versus 392.25 MiB, but the FSDP gradient high-water mark reaches 404.33 MiB. During backward, a temporary full gradient and reduce-scatter buffers can overlap with local gradient shards that have already been finalized. Replicated LayerNorm gradients also remain full-sized. This transient overlap makes the category peak slightly less than a 2x improvement even though the final stored gradients are almost exactly halved.
+
+PyTorch's `AUTOGRAD_DETAIL` category, called `Autograd internals` here, is a fallback for outputs created inside backward functions that were not already recognized as parameters, gradients, activations, or another category. In this FSDP run it includes backward and reduce-scatter implementation tensors; it does not mean that 426 MiB of forward activations were saved for backward. Likewise, a gathered full weight can be classified as `INPUT` because it is created by a collective and is never seen by the optimizer as a persistent parameter.
+
+![Deep MLP baseline memory timeline](./figures/mlp_baseline_memory_timeline.png)
+
+*Full-replica MLP memory timeline. Parameters and Adam state form the large persistent base; gradients and activations grow and are released during each step.*
+
+![Deep MLP FSDP memory timeline](./figures/mlp_fsdp_memory_timeline.png)
+
+*FSDP MLP memory timeline. The persistent parameter and optimizer-state bands are approximately halved, while backward and collective-related allocations appear as transient spikes.*
+
+### Transformer at sequence length 1024
+
+The Transformer has four layers, `d_model=512`, eight attention heads, `d_ff=2048`, a vocabulary of 4096, and 17.3 million parameters. We used a per-rank batch size of 4 and three training steps. Its attention implementation explicitly materializes the `[batch, heads, sequence, sequence]` score and probability tensors, making the quadratic activation cost visible.
+
+| Measurement | Full replica | FSDP per rank | Full / FSDP |
+|---|---:|---:|---:|
+| Resident parameters + gradients + optimizer state | 264.42 MiB | 132.28 MiB | 2.00x |
+| Live tensor co-peak | 1,498.67 MiB | 1,399.56 MiB | 1.07x |
+
+The persistent state is again almost exactly halved, but that state is now a small part of the peak. At sequence length 1024, activations alone reach roughly 1.16 GiB in both modes. FSDP shards model state, not activations, so its relative saving shrinks toward 1x as the sequence length and attention activation footprint grow.
+
+| Category | Full replica | FSDP per rank | Full / FSDP |
+|---|---:|---:|---:|
+| Parameters | 74.11 MiB | 33.07 MiB | 2.24x |
+| Optimizer state | 132.21 MiB | 66.14 MiB | 2.00x |
+| Gradients | 66.11 MiB | 41.07 MiB | 1.61x |
+| Activations | 1,168.28 MiB | 1,160.28 MiB | 1.01x |
+| Autograd internals | 264.00 MiB | 299.53 MiB | 0.88x |
+| Temporaries | 0.04 MiB | 0.04 MiB | 1.00x |
+| Inputs | 5.07 MiB | 36.07 MiB | 0.14x |
+| Uncategorized | 16.00 MiB | 16.00 MiB | 1.00x |
+| **Live tensor co-peak** | **1,498.67 MiB** | **1,399.56 MiB** | **1.07x** |
+
+The 2.24x parameter row and 1.61x gradient row have the same interpretation as in the MLP experiment: they are category high-water marks inferred from the execution graph, not direct counts of final persistent tensors. The explicit resident-state measurement is the appropriate number for the sharding ratio; it shows the expected 2x reduction.
+
+![Transformer baseline memory timeline at sequence length 1024](./figures/transformer_seq1024_baseline_memory_timeline.png)
+
+*Full-replica Transformer timeline at sequence length 1024. The red activation band dominates the peak.*
+
+![Transformer FSDP memory timeline at sequence length 1024](./figures/transformer_seq1024_fsdp_memory_timeline.png)
+
+*FSDP Transformer timeline at sequence length 1024. Parameter and optimizer-state storage is smaller, but the activation band is essentially unchanged.*

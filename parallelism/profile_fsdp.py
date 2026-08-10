@@ -1,19 +1,13 @@
-"""Compare TOTAL training memory of FSDP (world_size=2) vs a full-replica baseline.
+"""Compare FSDP (world_size=2) with a full-replica baseline using two views:
 
-"Total" here means peak process RSS during the training loop, which includes
-*everything*: parameters, gradients, optimizer state, activations, autograd
-saved tensors, and FSDP's transient all-gather / reduce-scatter buffers.
+  * exact persistent training state: parameters, finalized gradients, and
+    optimizer state resident on one rank;
+  * profiler-visible live tensor memory: category peaks and the largest sum of
+    tensors simultaneously alive during training.
 
-Why peak RSS (and not just the profiler table)?
-  * On CPU there is no ``torch.cuda.max_memory_allocated``.
-  * Activations are allocated and freed within a step, so we sample *current*
-    RSS on a background thread and keep the max.
-  * RSS high-water marks don't reset within a process and the CPU allocator
-    caches freed blocks, so baseline and FSDP are each run in their OWN process
-    to get clean, comparable peaks.
-
-We also keep the PyTorch profiler memory table from
-https://docs.pytorch.org/tutorials/recipes/recipes/profiler_recipe.html
+Baseline and FSDP run in separate processes so their profiler timelines and
+model state remain isolated. We also keep the PyTorch profiler operator table
+from https://docs.pytorch.org/tutorials/recipes/recipes/profiler_recipe.html
 for the per-op transient-allocation breakdown.
 
 Run (CPU / gloo):
@@ -28,12 +22,9 @@ import glob
 import json
 import os
 import shutil
-import threading
-import time
 import weakref
 from collections import defaultdict
 
-import psutil
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -66,7 +57,7 @@ CATEGORY_ORDER = [
     ("OPTIMIZER_STATE", "optimizer state"),
     ("GRADIENT", "gradients"),
     ("ACTIVATION", "activations"),
-    ("AUTOGRAD_DETAIL", "autograd saved"),
+    ("AUTOGRAD_DETAIL", "autograd internals"),
     ("TEMPORARY", "temporaries"),
     ("INPUT", "inputs"),
     ("UNKNOWN", "uncategorized"),
@@ -374,36 +365,6 @@ class ToyModel(nn.Module):
         return self.head(x)
 
 
-class PeakRSS:
-    """Sample current process RSS on a background thread and keep the max.
-    Captures transient activation memory that alloc/frees within a step."""
-
-    def __init__(self, interval: float = 0.0005) -> None:
-        self.proc = psutil.Process()
-        self.interval = interval
-        self.peak = 0
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-
-    def _run(self) -> None:
-        while not self._stop.is_set():
-            rss = self.proc.memory_info().rss
-            if rss > self.peak:
-                self.peak = rss
-            time.sleep(self.interval)
-
-    def __enter__(self) -> "PeakRSS":
-        self.peak = self.proc.memory_info().rss
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-        return self
-
-    def __exit__(self, *exc) -> None:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join()
-
-
 def _resolve_device_type(device: str = "cpu") -> str:
     """Normalize a requested device to what will actually be used: 'cuda' (NCCL,
     one rank per GPU) only when requested AND a GPU is present, otherwise 'cpu'
@@ -644,7 +605,6 @@ def _train_step(
 
 
 def run_phase(rank: int, mode: str, world_size: int, device_type: str = "cpu") -> None:
-    proc = psutil.Process()
     if device_type == "cuda":
         device = torch.device(f"cuda:{rank}")
         torch.cuda.set_device(device)
@@ -653,13 +613,6 @@ def run_phase(rank: int, mode: str, world_size: int, device_type: str = "cpu") -
 
     if mode == "fsdp":
         _setup(rank, world_size, device_type)
-
-    # Capture the baseline AFTER the process group is initialized, so comm
-    # buffers count as pre-model overhead (not as model/training memory). This
-    # keeps 'peak-overhead' a fair model+training comparison across modes. On
-    # CUDA the analogue is the allocator's peak-allocated high-water mark, which
-    # already excludes the fixed CUDA context, so its 'before' baseline is 0.
-    rss_before = proc.memory_info().rss  # interpreter + torch + comm-init overhead
 
     torch.manual_seed(0)
     if mode == "fsdp":
@@ -677,10 +630,9 @@ def run_phase(rank: int, mode: str, world_size: int, device_type: str = "cpu") -
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     x, y = _make_batch(device)
 
-    # --- Pass 1: clean peak-memory run (no profiler, to avoid contaminating it) ---
-    # CPU: sample process RSS on a thread. CUDA: reset the allocator peak stats
-    # (after the model is resident, so params are included) and read the
-    # high-water mark of allocated / reserved bytes at the end.
+    # --- Pass 1: collect exact persistent state and FSDP-internal samples ---
+    # Keep this separate from the profiler pass so instrumentation does not
+    # affect the explicit parameter/gradient/optimizer accounting.
     footprint: dict[str, int] = {}
     fsdp_internal_samples: list[dict[str, int | str]] = []
 
@@ -693,20 +645,7 @@ def run_phase(rank: int, mode: str, world_size: int, device_type: str = "cpu") -
             if step == 0:
                 footprint = _footprint_bytes(model, optimizer)
 
-    if device_type == "cuda":
-        torch.cuda.synchronize(device)
-        torch.cuda.reset_peak_memory_stats(device)
-        _run_pass1()
-        torch.cuda.synchronize(device)
-        peak_alloc = torch.cuda.max_memory_allocated(device)
-        peak_reserved = torch.cuda.max_memory_reserved(device)
-        peak_rss = 0
-    else:
-        with PeakRSS() as peak:
-            _run_pass1()
-        peak_rss = peak.peak
-        peak_alloc = 0
-        peak_reserved = 0
+    _run_pass1()
 
     # --- Pass 2: profiler run for the granular per-category memory breakdown ---
     # record_shapes + with_stack are REQUIRED for the memory profiler to walk the
@@ -746,10 +685,6 @@ def run_phase(rank: int, mode: str, world_size: int, device_type: str = "cpu") -
         "mode": mode,
         "rank": rank,
         "device_type": device_type,
-        "rss_before": rss_before,
-        "peak_rss": peak_rss,
-        "peak_cuda_alloc": peak_alloc,
-        "peak_cuda_reserved": peak_reserved,
         **footprint,
         **categorized,
         "fsdp_internal_samples": fsdp_internal_samples,
@@ -791,67 +726,29 @@ def _report() -> None:
     with torch.device("meta"):
         n_params = sum(p.numel() for p in ToyModel().parameters())
     print("\n" + "#" * 78)
-    print(f"# TOTAL TRAINING MEMORY  (world_size={WORLD_SIZE}, {STEPS} steps, batch/rank={BATCH_PER_RANK})")
+    print(f"# PERSISTENT TRAINING STATE  (world_size={WORLD_SIZE}, {STEPS} steps, batch/rank={BATCH_PER_RANK})")
     print(f"# device: {device_type}  |  model: {NUM_LAYERS} blocks, d_model={D_MODEL}, "
           f"d_ff={D_FF}, params={n_params / 1e6:.1f}M")
     print("#" * 78)
 
-    if device_type == "cuda":
-        # On CUDA the peak-allocated high-water mark already excludes the fixed
-        # CUDA context, so it IS the model+training footprint (no overhead to
-        # subtract). 'peak reserved' is the caching allocator's reservation.
-        def _peak(r: dict) -> int:
-            return r["peak_cuda_alloc"]
-
-        header = (
-            f"{'phase':<20}{'peak allocated':>16}{'peak reserved':>16}"
-            f"{'resident(P+G+O)':>18}{'transient~':>14}"
+    header = (
+        f"{'phase':<20}{'parameters':>16}{'gradients':>16}"
+        f"{'optimizer state':>18}{'total':>16}"
+    )
+    print(header)
+    print("-" * len(header))
+    for r in (base, fsdp0):
+        if r is None:
+            continue
+        label = "baseline (full)" if r["mode"] == "baseline" else "fsdp (per rank)"
+        print(
+            f"{label:<20}{_fmt(r['params']):>16}{_fmt(r['grads']):>16}"
+            f"{_fmt(r['opt_state']):>18}{_fmt(r['resident_total']):>16}"
         )
-        print(header)
-        print("-" * len(header))
-        for r in (base, fsdp0):
-            if r is None:
-                continue
-            peak = _peak(r)
-            transient = peak - r["resident_total"]
-            label = "baseline (full)" if r["mode"] == "baseline" else "fsdp (per rank)"
-            print(
-                f"{label:<20}{_fmt(peak):>16}{_fmt(r['peak_cuda_reserved']):>16}"
-                f"{_fmt(r['resident_total']):>18}{_fmt(transient):>14}"
-            )
-        note = (
-            "note: 'peak allocated' = torch.cuda.max_memory_allocated (live tensors "
-            "high-water mark,\n      excludes the fixed CUDA context); 'peak reserved' "
-            "= allocator reservation;\n      'transient~' = peak allocated - resident."
-        )
-    else:
-        def _peak(r: dict) -> int:
-            return r["peak_rss"] - r["rss_before"]
-
-        header = f"{'phase':<20}{'peak RSS':>14}{'peak-overhead':>16}{'resident(P+G+O)':>18}{'activations~':>16}"
-        print(header)
-        print("-" * len(header))
-        for r in (base, fsdp0):
-            if r is None:
-                continue
-            peak_minus_overhead = _peak(r)
-            activations = peak_minus_overhead - r["resident_total"]
-            label = "baseline (full)" if r["mode"] == "baseline" else "fsdp (per rank)"
-            print(
-                f"{label:<20}{_fmt(r['peak_rss']):>14}{_fmt(peak_minus_overhead):>16}"
-                f"{_fmt(r['resident_total']):>18}{_fmt(activations):>16}"
-            )
-        note = (
-            "note: 'peak RSS' includes ~torch/interpreter overhead (~rss_before); "
-            "'peak-overhead' isolates model+training; 'activations~' = peak-overhead - resident."
-        )
-
     if base and fsdp0:
-        bd = _peak(base)
-        fd = _peak(fsdp0)
         print("-" * len(header))
-        print(f"peak ratio baseline/fsdp: {bd / max(fd, 1):.2f}x")
-        print(note)
+        ratio = base["resident_total"] / max(fsdp0["resident_total"], 1)
+        print(f"resident-state ratio baseline/fsdp: {ratio:.2f}x")
 
     _report_categories(base, fsdp0)
     _report_fsdp_internal(fsdp0)
@@ -860,7 +757,7 @@ def _report() -> None:
 def _report_categories(base: dict | None, fsdp0: dict | None) -> None:
     """Granular per-category peak tensor memory (from the profiler's memory
     timeline): where the bytes actually live — params, optimizer state, grads,
-    activations, autograd-saved tensors, temporaries."""
+    activations, autograd internals, and temporaries."""
     if base is None and fsdp0 is None:
         return
     print("\n" + "#" * 78)
@@ -949,7 +846,7 @@ def main(device: str = "cpu") -> None:
     shutil.rmtree(RESULTS_DIR, ignore_errors=True)
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
-    # Separate processes so each phase gets a clean peak-memory high-water mark.
+    # Separate processes keep each phase's model state and profiler timeline isolated.
     mp.spawn(run_phase, args=("baseline", 1, device_type), nprocs=1, join=True)
     mp.spawn(run_phase, args=("fsdp", WORLD_SIZE, device_type), nprocs=WORLD_SIZE, join=True)
 
