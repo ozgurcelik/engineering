@@ -1,9 +1,6 @@
-"""Compare FSDP (world_size=2) with a full-replica baseline using two views:
-
-  * exact persistent training state: parameters, finalized gradients, and
-    optimizer state resident on one rank;
-  * profiler-visible live tensor memory: category peaks and the largest sum of
-    tensors simultaneously alive during training.
+"""Compare FSDP (world_size=2) with a full-replica baseline using
+profiler-visible live tensor memory: category peaks and the largest sum of
+tensors simultaneously alive during training.
 
 Baseline and FSDP run in separate processes so their profiler timelines and
 model state remain isolated. We also keep the PyTorch profiler operator table
@@ -391,25 +388,6 @@ def _cleanup() -> None:
     dist.destroy_process_group()
 
 
-def _footprint_bytes(model: nn.Module, optimizer: torch.optim.Optimizer) -> dict[str, int]:
-    """Resident bytes held on THIS rank: parameters, grads, optimizer state."""
-    param_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
-    grad_bytes = sum(
-        p.grad.numel() * p.grad.element_size() for p in model.parameters() if p.grad is not None
-    )
-    opt_bytes = 0
-    for state in optimizer.state.values():
-        for v in state.values():
-            if torch.is_tensor(v):
-                opt_bytes += v.numel() * v.element_size()
-    return {
-        "params": param_bytes,
-        "grads": grad_bytes,
-        "opt_state": opt_bytes,
-        "resident_total": param_bytes + grad_bytes + opt_bytes,
-    }
-
-
 def _tensor_bytes(tensor: torch.Tensor | None) -> int:
     if tensor is None:
         return 0
@@ -630,20 +608,15 @@ def run_phase(rank: int, mode: str, world_size: int, device_type: str = "cpu") -
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     x, y = _make_batch(device)
 
-    # --- Pass 1: collect exact persistent state and FSDP-internal samples ---
-    # Keep this separate from the profiler pass so instrumentation does not
-    # affect the explicit parameter/gradient/optimizer accounting.
-    footprint: dict[str, int] = {}
+    # --- Pass 1: warm up the optimizer and collect FSDP-internal samples ---
+    # Keep instrumentation separate from the profiler timeline.
     fsdp_internal_samples: list[dict[str, int | str]] = []
 
     def _run_pass1() -> None:
-        nonlocal footprint
         for step in range(STEPS):
             samples = fsdp_internal_samples if mode == "fsdp" and rank == 0 and step == 0 else None
             with record_function("step"):
                 _train_step(model, optimizer, is_fsdp, x, y, samples, tracker)
-            if step == 0:
-                footprint = _footprint_bytes(model, optimizer)
 
     _run_pass1()
 
@@ -685,7 +658,6 @@ def run_phase(rank: int, mode: str, world_size: int, device_type: str = "cpu") -
         "mode": mode,
         "rank": rank,
         "device_type": device_type,
-        **footprint,
         **categorized,
         "fsdp_internal_samples": fsdp_internal_samples,
     }
@@ -720,35 +692,6 @@ def _report() -> None:
 
     base = next((r for r in rows if r["mode"] == "baseline"), None)
     fsdp0 = next((r for r in rows if r["mode"] == "fsdp" and r["rank"] == 0), None)
-
-    device_type = (fsdp0 or base or {}).get("device_type", "cpu")
-
-    with torch.device("meta"):
-        n_params = sum(p.numel() for p in ToyModel().parameters())
-    print("\n" + "#" * 78)
-    print(f"# PERSISTENT TRAINING STATE  (world_size={WORLD_SIZE}, {STEPS} steps, batch/rank={BATCH_PER_RANK})")
-    print(f"# device: {device_type}  |  model: {NUM_LAYERS} blocks, d_model={D_MODEL}, "
-          f"d_ff={D_FF}, params={n_params / 1e6:.1f}M")
-    print("#" * 78)
-
-    header = (
-        f"{'phase':<20}{'parameters':>16}{'gradients':>16}"
-        f"{'optimizer state':>18}{'total':>16}"
-    )
-    print(header)
-    print("-" * len(header))
-    for r in (base, fsdp0):
-        if r is None:
-            continue
-        label = "baseline (full)" if r["mode"] == "baseline" else "fsdp (per rank)"
-        print(
-            f"{label:<20}{_fmt(r['params']):>16}{_fmt(r['grads']):>16}"
-            f"{_fmt(r['opt_state']):>18}{_fmt(r['resident_total']):>16}"
-        )
-    if base and fsdp0:
-        print("-" * len(header))
-        ratio = base["resident_total"] / max(fsdp0["resident_total"], 1)
-        print(f"resident-state ratio baseline/fsdp: {ratio:.2f}x")
 
     _report_categories(base, fsdp0)
     _report_fsdp_internal(fsdp0)
@@ -827,11 +770,8 @@ def _report_fsdp_internal(fsdp0: dict | None) -> None:
     print("-" * len(header))
     print(
         "note: these are FSDP-specific tensors only. The reduce-scatter shard\n"
-        "      output becomes the local grad. The collectives' INPUT buffers (the\n"
-        "      casted all-gather shard / the full flattened reduce-scatter grad)\n"
-        "      are not held by an explicit reference — PyTorch's NCCL keeps them\n"
-        "      alive until the op completes (recordStream) — so they aren't listed\n"
-        "      here.\n"
+        "      output becomes the local grad. Collective input storage is protected\n"
+        "      internally by the process-group backend and is not listed here.\n"
         "      'pinned full W' = forward full-weight storages still resident but\n"
         "      no longer an attached full param (e.g. pinned by autograd's saved\n"
         "      tensors). With per-layer freeing via storage().resize_(0) this is\n"

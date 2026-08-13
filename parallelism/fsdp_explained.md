@@ -289,7 +289,7 @@ With one rank, no communication is necessary. Otherwise, the function optionally
         Issue an async all-gather operation for the layers params for the forward pass.
         """
         for param_name, param_state in self._layer_states[layer].param_states.items():
-            if self._storage_allocated(param_state.full_param):
+            if self._full_param_storage_is_allocated(param_state.full_param):
                 continue
             local_param = getattr(layer, param_name, None)
             metadata = param_state.metadata
@@ -344,7 +344,7 @@ The post-forward hook performs the inverse transition:
             # weight autograd saved for backward, so resizing to 0 releases that
             # shared allocation; the pre-backward hook re-gathers into the same
             # storage.
-            self._free_full_param(param_state.full_param)
+            self._release_full_param_storage(param_state.full_param)
 
         next_index = self._layer_index[layer] + self._prefetch_window_size
         if next_index < len(self._fsdp_layers):
@@ -375,14 +375,16 @@ This code does not create CUDA streams itself. It relies on `async_op=True` and 
 
 Backward mirrors the schedule in reverse. With four layers and a window of 2, `L3` and `L2` are gathered just in time when backward first reaches them. The pre-backward hook for `L3` starts `AG(L1)`, and the hook for `L2` starts `AG(L0)`, allowing those gathers to overlap the backward computation of later layers.
 
-#### A toy-specific storage trick
+#### Managing autograd-aliased full-parameter storage
 
-The collectives above are fundamental to FSDP; the following storage-resizing mechanism is not. It is a deliberately low-level technique this toy uses to release a full parameter after forward while preserving the tensor objects already captured by autograd.
+`FULL_SHARD` releases an unsharded parameter after forward and materializes it again for backward. Eager autograd makes that lifecycle subtle: it may save a tensor that aliases the gathered parameter's storage, so merely assigning a new empty tensor to `full_param.data` would leave the saved alias holding the original allocation alive.
+
+This implementation therefore resizes the shared storage itself. This is low-level machinery, but it is not unique to this project: [PyTorch FSDP2 uses storage resizing for the same autograd-aliasing reason](https://github.com/pytorch/pytorch/blob/main/torch/distributed/fsdp/_fully_shard/_fsdp_param.py). We confine direct storage manipulation to a small set of lifecycle helpers rather than treating it as a general tensor-programming technique.
 
 The helper that releases the storage is:
 ```python
     @staticmethod
-    def _free_full_param(full_param: torch.nn.Parameter | None) -> None:
+    def _release_full_param_storage(full_param: torch.nn.Parameter | None) -> None:
         """Release a full (unsharded) weight by resizing its storage to 0.
 
         Autograd's saved-for-backward copy of the weight shares this exact
@@ -398,7 +400,7 @@ The helper that releases the storage is:
         with torch.no_grad():
             full_param.untyped_storage().resize_(0)
 ```
-The toy uses this trick in three places: after forward, before backward, and after the backward reduce-scatter.
+The wrapper releases this storage after forward, rematerializes the same storage before backward, and releases it again after launching the gradient reduce-scatter.
 
 A materialized full parameter is just a tensor whose `[out, in]` view points into an all-gather buffer's storage. When autograd needs the weight for backward, it saves a tensor that shares *that exact storage*. Three things therefore point at one allocation:
 
@@ -409,16 +411,16 @@ one allocation (untyped storage)
 full_param        full_param.data       autograd-saved tensor
 (the Parameter)   ([out, in] view)      (shares the SAME storage)
 
-free     = storage.resize_(0)        -> every view now points at empty storage
-regather = storage.resize_(n*bytes)  -> refills in place; the saved tensor is valid again
+release       = storage.resize_(0)        -> every view now points at empty storage
+rematerialize = storage.resize_(n*bytes)  -> refill in place; saved aliases are valid again
 ```
 
-So to actually free the weight we must shrink the storage itself, not merely repoint `full_param`: assigning a fresh empty tensor to `full_param.data` would leave the autograd-saved copy holding the old allocation alive. Resizing the storage to 0 releases the shared allocation for reuse while keeping the tensor's `[out, in]` sizes intact, so `AccumulateGrad` still accepts a full-shaped gradient later. This is safe only because we control exactly which tensors share the storage and when the hooks run; it is not a general-purpose way to mutate autograd-tracked tensors.
+Resizing the storage to 0 releases the shared allocation for reuse while keeping the tensor's `[out, in]` sizes intact, so `AccumulateGrad` still accepts a full-shaped gradient later. Before backward, growing and refilling that same storage also restores the value seen by autograd's saved aliases. These operations depend on tightly controlled alias and hook lifetimes, which is why all raw storage access stays inside the lifecycle helpers.
 
 The mirror image of "free by resizing to 0" is the question "is this parameter currently materialized?", which we answer by asking the storage, not the tensor shape:
 ```python
     @staticmethod
-    def _storage_allocated(param: torch.nn.Parameter | None) -> bool:
+    def _full_param_storage_is_allocated(param: torch.nn.Parameter | None) -> bool:
         """A full param's memory is tracked by its STORAGE, not its tensor
         sizes: we free by resizing the storage to 0 while keeping the [out, in]
         sizes (so autograd still sees the right shape). So 'is it materialized?'
@@ -426,6 +428,8 @@ The mirror image of "free by resizing to 0" is the question "is this parameter c
         return param is not None and param.untyped_storage().size() > 0
 ```
 A freed full parameter still reports its logical `[out, in]` shape, so `.numel()` says nothing about whether its backing allocation is present. The materialization guards must therefore inspect `untyped_storage().size()`.
+
+The main alternative is to retain every gathered parameter until its backward computation, equivalent to `reshard_after_forward=False`. That avoids storage manipulation and the backward all-gather, but full parameters accumulate throughout forward and increase peak memory. Custom autograd functions could instead control what is saved and rematerialized, but they would make this implementation operator-specific. We keep storage resizing because it preserves the generic eager-module path and the lower-memory `FULL_SHARD` lifecycle.
 
 We then register the forward hooks for the FSDP layers.
 ```python
@@ -468,7 +472,7 @@ This avoids repeated FP32-to-low-precision-to-FP32 conversions and is closer to 
 
 Backward starts by rematerializing the current layer's parameters. For a linear layer, `dL/dx = W^T * dL/dy`, so the full `W` is required whenever an input gradient must be computed. Not every operator or backward path needs parameter values, but this simplified module-level policy gathers every parameter belonging to a sharded module whose backward hook runs.
 ```python
-    def _regather_full_param_backward(
+    def _rematerialize_full_param_storage_async(
         self,
         full_param: torch.nn.Parameter,
         local_param: torch.nn.Parameter,
@@ -496,7 +500,7 @@ Backward starts by rematerializing the current layer's parameters. For a linear 
             return None
         return dist.all_gather_into_tensor(full_param.data, local_shard, async_op=True)
 ```
-This is the backward half of the toy-specific storage trick. The post-forward hook left the existing tensor objects and their shape metadata intact but shrank their shared storage to zero. `_regather_full_param_backward` grows that same storage, temporarily exposes it as a flat padded buffer, and all-gathers into it. `_use_prefetched_layer_backward` later removes the padding and restores the original-shaped view. Reusing the storage matters when autograd saved a tensor that shares it, as happens for a linear weight needed to compute an input gradient.
+The post-forward hook left the existing tensor objects and their shape metadata intact but shrank their shared storage to zero. `_rematerialize_full_param_storage_async` grows that same storage, temporarily exposes it as a flat padded buffer, and all-gathers into it. `_use_prefetched_layer_backward` later removes the padding and restores the original-shaped view. Reusing the storage matters when autograd saved a tensor that shares it, as happens for a linear weight needed to compute an input gradient.
 
 Backward prefetching then follows the same issue-now, wait-later pattern as forward prefetching:
 ```python
@@ -506,12 +510,12 @@ Backward prefetching then follows the same issue-now, wait-later pattern as forw
         """
         for param_name, param_state in self._layer_states[layer].param_states.items():
             full_param = param_state.full_param
-            if full_param is None or self._storage_allocated(full_param):
+            if full_param is None or self._full_param_storage_is_allocated(full_param):
                 continue
             metadata = param_state.metadata
             if metadata is None:
                 continue
-            handle = self._regather_full_param_backward(
+            handle = self._rematerialize_full_param_storage_async(
                 full_param, param_state.local_param, metadata
             )
             param_state.backward_gather_handle = handle
@@ -625,12 +629,12 @@ class PendingReduceScatter:
             # it: resize the storage to 0 (the autograd-saved copy shares it, so
             # the shared allocation is released for reuse) rather than detaching
             # to a new empty storage.
-            self._free_full_param(param)
+            self._release_full_param_storage(param)
         return hook
 ```
 The post-accumulate-grad hook starts that collective as soon as the full gradient is ready. It records which persistent local parameter should receive the result, appends the work to the pending queue, clears the temporary full gradient, and releases the full parameter's storage.
 
-Clearing `param.grad` and the full weight does not clear the reduce-scatter output stored in `PendingReduceScatter`. The collective also needs its flattened input until the backend has consumed it; this toy relies on PyTorch's asynchronous collective machinery for that lifetime. A more defensive teaching implementation could store the flattened input in `PendingReduceScatter` until finalization. Padding with `torch.cat` also creates an extra temporary input allocation.
+Clearing `param.grad` and the full weight does not clear the reduce-scatter output stored in `PendingReduceScatter`. PyTorch's process-group backend is responsible for protecting the asynchronous collective's input storage until it has been consumed. Padding with `torch.cat` still creates an additional temporary input allocation.
 
 The pending queue is drained as follows:
 ```python
@@ -724,21 +728,11 @@ Supporting these cases needs alias-aware parameter ownership plus a stack (or eq
 
 Finally, this is a learning implementation, not a production one: we flatten and shard each parameter separately and issue a collective per parameter, which adds latency and padding overhead compared to grouped implementations like PyTorch FSDP1/FSDP2.
 
-## Why the storage-resizing trick is needed
-
-The storage-resizing code is not a fundamental part of FSDP. It is a consequence of combining ordinary PyTorch autograd with our decision to free a gathered parameter after forward and gather it again for backward.
-
-During forward, autograd may save a tensor that shares the full parameter's storage. For example, linear backward needs the full weight to compute the input gradient. Restoring `layer.weight` to the local shard does not change the tensor already saved by autograd, so that saved tensor would continue to keep the full allocation alive. Assigning `full_param.data` to a new empty tensor would not solve this either: it would only repoint `full_param`, while autograd's saved tensor would still reference the old storage.
-
-We therefore shrink the shared storage itself to zero after forward. This releases the full allocation while leaving the existing tensor objects, shapes, and autograd graph intact. Before backward, we grow that same storage and all-gather the weight into it again. Because autograd's saved tensor still refers to that storage, it sees the newly gathered values and backward can proceed. After the full gradient has been reduce-scattered, we shrink the storage once more.
-
-We could avoid this low-level technique by retaining every gathered weight until backward, but then the full parameters would accumulate throughout forward and largely defeat reshard-after-forward memory savings. A more robust alternative would be custom autograd logic that explicitly regathers parameters during backward, but that would be more operator-specific and substantially more complex. This implementation uses storage resizing as a compact teaching mechanism; mutating `.data` and raw storage this way is fragile and should not be treated as a general PyTorch pattern.
-
 ## Results
 
-We profiled two models: the parameter-heavy residual MLP from `profile_fsdp.py`, and the small causal Transformer from `profile_fsdp_transformers.py`. Both experiments ran on CPU with Gloo, two FSDP ranks, FP32 parameters and computation, and Adam. The baseline uses one process with a complete model replica; the FSDP number is the memory used by rank 0.
+We profiled two models: a parameter-heavy residual MLP and a small causal Transformer. Both experiments ran on CPU with Gloo, two FSDP ranks, FP32 parameters and computation, and Adam. The baseline uses one process with a complete model replica; the FSDP number is the memory used by rank 0.
 
-Each script makes two measurement passes. The first directly counts the persistent parameters, finalized gradients, and optimizer state held by the model and optimizer. The profiler pass reconstructs the timeline of live tensor allocations, including activations and FSDP's temporary communication tensors. `Live tensor co-peak` is the largest sum of simultaneously live, profiler-visible tensors.
+The profiler reconstructs the timeline of live tensor allocations, including activations and FSDP's temporary communication tensors. `Live tensor co-peak` is the largest sum of simultaneously live, profiler-visible tensors.
 
 There is one more subtlety in the granular tables. Each category is shown at its own high-water mark, and the categories do not necessarily reach those peaks at the same instant. The rows therefore should not be added together. `Live tensor co-peak` is the maximum of their actual sum at one instant.
 
@@ -746,12 +740,7 @@ There is one more subtlety in the granular tables. Each category is shown at its
 
 The MLP contains 24 residual blocks with `d_model=1024` and `d_ff=4096`, for 205.6 million parameters. We used a per-rank batch size of 8, sequence length 32, and five training steps. This intentionally keeps activations small relative to the parameters and Adam state, which is the regime in which FSDP's sharding should be most visible.
 
-| Measurement | Full replica | FSDP per rank | Full / FSDP |
-|---|---:|---:|---:|
-| Resident parameters + gradients + optimizer state | 3,137.19 MiB | 1,568.98 MiB | 2.00x |
-| Live tensor co-peak | 3,171.16 MiB | 1,676.05 MiB | 1.89x |
-
-The persistent model state is almost exactly halved. After including live activations and FSDP's transient all-gather and reduce-scatter tensors, the profiler's live-tensor co-peak shows a 1.89x reduction.
+After including live activations and FSDP's transient all-gather and reduce-scatter tensors, the live-tensor co-peak falls from 3,171.16 MiB to 1,676.05 MiB, a 1.89x reduction.
 
 The granular live-tensor peaks are:
 
@@ -767,9 +756,9 @@ The granular live-tensor peaks are:
 | Uncategorized | 32.02 MiB | 27.91 MiB | 1.15x |
 | **Live tensor co-peak** | **3,171.16 MiB** | **1,676.05 MiB** | **1.89x** |
 
-The apparent 2.04x parameter reduction is a profiler-classification artifact, not super-linear sharding. Directly counting the tensors in `model.parameters()` gives 784.30 MiB for the baseline and 392.25 MiB for FSDP, which is just under 2x because LayerNorm parameters stay replicated. Padding can add further overhead when a parameter is not divisible by the world size, although these MLP dimensions divide evenly across two ranks. The generic profiler assigned one additional 16 MiB baseline allocation to its `PARAMETER` category.
+The apparent 2.04x parameter reduction is a profiler-classification artifact, not super-linear sharding. The actual sharding ratio is slightly below 2x because LayerNorm parameters stay replicated. Padding can add further overhead when a parameter is not divisible by the world size, although these MLP dimensions divide evenly across two ranks. The generic profiler assigned one additional 16 MiB baseline allocation to its `PARAMETER` category.
 
-The gradient category has the opposite-looking effect. Final resident gradients are also 784.30 MiB versus 392.25 MiB, but the FSDP gradient high-water mark reaches 404.33 MiB. During backward, a temporary full gradient and reduce-scatter buffers can overlap with local gradient shards that have already been finalized. Replicated LayerNorm gradients also remain full-sized. This transient overlap makes the category peak slightly less than a 2x improvement even though the final stored gradients are almost exactly halved.
+The gradient category shows a smaller 1.94x improvement. During backward, a temporary full gradient and reduce-scatter buffers can overlap with local gradient shards that have already been finalized. Replicated LayerNorm gradients also remain full-sized, raising the category's high-water mark.
 
 PyTorch's `AUTOGRAD_DETAIL` category, called `Autograd internals` here, is a fallback for outputs created inside backward functions that were not already recognized as parameters, gradients, activations, or another category. In this FSDP run it includes backward and reduce-scatter implementation tensors; it does not mean that 426 MiB of forward activations were saved for backward. Likewise, a gathered full weight can be classified as `INPUT` because it is created by a collective and is never seen by the optimizer as a persistent parameter.
 
@@ -785,12 +774,7 @@ PyTorch's `AUTOGRAD_DETAIL` category, called `Autograd internals` here, is a fal
 
 The Transformer has four layers, `d_model=512`, eight attention heads, `d_ff=2048`, a vocabulary of 4096, and 17.3 million parameters. We used a per-rank batch size of 4 and three training steps. Its attention implementation explicitly materializes the `[batch, heads, sequence, sequence]` score and probability tensors, making the quadratic activation cost visible.
 
-| Measurement | Full replica | FSDP per rank | Full / FSDP |
-|---|---:|---:|---:|
-| Resident parameters + gradients + optimizer state | 264.42 MiB | 132.28 MiB | 2.00x |
-| Live tensor co-peak | 1,498.67 MiB | 1,399.56 MiB | 1.07x |
-
-The persistent state is again almost exactly halved, but that state is now a small part of the peak. At sequence length 1024, activations alone reach roughly 1.16 GiB in both modes. FSDP shards model state, not activations, so its relative saving shrinks toward 1x as the sequence length and attention activation footprint grow.
+The live-tensor co-peak falls only from 1,498.67 MiB to 1,399.56 MiB, a 1.07x reduction. At sequence length 1024, activations alone reach roughly 1.16 GiB in both modes. FSDP shards model state, not activations, so its relative saving shrinks toward 1x as the sequence length and attention activation footprint grow.
 
 | Category | Full replica | FSDP per rank | Full / FSDP |
 |---|---:|---:|---:|
@@ -800,11 +784,11 @@ The persistent state is again almost exactly halved, but that state is now a sma
 | Activations | 1,168.28 MiB | 1,160.28 MiB | 1.01x |
 | Autograd internals | 264.00 MiB | 299.53 MiB | 0.88x |
 | Temporaries | 0.04 MiB | 0.04 MiB | 1.00x |
-| Inputs | 5.07 MiB | 36.07 MiB | 0.14x |
+| Inputs | 5.07 MiB | 32.07 MiB | 0.16x |
 | Uncategorized | 16.00 MiB | 16.00 MiB | 1.00x |
 | **Live tensor co-peak** | **1,498.67 MiB** | **1,399.56 MiB** | **1.07x** |
 
-The 2.24x parameter row and 1.61x gradient row have the same interpretation as in the MLP experiment: they are category high-water marks inferred from the execution graph, not direct counts of final persistent tensors. The explicit resident-state measurement is the appropriate number for the sharding ratio; it shows the expected 2x reduction.
+The 2.24x parameter row and 1.61x gradient row have the same interpretation as in the MLP experiment: they are category high-water marks inferred from the execution graph, not direct sharding ratios.
 
 ![Transformer baseline memory timeline at sequence length 1024](./figures/transformer_seq1024_baseline_memory_timeline.png)
 

@@ -156,7 +156,7 @@ saved tensor keeps its `[out, in]` metadata (so `AccumulateGrad` still accepts a
 full-shaped grad) but its storage now holds nothing — bytes returned immediately,
 regardless of how many tensors reference it.
 
-The backward pre-hook (`_regather_full_param_backward`) then resizes that **same**
+The backward pre-hook (`_rematerialize_full_param_storage_async`) then resizes that **same**
 storage back up and refills it via all-gather, which makes autograd's still-
 attached saved tensor valid again.
 

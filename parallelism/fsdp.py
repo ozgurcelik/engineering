@@ -202,8 +202,11 @@ class FSDP(torch.nn.Module):
         handle = dist.all_gather_into_tensor(buffer, local_shard, async_op=True)
         return handle, buffer
 
+    # Full-parameter storage lifecycle. Raw storage operations are deliberately
+    # confined to these helpers because autograd may retain aliases of the
+    # gathered parameter between forward and backward.
     @staticmethod
-    def _storage_allocated(param: torch.nn.Parameter | None) -> bool:
+    def _full_param_storage_is_allocated(param: torch.nn.Parameter | None) -> bool:
         """A full param's memory is tracked by its STORAGE, not its tensor
         sizes: we free by resizing the storage to 0 while keeping the [out, in]
         sizes (so autograd still sees the right shape). So 'is it materialized?'
@@ -211,7 +214,7 @@ class FSDP(torch.nn.Module):
         return param is not None and param.untyped_storage().size() > 0
 
     @staticmethod
-    def _free_full_param(full_param: torch.nn.Parameter | None) -> None:
+    def _release_full_param_storage(full_param: torch.nn.Parameter | None) -> None:
         """Release a full (unsharded) weight by resizing its storage to 0.
 
         Autograd's saved-for-backward copy of the weight shares this exact
@@ -227,7 +230,7 @@ class FSDP(torch.nn.Module):
         with torch.no_grad():
             full_param.untyped_storage().resize_(0)
 
-    def _regather_full_param_backward(
+    def _rematerialize_full_param_storage_async(
         self,
         full_param: torch.nn.Parameter,
         local_param: torch.nn.Parameter,
@@ -261,12 +264,12 @@ class FSDP(torch.nn.Module):
         """
         for param_name, param_state in self._layer_states[layer].param_states.items():
             full_param = param_state.full_param
-            if full_param is None or self._storage_allocated(full_param):
+            if full_param is None or self._full_param_storage_is_allocated(full_param):
                 continue
             metadata = param_state.metadata
             if metadata is None:
                 continue
-            handle = self._regather_full_param_backward(
+            handle = self._rematerialize_full_param_storage_async(
                 full_param, param_state.local_param, metadata
             )
             param_state.backward_gather_handle = handle
@@ -333,7 +336,7 @@ class FSDP(torch.nn.Module):
             # it: resize the storage to 0 (the autograd-saved copy shares it, so
             # the shared allocation is released for reuse) rather than detaching
             # to a new empty storage.
-            self._free_full_param(param)
+            self._release_full_param_storage(param)
         return hook
 
     def _prefetch_layer_forward(self, layer: torch.nn.Module) -> None:
@@ -341,7 +344,7 @@ class FSDP(torch.nn.Module):
         Issue an async all-gather operation for the layers params for the forward pass.
         """
         for param_name, param_state in self._layer_states[layer].param_states.items():
-            if self._storage_allocated(param_state.full_param):
+            if self._full_param_storage_is_allocated(param_state.full_param):
                 continue
             local_param = getattr(layer, param_name, None)
             metadata = param_state.metadata
@@ -398,7 +401,7 @@ class FSDP(torch.nn.Module):
             # weight autograd saved for backward, so resizing to 0 releases that
             # shared allocation; the pre-backward hook re-gathers into the same
             # storage.
-            self._free_full_param(param_state.full_param)
+            self._release_full_param_storage(param_state.full_param)
 
         next_index = self._layer_index[layer] + self._prefetch_window_size
         if next_index < len(self._fsdp_layers):

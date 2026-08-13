@@ -2,16 +2,15 @@
 sweeping the SEQUENCE LENGTH.
 
 Why sweep sequence length?
-  Parameters and optimizer state do NOT depend on sequence length, so FSDP's
-  sharding win on them is a fixed number of bytes. Attention activations, on the
-  other hand, grow ~O(T^2) (this toy uses explicit softmax(QK^T)V so the
+  Parameter and optimizer-state memory does NOT depend on sequence length.
+  Attention activations, on the other hand, grow ~O(T^2) (this toy uses
+  explicit softmax(QK^T)V so the
   [B, heads, T, T] scores are materialized and saved for backward). As T grows,
   activations come to dominate total memory, and since activations are the SAME
   on FSDP and baseline (FSDP shards weights, not activations), FSDP's relative
   advantage shrinks. This sweep makes that trade-off visible.
 
 We reuse the model-agnostic measurement helpers from ``profile_fsdp.py``:
-  * exact persistent parameter, gradient, and optimizer-state bytes per rank;
   * the profiler's per-category LIVE tensor co-peak (params/optimizer/grad/
     activation/autograd/...), which captures transient tensor memory.
 
@@ -42,7 +41,6 @@ from profile_fsdp import (
     CATEGORY_ORDER,
     FullWeightTracker,
     _categorized_memory,
-    _footprint_bytes,
     _record_fsdp_internal_sample,
     _resolve_device_type,
     _report_categories,
@@ -234,12 +232,10 @@ def run_phase(
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     x, y = _make_batch(seq_len, device)
 
-    # --- Pass 1: collect exact persistent state and FSDP-internal samples ---
-    footprint: dict[str, int] = {}
+    # --- Pass 1: warm up the optimizer and collect FSDP-internal samples ---
     fsdp_internal_samples: list[dict[str, int | str]] = []
 
     def _run_pass1() -> None:
-        nonlocal footprint
         for step in range(STEPS):
             samples = (
                 fsdp_internal_samples
@@ -248,8 +244,6 @@ def run_phase(
             )
             with record_function("step"):
                 _train_step(model, optimizer, is_fsdp, x, y, samples, tracker)
-            if step == 0:
-                footprint = _footprint_bytes(model, optimizer)
 
     _run_pass1()
 
@@ -287,7 +281,6 @@ def run_phase(
         "rank": rank,
         "seq_len": seq_len,
         "device_type": device_type,
-        **footprint,
         **categorized,
         "fsdp_internal_samples": fsdp_internal_samples,
         "top_ops": top_ops,
@@ -315,7 +308,7 @@ def _load_results() -> dict[tuple[str, int], dict]:
             row = json.load(f)
         if "mode" not in row:
             continue
-        # rank 0 is representative for the per-category / footprint numbers.
+        # Rank 0 is representative for the per-category numbers.
         if row.get("rank", 0) != 0:
             continue
         rows[(row["mode"], row["seq_len"])] = row
@@ -338,16 +331,6 @@ def _report(seq_lens: list[int]) -> None:
         f"vocab={VOCAB}, params={n_params / 1e6:.1f}M"
     )
     print("#" * 92)
-
-    # Seq-independent footprint (params/optimizer are constant in T); print once.
-    base0 = rows.get(("baseline", seq_lens[0]))
-    fsdp0 = rows.get(("fsdp", seq_lens[0]))
-    if base0 and fsdp0:
-        print(
-            f"resident params+grad+opt (T-independent):  baseline {_fmt(base0['resident_total'])} MB"
-            f"   fsdp/rank {_fmt(fsdp0['resident_total'])} MB"
-            f"   ({base0['resident_total'] / max(fsdp0['resident_total'], 1):.2f}x)"
-        )
 
     # --- Table 1: LIVE co-peak tensor memory (the true memory picture) ---
     print("\n" + "=" * 92)
