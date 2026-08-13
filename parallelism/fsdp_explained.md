@@ -699,6 +699,28 @@ Finally, `finish_gradient_synchronization()` combines both synchronization paths
 ```
 The caller invokes this once after backward and before the optimizer step.
 
+## Activations: what FSDP does not shard
+
+Parameters are the learned values that persist across batches, such as linear weights and embedding tables. Activations are the data-dependent tensors produced while a particular batch moves through the model. For a Transformer, they include the residual stream, normalized hidden states, Q, K, and V, attention probabilities, MLP intermediate values, and logits. They are called activations even when they are not the output of an activation function such as GELU.
+
+During training, autograd must retain selected activations from the forward pass so it can compute gradients later. For example, a linear layer's weight gradient needs the layer input, attention backward needs values derived from Q, K, V, and the attention probabilities, and GELU backward needs information from its forward pass. Near the end of forward, saved activations from many layers may therefore be alive at the same time. Backward visits the layers in reverse order and releases those saved values as they are consumed.
+
+Attention can make this memory particularly large. The Transformer used in the results below explicitly creates an attention tensor with shape `[batch, heads, sequence, sequence]`. With a per-rank batch size of 4, eight heads, sequence length 1024, and FP32 values, one such tensor occupies:
+
+```text
+4 * 8 * 1024 * 1024 * 4 bytes = 128 MiB
+```
+
+That is one activation tensor in one layer. Four layers need 512 MiB for just one such retained tensor per layer, before accounting for Q, K, V, residual streams, MLP intermediates, logits, and other autograd state.
+
+FSDP does not normally shard these activations. Every data-parallel rank processes a different local batch and retains the activations for that batch. Its per-rank memory is therefore approximately:
+
+```text
+FSDP memory = sharded model state + unsharded activations + transient communication buffers
+```
+
+As activations come to dominate that sum, dividing the model state across more ranks has a smaller effect on the total peak. Activation checkpointing addresses a different part of the problem: it saves fewer forward values and recomputes them during backward, trading additional computation for lower activation memory.
+
 ## Costs and trade-offs
 
 The sharding lifecycle is easier to understand first; we can now quantify its main trade-off.
@@ -774,7 +796,7 @@ PyTorch's `AUTOGRAD_DETAIL` category, called `Autograd internals` here, is a fal
 
 The Transformer has four layers, `d_model=512`, eight attention heads, `d_ff=2048`, a vocabulary of 4096, and 17.3 million parameters. We used a per-rank batch size of 4 and three training steps. Its attention implementation explicitly materializes the `[batch, heads, sequence, sequence]` score and probability tensors, making the quadratic activation cost visible.
 
-The live-tensor co-peak falls only from 1,498.67 MiB to 1,399.56 MiB, a 1.07x reduction. At sequence length 1024, activations alone reach roughly 1.16 GiB in both modes. FSDP shards model state, not activations, so its relative saving shrinks toward 1x as the sequence length and attention activation footprint grow.
+The live-tensor co-peak falls only from 1,498.67 MiB to 1,399.56 MiB, a 1.07x reduction. At sequence length 1024, the profiler's `ACTIVATION` category reaches a high-water mark of roughly 1.16 GiB in both modes. This is the category's own profiler-inferred maximum, not necessarily the amount of activation memory live at the overall co-peak. FSDP shards model state, not activations, so its relative saving shrinks toward 1x as the sequence length and attention activation footprint grow.
 
 | Category | Full replica | FSDP per rank | Full / FSDP |
 |---|---:|---:|---:|
@@ -797,3 +819,7 @@ The 2.24x parameter row and 1.61x gradient row have the same interpretation as i
 ![Transformer FSDP memory timeline at sequence length 1024](./figures/transformer_seq1024_fsdp_memory_timeline.png)
 
 *FSDP Transformer timeline at sequence length 1024. Parameter and optimizer-state storage is smaller, but the activation band is essentially unchanged.*
+
+In this parameter-dominated MLP, FSDP nearly halves peak tensor memory across two ranks. In the small Transformer with explicit attention and a 1024-token context, activation memory dominates, so sharding model state reduces the peak by only 1.07x. This does not mean that FSDP is ineffective for LLMs; it shows that FSDP solves model-state replication, not activation memory. Large-model training therefore commonly combines FSDP with techniques that target activations, such as mixed precision, activation checkpointing, memory-efficient attention, and activation-sharding parallelism.
+
+The next step will be implementing activation checkpointing to reduce the activation memory in this example.
