@@ -2,6 +2,7 @@
 
 How is a GPU different from a CPU?
 CPUs optimize for a few fast threads while GPUs optimize for many threads.
+So, GPUs are optimized for throughput.
 A thread is the smallest unit of execution on a GPU. Each thread runs the **same instructions** but on **different data** — this is the SIMT (Single Instruction, Multiple Threads) model.
 
 GPUs have many more compute units and much less support for branching (control, cache).
@@ -9,11 +10,17 @@ GPUs have many more compute units and much less support for branching (control, 
 CPUs optimize for latency (each thread finishes quickly) while GPUs optimize for throughput (total processed data per unit time).
 
 GPUs have many SMs (streaming multiprocessors) that independently execute blocks (jobs).
+An SM is like an independent core with its own compute unit and subcomponents.
 Each SM contains many SPs (streaming processors) that execute threads in parallel.
 
 The closer to a memory to the SM, the faster the access is.
 L1 and shared memory are inside the SM.
 L2 cache is on the die, and global memory chips next to the GPU.
+
+Why can't we just have very large L1 cache?
+Because it would be too expensive and too power-hungry.
+
+L1 cache simply stores most recently used data while shared memory is programmable and we can manage what we put in it.
 
 ## Execution model of a GPU
 
@@ -22,6 +29,7 @@ Threads: Threads do the work in parallel. All threads execute the same instructi
 Blocks: Groups of threads. Each block runs on a single SM with its own shared memory.
 
 Warp: Threads always execute in groups of 32 called a **warp**. Threads in a warp are contiguous in memory.
+warp is essentially a scheduling unit inside the gpu. this decresaes the overhead of the scheduler deciding which threads to run.
 
 So, blocks are assigned to SMs, and each block is divided into warps. Each warp contains 32 threads.
 
