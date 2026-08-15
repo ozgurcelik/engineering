@@ -493,3 +493,16 @@ We then launch the kernel with the `add_kernel` function.
 There, the `(num_blocks,)` represents the launch grid: the number of triton kernels we will be running in parallel.
 The grid can be 1D, 2D, or 3D, and in this case, we are using 1D grid.
 Along with the grid, we also pass the pointers to the input and output tensors, and the number of elements and block size to the triton kernel.
+
+In the `add_kernel` function, we first need to identify which program we are running since we will have multiple programs running in parallel processing different slices of data independently.
+Since we are using a 1D grid, we learn the program id by looking at the axis=0.
+We then need to figure out the data we will be processing in our program.
+In this case, we do this in 2 steps:
+1. We find the starting index of the data we will be processing in our program.
+2. Using the starting index, we find the indices of the data we will be processing in our program.
+The `tl.arange(0, BLOCK_SIZE)` function gives us a list of indices from 0 to BLOCK_SIZE-1, so the offsets is basically a list of indices starting from the starting index and ending at the starting index + BLOCK_SIZE - 1.
+As we mentioned earlier, it's possible that some of the programs may not be processing the "full" amount of data, and we use the mask to mask off the indices that are out of the range of the data we will be processing.
+Mask is a boolean tensor that prevents us from accessing the data that is out of the range of the data we will be processing.
+With the `tl.load` function, we load the data from the input tensors at the indices specified by the offsets where the mask is true and we pass the cases where the mask is false to the `tl.load` function to ignore.
+We then add the data from the two input tensors and store the result in the output tensor at the indices specified by the offsets where the mask is true.
+
