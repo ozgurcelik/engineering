@@ -24,11 +24,10 @@ def add_kernel(
     out = x + y
     tl.store(output_ptr + offsets, out, mask=mask)
 # %%
-def add(x: torch.Tensor, y: torch.Tensor):
+def add(x: torch.Tensor, y: torch.Tensor, block_size: int = 32):
     output = torch.empty_like(x)
     assert x.is_cuda and y.is_cuda and output.is_cuda
     n_elements = output.numel()
-    block_size = 1024
     num_blocks = triton.cdiv(n_elements, block_size)
     add_kernel[(num_blocks,)](x,y,output,n_elements,block_size)
     return output
@@ -45,29 +44,58 @@ print(output_triton)
 print(f'The maximum difference between torch and triton is '
       f'{torch.max(torch.abs(output_torch - output_triton))}')
 # %%
-@triton.testing.perf_report(
+BLOCK_SIZES = [16, 64, 256, 1024, 4096]
+PROVIDERS = ['torch'] + [f'triton-{block_size}' for block_size in BLOCK_SIZES]
+LINE_NAMES = ['Torch'] + [f'Triton (BLOCK_SIZE={block_size})' for block_size in BLOCK_SIZES]
+COLORS = ['black', 'tab:blue', 'tab:orange', 'tab:green', 'tab:red', 'tab:purple']
+STYLES = [(color, '-') for color in COLORS]
+
+@triton.testing.perf_report([
     triton.testing.Benchmark(
         x_names=['size'],  # Argument names to use as an x-axis for the plot.
-        x_vals=[2**i for i in range(12, 28, 1)],  # Different possible values for `x_name`.
+        x_vals=[2**i for i in range(12, 30, 1)],  # Different possible values for `x_name`.
         x_log=True,  # x axis is logarithmic.
         line_arg='provider',  # Argument name whose value corresponds to a different line in the plot.
-        line_vals=['triton', 'torch'],  # Possible values for `line_arg`.
-        line_names=['Triton', 'Torch'],  # Label name for the lines.
-        styles=[('blue', '-'), ('green', '-')],  # Line styles.
+        line_vals=PROVIDERS,  # Possible values for `line_arg`.
+        line_names=LINE_NAMES,  # Label name for the lines.
+        styles=STYLES,  # Line styles.
         ylabel='GB/s',  # Label name for the y-axis.
         plot_name='vector-add-performance',  # Name for the plot. Used also as a file name for saving the plot.
-        args={},  # Values for function arguments not in `x_names` and `y_name`.
-    ))
-def benchmark(size, provider):
+        args={'metric': 'gbps'},  # Values for function arguments not in `x_names` and `y_name`.
+    ),
+    triton.testing.Benchmark(
+        x_names=['size'],
+        x_vals=[2**i for i in range(12, 30, 1)],
+        x_log=True,
+        y_log=True,
+        line_arg='provider',
+        line_vals=PROVIDERS,
+        line_names=LINE_NAMES,
+        styles=STYLES,
+        ylabel='Latency (us)',
+        plot_name='vector-add-latency',
+        args={'metric': 'latency'},
+    ),
+])
+def benchmark(size, provider, metric):
     x = torch.rand(size, device=DEVICE, dtype=torch.float32)
     y = torch.rand(size, device=DEVICE, dtype=torch.float32)
     quantiles = [0.5, 0.2, 0.8]
     if provider == 'torch':
         ms, min_ms, max_ms = triton.testing.do_bench(lambda: x + y, quantiles=quantiles)
-    if provider == 'triton':
-        ms, min_ms, max_ms = triton.testing.do_bench(lambda: add(x, y), quantiles=quantiles)
-    gbps = lambda ms: 3 * x.numel() * x.element_size() * 1e-9 / (ms * 1e-3)
-    return gbps(ms), gbps(max_ms), gbps(min_ms)
+    else:
+        block_size = int(provider.rsplit('-', maxsplit=1)[1])
+        ms, min_ms, max_ms = triton.testing.do_bench(
+            lambda: add(x, y, block_size), quantiles=quantiles
+        )
+
+    if metric == 'gbps':
+        gbps = lambda elapsed_ms: 3 * x.numel() * x.element_size() * 1e-9 / (elapsed_ms * 1e-3)
+        # Throughput is inversely proportional to latency, so the error-bound order is reversed.
+        return gbps(ms), gbps(max_ms), gbps(min_ms)
+
+    latency_us = lambda elapsed_ms: elapsed_ms * 1e3
+    return latency_us(ms), latency_us(min_ms), latency_us(max_ms)
 # %%
 benchmark.run(print_data=True, show_plots=True)
 # %%
