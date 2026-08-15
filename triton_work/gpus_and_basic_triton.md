@@ -14,8 +14,8 @@ issued instruction together, but threads can take different branches. When
 they do, the warp executes the required paths with different lanes masked off.
 This is the SIMT (Single Instruction, Multiple Threads) model.
 
-Compared with CPUs, GPUs dedicate relatively more hardware to arithmetic
-throughput and relatively less to sophisticated control logic and large,
+Compared with CPUs, GPUs dedicate more hardware to arithmetic
+throughput and less to sophisticated control logic and large,
 low-latency caches per execution unit.
 
 GPUs have many SMs (streaming multiprocessors) that schedule thread blocks.
