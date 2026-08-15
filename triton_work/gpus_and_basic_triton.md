@@ -3,9 +3,10 @@
 How is a GPU different from a CPU?
 CPUs optimize for a few fast threads while GPUs optimize for many threads.
 So, GPUs are optimized for throughput.
-A thread is the smallest unit of execution on a GPU. Each thread runs the **same instructions** but on **different data** — this is the SIMT (Single Instruction, Multiple Threads) model.
+A thread is the smallest unit of execution on a GPU. Each thread in a warp runs the **same instructions** but on **different data** — this is the SIMT (Single Instruction, Multiple Threads) model.
+This means these threads are executing the same kernel code, but they can take different paths through the code (different branches in if statements, etc.).
 
-GPUs have many more compute units and much less support for branching (control, cache).
+GPUs have many more compute units and much less support for branching (control, cache) compared to CPUs.
 
 CPUs optimize for latency (each thread finishes quickly) while GPUs optimize for throughput (total processed data per unit time).
 
@@ -28,7 +29,7 @@ Threads: Threads do the work in parallel. All threads execute the same instructi
 
 Blocks: Groups of threads. Each block runs on a single SM with its own shared memory.
 
-Warp: Threads always execute in groups of 32 called a **warp**. Threads in a warp are contiguous in memory.
+Warp: Threads always execute in groups of 32 called a **warp**.
 warp is essentially a scheduling unit inside the gpu. this decresaes the overhead of the scheduler deciding which threads to run.
 
 So, blocks are assigned to SMs, and each block is divided into warps. Each warp contains 32 threads.
@@ -98,7 +99,7 @@ Example from the lecture — elementwise ReLU (\(x = \max(0, x)\)) on a vector o
 - **Float32**: 1 read + 1 write = 8 bytes moved per element, 1 FLOP → 1/8 FLOP/byte
 - **Float16**: 1 read + 1 write = 4 bytes moved per element, 1 FLOP → 1/4 FLOP/byte
 
-Half the bytes means double the arithmetic intensity, pushing the operation closer to the compute-bound regime. Tensor cores (introduced in Volta/Turing) exploit this further — they perform matrix multiplications in low/mixed precision (e.g., FP16 inputs, FP32 accumulation), making matmuls >10x faster than standard floating point ops.
+Half the bytes means double the arithmetic intensity, pushing the operation closer to the compute-bound regime.
 
 #### FP16 vs BF16
 
@@ -116,8 +117,7 @@ If we need to do multiple operations in a row, we can fuse them together to redu
 ### Recomputation
 
 The idea is doing more compute instead of storing the intermediate results in memory.
-For example, in backward pass, we can store the activations and compute the jacobians.
-Instead, we can recompute the activations and jacobians in the backward pass.
+For example, instead of storing the activations of the forward pass, we can recompute them in the backward pass for gradient computation.
 
 ### Coalescing memory
 
@@ -125,8 +125,7 @@ DRAM (global memory) is read in burst mode.
 Each address space is partitioned into burst sections.
 Whenever a location is accessed, the entire burst section that contains the location is read into the cache.
 
-Memory accesses are coalesced if all the threads in a warp fall into the same burst section.
-Only one DRAM request is made for the entire burst section.
+Because of this, its more efficient if a warp can make use of the same burst section as much as possible.
 
 #### Row-major layout
 
@@ -188,7 +187,7 @@ $$
 
 tiles.
 
-An A100 has 108 SMs, so we can handle 108 tiles in one go. With 120 tiles, we need to do another cycle where tiles are very sparse to begin with. This is quite inefficient.
+An A100 has 108 SMs, so we can handle 108 tiles in one go assuming each SM can handle one block per SM. With 120 tiles, we need to do another cycle where tiles are very sparse to begin with. This is quite inefficient.
 
 
 ## More Notes
@@ -229,7 +228,7 @@ Basically mini GPI core that runs thousands of threads concurrently.
 ### Thread
 
 The smallest unit of execution.
-No OS involvement, instance context switch, no stack.
+No OS involvement, instance context switch.
 A thread owns a slice of the register file and executes the kernel code once.
 
 ### Warp
@@ -254,7 +253,7 @@ The ratio of active warps on an SM to the maximum possible warps on that SM.
 
 ### Stride
 
-The number of elements (not bytes) you need to skip in memory to advance by one unit along a given tensor dimension. For a contiguous (M, N) float tensor, stride(0) = N (advance one row = skip N elements) and stride(1) = 1 (advance one column = skip 1 element).
+In pytorch, the number of elements (not bytes) you need to skip in memory to advance by one unit along a given tensor dimension. For a contiguous (M, N) float tensor, stride(0) = N (advance one row = skip N elements) and stride(1) = 1 (advance one column = skip 1 element).
 
 ### Software Pipelining
 
@@ -269,7 +268,7 @@ So at any given moment, memory loads, arithmetic, and stores are all running con
 
 ### Persistent Kernel
 
-A kernel launch strategy where you launch just enough CTAs to fill the GPU (NUM_SM × occupancy) and have each CTA loop over many chunks of work, rather than launching one CTA per chunk. Benefits: (1) avoids the fixed cost of launching thousands of tiny CTAs; (2) keeps caches warm across iterations; (3) lets software pipelining span across chunks of work.
+A kernel launch strategy where you launch just enough CTAs to fill the GPU and have each CTA loop over many chunks of work, rather than launching one CTA per chunk. Benefits: (1) avoids the fixed cost of launching thousands of tiny CTAs; (2) keeps caches warm across iterations; (3) lets software pipelining span across chunks of work.
 
 #### Example
 
@@ -285,9 +284,9 @@ Register file, shared memory, warp slots, and block slots
 
 The number of resident programs is whatever is permitted by the tightest of these four constraints. Formally:
 
-max_blocks_per_SM = min(
-    register_file_size      // registers_per_block,
-    shared_memory_size      // shared_memory_per_block,
-    max_warps_per_SM        // warps_per_block,
-    hard_block_limit        // always 1 per block
+resident_blocks_per_SM = min(
+    floor(registers_per_SM / registers_per_block),
+    floor(shared_memory_per_SM / shared_memory_per_block),
+    floor(max_warps_per_SM / warps_per_block),
+    max_blocks_per_SM,
 )
