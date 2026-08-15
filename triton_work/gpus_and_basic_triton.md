@@ -434,3 +434,62 @@ resident_blocks_per_SM = min(
 This is a simplified model. Real allocation is rounded according to
 architecture-specific granularities, and a resource that a block does not use
 does not limit residency.
+
+
+### Vector Addition Example
+
+Triton is a python-based domain-specific language for writing GPU kernels thats meant to be more readable and accessible than CUDA.
+
+The key design principle of the triton is the block level programming model.
+This means that the kernels we write will be scheduled in the blocks instead of the threads like in CUDA.
+Since triton already handles and abstracts away the thread level details, our main focus will be on the block level, especially efficiently utilizing memory access patterns and parallelism.
+
+Now lets look at a simple vector addition example in triton.
+
+```python
+@triton.jit
+def add_kernel(
+    x_ptr, # pointer to the input vector x
+    y_ptr, # pointer to the input vector y
+    output_ptr, # pointer to the output vector
+    n_elements, # so that we will know where to stop
+    BLOCK_SIZE: tl.constexpr, # the size of the block
+):
+    # identify which program we are running
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    x = tl.load(x_ptr + offsets, mask=mask)
+    y = tl.load(y_ptr + offsets, mask=mask)
+    out = x + y
+    tl.store(output_ptr + offsets, out, mask=mask)
+
+def add(x: torch.Tensor, y: torch.Tensor):
+    output = torch.empty_like(x)
+    assert x.is_cuda and y.is_cuda and output.is_cuda
+    n_elements = output.numel()
+    block_size = 1024
+    num_blocks = triton.cdiv(n_elements, block_size)
+    add_kernel[(num_blocks,)](x,y,output,n_elements,block_size)
+    return output
+```
+
+First of all, we have 2 functions here: `add_kernel` and `add`.
+The `add` function is the CPU-side function that launches the `add_kernel` function which is the actual GPU kernel.
+The `@triton.jit` decorator is used to tell triton that the following function is a GPU kernel.
+Such functions are called triton kernels and compiled at the launch time.
+
+Now, lets look at the code in detail.
+In the `add` function, our inputs are the two input vectors we will be summing together.
+We first allocate an output tensor of the same size as the input tensors to which we will be writing the result.
+The size of the output tensor is of course dependent on the operation we are performing.
+Since we are adding two vectors, the size of the output tensor will be the same as the input tensors.
+
+Afterwards, we determine the block size and calculate how many programs we will be launching.
+In this implementation, we will launch one program per block.
+It's possible that the n_elements is not divisible by the block size, so the tail programs may not be doing the "full" amount of work.
+We then launch the kernel with the `add_kernel` function.
+There, the `(num_blocks,)` represents the launch grid: the number of triton kernels we will be running in parallel.
+The grid can be 1D, 2D, or 3D, and in this case, we are using 1D grid.
+Along with the grid, we also pass the pointers to the input and output tensors, and the number of elements and block size to the triton kernel.
