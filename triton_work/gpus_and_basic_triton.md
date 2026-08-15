@@ -506,3 +506,93 @@ Mask is a boolean tensor that prevents us from accessing the data that is out of
 With the `tl.load` function, we load the data from the input tensors at the indices specified by the offsets where the mask is true and we pass the cases where the mask is false to the `tl.load` function to ignore.
 We then add the data from the two input tensors and store the result in the output tensor at the indices specified by the offsets where the mask is true.
 
+Now we benchmark the performance of this kernel for different vector and block sizes with FP32 data type.
+We measure the performance in terms of throughput and latency.
+For throughput, we measure the number bytes processed per second.
+Since the addition operation reads 2 values from the input tensors and writes 1 value to the output tensor, we multiply the number of elements by 3.
+The full equation is `3 * x.numel() * x.element_size() * 1e-9 / (elapsed_ms * 1e-3)`.
+
+vector-add-performance:
+           size       Torch  Triton (BLOCK_SIZE=16)  Triton (BLOCK_SIZE=64)  Triton (BLOCK_SIZE=256)  Triton (BLOCK_SIZE=1024)  Triton (BLOCK_SIZE=4096)
+0        4096.0    9.365854                8.677966                9.365854                 8.486188                  9.365854                  8.126984
+1        8192.0   16.879121               17.860465               16.879121                18.450450                 16.695652                 13.900453
+2       16384.0   27.927273               27.551570               27.927273                30.266009                 27.927273                 26.597403
+3       32768.0   53.659389               44.846717               52.625267                52.512819                 55.601811                 42.965036
+4       65536.0   98.303995               57.757931               91.360591                99.497980                 93.267553                 89.367273
+5      131072.0  140.635194               72.176211              138.456339               144.564706                141.038735                145.420113
+6      262144.0  151.236923               83.308473              151.004606               153.121496                157.035145                158.045011
+7      524288.0  203.950206               89.286103              167.325960               164.870440                210.726687                204.056045
+8     1048576.0  178.329250              115.143780              175.268993               173.835544                183.146712                202.584235
+9     2097152.0  212.376990              148.285472              212.376990               209.939141                209.435955                213.356490
+10    4194304.0  216.558443              161.609458              218.271443               221.467754                216.290430                215.726790
+11    8388608.0  222.493755              178.633045              225.564893               224.646715                222.690641                222.438691
+12   16777216.0  227.411609              183.189384              227.551439               229.581666                226.886744                226.229990
+13   33554432.0  229.305540              179.366405              244.968158               232.577576                229.795493                229.860563
+14   67108864.0  231.075219              181.135098              232.163474               234.123556                231.230212                235.574395
+15  134217728.0  231.866143              179.863475              244.747778               245.075505                231.933458                236.311572
+16  268435456.0  238.529289              177.745455              246.315044               243.965398                232.164815                237.052545
+17  536870912.0  232.481433              181.384627              247.450964               246.287924                232.434990                237.304851
+vector-add-latency:
+           size         Torch  Triton (BLOCK_SIZE=16)  Triton (BLOCK_SIZE=64)  Triton (BLOCK_SIZE=256)  Triton (BLOCK_SIZE=1024)  Triton (BLOCK_SIZE=4096)
+0        4096.0      5.792000                5.888000                5.824000                 5.328000                  5.824000                  6.464000
+1        8192.0      5.824000                5.792000                5.984000                 5.344000                  5.792000                  6.624000
+2       16384.0      7.120000                7.232000                7.184000                 7.072000                  7.072000                  7.568000
+3       32768.0      7.392000                9.232000                7.424000                 6.944000                  7.328000                  8.608000
+4       65536.0      8.320000               13.024000                8.448000                 7.872000                  8.400000                  9.136000
+5      131072.0     10.784000               22.064000               11.360000                11.344000                 11.552000                 11.424000
+6      262144.0     20.000000               38.144000               22.879999                20.927999                 20.096000                 23.328001
+7      524288.0     30.432001               71.456000               37.728000                37.087999                 30.960000                 30.896001
+8     1048576.0     62.912002              109.536000               64.608000                65.087996                 63.552000                 57.151999
+9     2097152.0    120.863996              171.168000              116.927996               114.720002                118.624002                116.063997
+10    4194304.0    231.552005              313.887998              231.247999               231.552005                233.536005                231.232002
+11    8388608.0    456.191987              573.248029              454.784006               449.647993                455.199987                453.727990
+12   16777216.0    888.144016             1097.568035              823.983997               879.887998                887.647986                887.167990
+13   33554432.0   1757.951975             2262.207985             1755.328000              1739.008009               1756.176054               1754.335999
+14   67108864.0   3482.560039             4445.600033             3454.015970              3436.912060               3481.152058               3414.479971
+15  134217728.0   6949.424028             8961.568356             6581.056118              6898.399830               6941.584110               6814.399958
+16  268435456.0  13863.424301            18342.239380            13086.848259             13201.408386              13856.016159              13589.135647
+17  536870912.0  27691.680908            35732.128143            26050.304413             26206.592560              27711.135864              27164.543152
+
+Now, lets try to make sense to these results.
+First of all, we are using a L4 GPU, and looking at the https://images.nvidia.com/aem-dam/Solutions/geforce/ada/nvidia-ada-gpu-architecture.pdf, we see that we have following properties:
+
+Streaming Multiprocessors (SMs): 58
+Theoritical Memory Bandwidth: 300GB/s
+FP32 Peak: 30.3 TFLOPS/s
+
+Let us look at if we are in the memory-bound or compute-bound region.
+Since we are using FP32 data type, for each element-wise addition operation, we do 2 reads and 1 write totalling to 3 operations so 12 bytes of data.
+Each addition operation takes 1 FLOPS.
+So, our arithmetic intensity is 1 FLOPS / 12 bytes = 0.0833 FLOPS/byte.
+The L4's roofline transition point is approximately at AI_ridge = 30.3 TFLOPS/s / 300GB/s = 101 FLOPS/byte.
+So, we are firmly in the memory-bound region.
+
+But if we are in the memory-bound region, why are we not seeing 300GB/s of throughput?
+Let's look at the latency results we have for block size 64 for different vector sizes:
+
+| Elements | Data moved | Ideal at 300 GB/s | Observed |
+|---:|---:|---:|---:|
+| 4,096 | 49 KB | 0.16 µs | about 5.8 µs |
+| 131,072 | 1.57 MB | 5.24 µs | about 11.4 µs |
+| 1,048,576 | 12.58 MB | 41.9 µs | about 64.6 µs |
+| 536,870,912 | 6.44 GB | 21.5 ms | about 26.1 ms |
+
+At 4096 elements, theoritically the memory system only needs 0.16 µs, but we are seeing 5.8 µs.
+This is because we have multiple overheads such as:
+- python overhead
+- doing the torch.empty_like operation
+- kernel launch overhead
+- and insufficient work to occupy all 58 SMs for larger block sizes
+
+Looking at the largest vector size, lets calculate how close we got to the theoretical bandwidth.
+
+| Implementation | GB/s | Percentage of theoretical |
+|---|---:|---:|
+| Triton, block 16 | 181.4 | 60.5% |
+| Triton, block 64 | 247.5 | 82.5% |
+| Triton, block 256 | 246.3 | 82.1% |
+| Triton, block 1024 | 232.4 | 77.5% |
+| Triton, block 4096 | 237.3 | 79.1% |
+| Torch | 232.5 | 77.5% |
+
+Reaching near 80% of the theoretical bandwidth is pretty good, and tells us the triton implementation is efficient.
