@@ -1,73 +1,113 @@
-# GPUs
+# GPU Basics and Triton Fundamentals
 
-How is a GPU different from a CPU?
-CPUs optimize for a few fast threads while GPUs optimize for many threads.
-So, GPUs are optimized for throughput.
-A thread is the smallest unit of execution on a GPU. Each thread in a warp runs the **same instructions** but on **different data** — this is the SIMT (Single Instruction, Multiple Threads) model.
-This means these threads are executing the same kernel code, but they can take different paths through the code (different branches in if statements, etc.).
+These notes focus on NVIDIA GPUs and use CUDA-style terminology. Other GPU
+architectures may use different names and execution widths.
 
-GPUs have many more compute units and much less support for branching (control, cache) compared to CPUs.
+## CPU vs. GPU
 
-CPUs optimize for latency (each thread finishes quickly) while GPUs optimize for throughput (total processed data per unit time).
+CPUs generally optimize for low latency on a small number of powerful threads,
+while GPUs optimize for throughput across many lightweight threads.
 
-GPUs have many SMs (streaming multiprocessors) that independently execute blocks (jobs).
-An SM is like an independent core with its own compute unit and subcomponents.
-Each SM contains many SPs (streaming processors) that execute threads in parallel.
+All threads execute the same kernel code. On an NVIDIA GPU, threads within a
+block are grouped into warps of 32. The active lanes of a warp execute each
+issued instruction together, but threads can take different branches. When
+they do, the warp executes the required paths with different lanes masked off.
+This is the SIMT (Single Instruction, Multiple Threads) model.
 
-The closer to a memory to the SM, the faster the access is.
-L1 and shared memory are inside the SM.
-L2 cache is on the die, and global memory chips next to the GPU.
+Compared with CPUs, GPUs dedicate relatively more hardware to arithmetic
+throughput and relatively less to sophisticated control logic and large,
+low-latency caches per execution unit.
+
+GPUs have many SMs (streaming multiprocessors) that schedule thread blocks.
+An SM contains warp schedulers, a register file, shared memory/L1 cache, and
+execution pipelines for operations such as FP32, integer, and matrix arithmetic.
+Threads are not permanently assigned to individual execution units; schedulers
+issue instructions from ready warps to the appropriate pipelines.
+
+In general, storage closer to the execution pipelines has lower latency and
+higher bandwidth. Registers and L1/shared memory are inside an SM, L2 cache is
+shared across the GPU, and global memory usually resides in off-chip HBM or
+VRAM.
 
 Why can't we just have very large L1 cache?
 Because it would be too expensive and too power-hungry.
 
-L1 cache simply stores most recently used data while shared memory is programmable and we can manage what we put in it.
+L1 cache is managed automatically by the hardware, while shared memory is
+programmer-managed storage used for deliberate data reuse and communication
+within a thread block.
 
-## Execution model of a GPU
+## GPU Execution Model
 
-Threads: Threads do the work in parallel. All threads execute the same instructions but on different data (SIMT).
+Threads: Threads execute the kernel code on their assigned data. Within a warp,
+the active lanes execute each issued instruction together.
 
-Blocks: Groups of threads. Each block runs on a single SM with its own shared memory.
+Blocks: Groups of threads. Each block normally runs to completion on one SM and
+has its own logical shared-memory allocation. Multiple blocks may be resident on
+the same SM.
 
-Warp: Threads always execute in groups of 32 called a **warp**.
-warp is essentially a scheduling unit inside the gpu. this decresaes the overhead of the scheduler deciding which threads to run.
+Warp: On NVIDIA GPUs, threads in a block are partitioned into groups of 32 called
+**warps**. Threads in a warp have consecutive linear thread IDs, but the memory
+addresses they access are determined by the kernel. A warp is the primary
+scheduling unit within an SM.
 
 So, blocks are assigned to SMs, and each block is divided into warps. Each warp contains 32 threads.
 
-Each thread has its own registers.
-Each thread can access its own registers and shared memory within the block.
-The information that goes across blocks need to be read/written to global memory which is slow.
+Each thread has its own logical registers and can access the shared memory of its
+block. Independent blocks generally communicate through global memory and
+cannot assume a scheduling order. Thread-block clusters provide an advanced
+exception on supported GPUs by allowing access to distributed shared memory.
 
 ## Roofline Model
 
 There are two regimes of performance:
+
 - The memory-bound regime: the GPU is bounded by memory bandwidth, how fast can it read/write data.
 - The compute-bound regime: the GPU is utilizing its compute units to the fullest.
 
-In the memory-bound regime, the throughput increases as we increase the operational intensity.
-While in the compute-bound regime, the throughput does not increase as we increase the operational intensity.
+Arithmetic intensity is the amount of computation performed per byte moved:
 
-We want to be on the compute-bound regime where we are utilizing our compute units to the fullest.
+$$
+\text{arithmetic intensity} = \frac{\text{FLOPs}}{\text{bytes moved}}
+$$
+
+The simplified roofline bound is:
+
+$$
+\text{attainable performance}
+\leq
+\min(\text{peak compute},\ \text{memory bandwidth} \times \text{arithmetic intensity})
+$$
+
+In the memory-bound regime, performance can increase with arithmetic intensity.
+In the compute-bound regime, increasing arithmetic intensity alone does not
+raise the compute ceiling. The goal is to approach the relevant roofline, not to
+make every algorithm compute-bound. For example, a well-optimized vector
+addition is still naturally memory-bound.
 
 ## How Do We Make a GPU Fast?
 
-Additional source: https://www.thonking.ai/p/what-shapes-do-matrix-multiplications
+Additional source: [What Shapes Do Matrix Multiplications Like?](https://www.thonking.ai/p/what-shapes-do-matrix-multiplications)
 
-There are 6 main techniques to make a GPU fast:
+Common GPU optimization techniques include:
+
 - Control divergence (not a memory bottleneck)
 - Low precision computation
 - Operator fusion
 - Recomputation
-- Coalescing memory
+- Coalesced memory access
 - Tiling
 
-While the control divergence is not memory based, the other 5 are.
+These techniques affect different bottlenecks. Coalescing and tiling improve
+memory access and reuse. Fusion reduces memory traffic and kernel-launch
+overhead. Low precision can improve both compute throughput and memory traffic.
+Recomputation explicitly trades additional compute for lower memory use.
 
 ### Control divergence
 
 GPUs are optimized for SIMT (Single Instruction, Multiple Threads) execution.
-So every thread in a warp executes the same instruction at the same time.
+The active lanes in a warp execute each issued instruction together.
 Conditionals are fine, but if we do something like:
+
 ```
 if (thread_id <= 3) {
     A;
@@ -75,61 +115,89 @@ if (thread_id <= 3) {
     B;
 }
 ```
-then when we do $A$, we will have 4 threads executing $A$ and the rest will be idle.
-And when we do $B$, we will the initial 4 threads will be idle while the rest will execute $B$.
-This is called control divergence.
+
+then, while path $A$ executes, four lanes are active and the others are masked
+off. While path $B$ executes, the initial four lanes are masked off and the
+remaining lanes are active. This is called control divergence. The precise
+instruction sequence depends on compiler decisions such as predication, but the
+important effect is reduced lane utilization.
 
 ### Low precision computation
 
-Arithmetic intensity: #FLOPs / #bytes moved.
-
 #### Bits and bytes
 
-A **bit** is the smallest unit of data — a single 0 or 1. A **byte** is 8 bits grouped together. The relationship is always: **1 byte = 8 bits**.
+A **bit** is the smallest unit of data—a single 0 or 1. A **byte** is 8 bits
+grouped together. The relationship is always: **1 byte = 8 bits**.
 
 The number in a data type's name tells you how many **bits** it uses:
+
 - **float32** (FP32): 32 bits = 32 / 8 = **4 bytes** per number
 - **float16** (FP16): 16 bits = 16 / 8 = **2 bytes** per number
 - **bfloat16** (BF16): 16 bits = **2 bytes** per number (different exponent/mantissa split than FP16)
 - **int8**: 8 bits = **1 byte** per number
 
-Why does this matter for GPUs? Every number that a thread reads from or writes to memory costs bytes of bandwidth. A float32 value costs 4 bytes per read/write, while a float16 value costs only 2. So switching from float32 to float16 **halves your memory traffic** for the same operation, which directly helps in the memory-bound regime.
+Why does this matter for GPUs? Values transferred to or from global memory
+consume bandwidth. An FP32 value uses 4 bytes, while an FP16 value uses 2.
+Assuming the same access pattern and no additional conversions, storing the
+tensors in FP16 halves the bytes transferred by those tensor loads and stores.
+This directly helps in the memory-bound regime.
 
 Example from the lecture — elementwise ReLU (\(x = \max(0, x)\)) on a vector of size \(n\):
-- **Float32**: 1 read + 1 write = 8 bytes moved per element, 1 FLOP → 1/8 FLOP/byte
-- **Float16**: 1 read + 1 write = 4 bytes moved per element, 1 FLOP → 1/4 FLOP/byte
 
-Half the bytes means double the arithmetic intensity, pushing the operation closer to the compute-bound regime.
+- **Float32**: 1 read + 1 write = 8 bytes moved per element, 1 operation → 1/8 operation/byte
+- **Float16**: 1 read + 1 write = 4 bytes moved per element, 1 operation → 1/4 operation/byte
+
+Half the bytes means double the operational intensity. The operation may still
+remain memory-bound, but it can process more elements per unit of memory
+bandwidth.
+
+Tensor Cores, introduced with NVIDIA Volta, accelerate supported matrix
+multiply-accumulate operations in low or mixed precision. The actual speedup
+depends on the GPU, data type, matrix shapes, alignment, and implementation.
 
 #### FP16 vs BF16
 
-Both are 16-bit (2 bytes), but they split those 16 bits differently. A floating-point number is stored as three fields: **sign** (positive/negative), **exponent** (the scale/range), and **mantissa** (the precision/significant digits).
+Both are 16-bit (2 bytes), but they split those 16 bits differently. A
+floating-point number is stored as three fields: **sign** (positive/negative),
+**exponent** (the scale/range), and **fraction** (the precision/significant
+digits).
 
-- **FP16**: 1 sign + 5 exponent + 10 mantissa — more precision, smaller range (max ~65,504)
-- **BF16**: 1 sign + 8 exponent + 7 mantissa — less precision, much larger range (max ~3.4 × 10³⁸, same as FP32)
+- **FP16**: 1 sign + 5 exponent + 10 fraction bits — more precision, smaller range (max ~65,504)
+- **BF16**: 1 sign + 8 exponent + 7 fraction bits — less precision, much larger
+  range (max ~3.4 × 10³⁸, approximately the same range as FP32)
 
-BF16 keeps the same 8 exponent bits as FP32, so it can represent the same range of magnitudes. This matters for training because gradients and activations can span a huge dynamic range. FP16's narrow range causes values to overflow or underflow more easily, which is why FP16 training often requires loss scaling. BF16 avoids this — you can typically drop it in as a replacement for FP32 without any scaling tricks, at the cost of slightly less precision (7 vs 10 mantissa bits). In practice this precision loss rarely affects model quality, which is why BF16 has become the default for LLM training.
+BF16 keeps the same 8 exponent bits as FP32, so it covers approximately the same
+range of magnitudes. This matters for training because gradients and activations
+can span a large dynamic range. FP16 values overflow or underflow more easily,
+which is why FP16 training often requires loss scaling. BF16 usually needs less
+loss scaling, but it is not a universal drop-in replacement for FP32: sensitive
+operations and accumulation may still use FP32, and numerical behavior depends
+on the model and hardware.
 
 ### Operator fusion
 
-If we need to do multiple operations in a row, we can fuse them together to reduce the number of memory reads and writes.
+If we need to do multiple operations in a row, we can fuse them to reduce the
+number of global memory reads and writes.
 
 ### Recomputation
 
 The idea is doing more compute instead of storing the intermediate results in memory.
-For example, instead of storing the activations of the forward pass, we can recompute them in the backward pass for gradient computation.
+For example, instead of storing all forward-pass activations, we can recompute
+selected activations during the backward pass before calculating gradients.
 
-### Coalescing memory
+### Coalesced Memory Access
 
-DRAM (global memory) is read in burst mode.
-Each address space is partitioned into burst sections.
-Whenever a location is accessed, the entire burst section that contains the location is read into the cache.
-
-Because of this, its more efficient if a warp can make use of the same burst section as much as possible.
+The GPU combines a warp's memory requests into the minimum number of memory
+transactions needed to cover the requested addresses. On modern NVIDIA GPUs,
+global-memory coalescing is commonly described in terms of 32-byte segments. For
+example, 32 consecutive FP32 accesses cover 128 bytes and normally require four
+32-byte transactions. Strided or scattered addresses may require many more.
 
 #### Row-major layout
 
-A 2D matrix is stored in memory as a flat 1D array. In **row-major** order (the default in C/CUDA), rows are stored one after another:
+A 2D matrix is stored in memory as a flat 1D array. In **row-major** order (the
+default in C/CUDA), rows are stored one after another:
+
 ```
 Matrix:          Memory (flat):
 | 1  2  3 |      [1, 2, 3, 4, 5, 6, 7, 8, 9]
@@ -142,32 +210,56 @@ Elements in the same row are adjacent in memory. Elements in the same column are
 
 Coalescing is about what all 32 threads in a warp access **simultaneously**, not what a single thread does over time.
 
-Consider \(C = A \times B\), where each thread computes one element of \(C\). Each element \(C[i][j]\) is the dot product of row \(i\) of \(A\) and column \(j\) of \(B\), computed over steps \(k = 0, 1, 2, \ldots\). At each step, every thread reads one element from \(A\) and one from \(B\). Whether those reads are coalesced depends on how threads are assigned.
+Consider \(C = A \times B\), where each thread computes one element of \(C\).
+Each element \(C[i][j]\) is the dot product of row \(i\) of \(A\) and column
+\(j\) of \(B\), computed over steps \(k = 0, 1, 2, \ldots\). At each step,
+every thread reads one element from \(A\) and one from \(B\). Whether those
+reads are coalesced depends on how threads are assigned.
 
 **Bad: threads along a column of C** (thread 0 does `C[0][0]`, thread 1 does `C[1][0]`, etc.):
-- **A**: each thread reads from a different row — `A[0][k]`, `A[1][k]`, `A[2][k]`, ... These addresses are each \(N\) apart, scattered across memory. **Not coalesced.**
-- **B**: all threads compute the same column, so they all read `B[k][0]` — the exact same address. This is a **broadcast** (one read serves all threads, fine).
+
+- **A**: each thread reads from a different row — `A[0][k]`, `A[1][k]`,
+  `A[2][k]`, ... These addresses are each \(N\) apart, scattered across memory.
+  **Not coalesced.**
+- **B**: all threads compute the same column, so they all read `B[k][0]` — the
+  exact same address. This is a **broadcast** (one read serves all threads,
+  fine).
 
 **Good: threads along a row of C** (thread 0 does `C[0][0]`, thread 1 does `C[0][1]`, etc.):
-- **A**: all threads compute the same row, so they all read `A[0][k]` — a **broadcast** (fine).
-- **B**: each thread reads an adjacent column — `B[k][0]`, `B[k][1]`, `B[k][2]`, ... These addresses are contiguous in row-major memory. One DRAM burst serves the whole warp. **Coalesced.**
 
-In both cases one matrix is broadcast (all threads read the same address) and the other is read by all 32 threads at different addresses. The question is whether those 32 addresses are contiguous (coalesced) or strided (not coalesced).
+- **A**: all threads compute the same row, so they all read `A[0][k]` — a **broadcast** (fine).
+- **B**: each thread reads an adjacent column — `B[k][0]`, `B[k][1]`,
+  `B[k][2]`, ... These addresses are contiguous in row-major memory and can be
+  served by the minimum number of transactions. **Coalesced.**
+
+In both cases, one matrix is broadcast (all threads read the same address) and
+the other is read by all 32 threads at different addresses. The question is
+whether those 32 addresses are contiguous (coalesced) or strided (not
+coalesced).
 
 ### Tiling
 
-Idea of grouping and ordering threads to minimize the number of global memory accesses.
-Cut the matrix into smaller tiles and load them into the shared memory.
+Tiling groups work to increase data reuse and reduce global-memory accesses. For
+matrix multiplication, we divide the matrices into smaller tiles, load input
+tiles into shared memory, and reuse them across multiple multiply-accumulate
+operations.
 
-Non-tiled matrix multiplication: each input is read $N$ times from global memory.
+For a square $N \times N$ matrix multiplication in a simplified implementation,
+each input element may be read roughly $N$ times from global memory.
 
-Tiled matrix multiplication: each input is read $\frac{N}{T}$ times from global memory, and $T$ times from shared memory within each tile. This is a factor of $T$ reduction in global memory accesses.
+With tile width $T$, each input element is read roughly $\frac{N}{T}$ times from
+global memory and reused $T$ times within a tile. This gives an approximate
+factor-of-$T$ reduction in global-memory reads. Caching and implementation
+details can change the exact traffic.
 
 #### Complexities of tiling
 
-Tile sizes may not divide the matrix size and lead to low utilization.
+Tile sizes may not divide the matrix dimensions, requiring masks and creating
+partially filled boundary tiles.
 
-Loading tiles are fast if burst align with the matrix.
+Tile loads are most efficient when addresses are aligned and accesses are
+coalesced. Tile size also affects register use, shared-memory use, occupancy,
+and the availability of hardware-specific matrix instructions.
 
 ### Wave Quantization
 
@@ -187,19 +279,30 @@ $$
 
 tiles.
 
-An A100 has 108 SMs, so we can handle 108 tiles in one go assuming each SM can handle one block per SM. With 120 tiles, we need to do another cycle where tiles are very sparse to begin with. This is quite inefficient.
+Assume this particular $256 \times 128$ matmul kernel permits one resident thread
+block per SM. An A100 has 108 SMs, so one scheduling wave can execute at most
+108 tiles. The $1792 \times 1792$ case completes in one underfilled wave of 98
+tiles. The $1793 \times 1793$ case requires 120 tiles: 108 in the first wave and
+only 12 in the tail wave, leaving most SMs idle during the tail.
+
+Separately, 22 of the 120 tiles are partially filled boundary tiles. That is
+**tile quantization**; the underfilled final scheduling wave is **wave
+quantization**. If the kernel permitted two resident blocks per SM, the wave
+capacity would instead be 216 blocks, so this particular 108-block boundary
+would not apply.
 
 
-## More Notes
+## Reference: GPU and Triton Terms
 
 ### Registers
 
-Smallest, fastest storage, physically inside the GPU core.
-The read/write happens in the same cycle arithmetic instruction that uses it.
+Registers are the lowest-latency, highest-bandwidth storage available to GPU
+threads and reside in the register file of each SM. Exact access latency and
+throughput depend on the architecture and instruction.
 
 Only the thread that owns it can see it.
 Threads cannot access each other's registers directly:
-They must go through the shared memory or warp shuffles.
+they must use shared memory or, within a warp, warp-shuffle instructions.
 
 ### Register File
 
@@ -207,86 +310,127 @@ Physical block of storage on each SM that holds all the registers for all the th
 
 ### SRAM (Static RAM)/Shared Memory/L1 Cache
 
-Static means it holds its value as long as it has power - no refresh needed.
-Its fast but expensive per byte.
+Static means it holds its value as long as it has power—no refresh is needed.
+It is fast but expensive per byte.
 
 On a GPU, SRAM shows up as:
-- Shared memory: A small pool on each SM that all threads in a program can read/write.
-Programmer managed, so you can put things there deliberately.
+
+- Shared memory: A small pool on each SM allocated per thread block. It is
+  programmer-managed in CUDA; in Triton, the compiler may manage shared-memory
+  staging for blocked operations.
 - L1 Cache: Managed automatically by the hardware to cache recent DRAM accesses.
 
-All threads within the same program can see it.
-Different programs cannnot access each other's shared memory.
+All threads within the same CUDA block can access that block's shared-memory
+allocation. Different blocks cannot normally access one another's shared
+memory, except through distributed shared memory in a supported block cluster.
 
 ### SM (Streaming Multiprocessor)
 
-Fundemental execution unit on an NVIDIA GPU.
+Fundamental processing unit on an NVIDIA GPU.
 Each SM has its own register file, shared memory, warp schedulers,
 arithmetic units (FP32, INT ...).
-Basically mini GPI core that runs thousands of threads concurrently.
+It keeps many warps resident and issues instructions from ready warps to hide
+latency.
 
 ### Thread
 
 The smallest unit of execution.
-No OS involvement, instance context switch.
-A thread owns a slice of the register file and executes the kernel code once.
+GPU threads are lightweight. The state of resident warps is kept on-chip, so an
+SM can switch among ready warps without an OS-style context switch. A thread has
+thread-local state and executes the kernel code once; compiler-generated local
+memory and stack frames may reside in device memory.
 
 ### Warp
 
-A group of 32 threads that execute same instruction at the same time but on different data.
+On NVIDIA GPUs, a group of 32 threads whose active lanes execute each issued
+instruction together on different data.
 
 ### Warp Shuffle
 
-A hardware instruction that lets threads within the same warp directly read each others registers without going through the shared memory.
+A hardware instruction that lets threads within the same warp exchange values
+from one another's registers without going through shared memory.
 
 ### CTA/Block/Program
 
-Group of threads guaranteed to run on the sane SM.
+A CUDA CTA is another name for a CUDA thread block: a group of threads that runs
+on the same SM. A Triton program instance is a higher-level blocked computation
+that usually maps approximately to a CTA on NVIDIA GPUs, but the two are not
+semantic synonyms.
 
 ### Grid
 
-Collection of programs launced for a kernel
-
-### Occupancy
-
-The ratio of active warps on an SM to the maximum possible warps on that SM.
+In CUDA, a grid is the collection of thread blocks launched for a kernel. In
+Triton, the launch grid specifies the number and arrangement of program
+instances.
 
 ### Stride
 
-In pytorch, the number of elements (not bytes) you need to skip in memory to advance by one unit along a given tensor dimension. For a contiguous (M, N) float tensor, stride(0) = N (advance one row = skip N elements) and stride(1) = 1 (advance one column = skip 1 element).
+In PyTorch, the number of elements—not bytes—you skip in memory to advance by
+one unit along a tensor dimension. For a contiguous $(M, N)$ tensor,
+`stride(0) = N` (advance one row) and `stride(1) = 1` (advance one column).
+Other APIs may express strides in bytes.
+
+## Advanced Scheduling and Resource Use
+
+### Occupancy
+
+The ratio of resident warps on an SM to the maximum number of resident warps
+supported by that SM. High occupancy can help hide latency, but maximum
+occupancy does not necessarily produce maximum performance.
 
 ### Software Pipelining
 
-A compiler transformation that rewrites a loop so that multiple iterations overlap in time. Instead of load → compute → store; load → compute → store; ..., the compiler emits something like:
+A compiler transformation that rewrites a loop so that multiple iterations
+overlap in time. Instead of load → compute → store; load → compute → store; ...,
+the compiler may produce a schedule like:
 
+```text
 load iteration 0
 load iteration 1 | compute iteration 0
 load iteration 2 | compute iteration 1 | store iteration 0
 load iteration 3 | compute iteration 2 | store iteration 1
 ...
-So at any given moment, memory loads, arithmetic, and stores are all running concurrently on different hardware units for different iterations. This hides DRAM latency. The cost is that you now need register/SRAM space to hold num_stages iterations' worth of live data simultaneously.
+```
+
+This can overlap memory operations and arithmetic from different iterations,
+helping to hide latency. More stages generally increase the amount of live data
+and may consume additional registers or shared memory, potentially reducing
+occupancy. In Triton, `num_stages` is a compiler hint; the exact generated
+pipeline depends on the loop, operations, target, and compiler version.
 
 ### Persistent Kernel
 
-A kernel launch strategy where you launch just enough CTAs to fill the GPU and have each CTA loop over many chunks of work, rather than launching one CTA per chunk. Benefits: (1) avoids the fixed cost of launching thousands of tiny CTAs; (2) keeps caches warm across iterations; (3) lets software pipelining span across chunks of work.
+A kernel strategy in which a bounded number of CTAs or Triton programs remain
+resident and loop over multiple work items, instead of launching one CTA per
+item in the grid. The number launched is often near the number of SMs multiplied
+by the desired number of resident programs per SM. Persistent kernels can
+reduce per-CTA scheduling overhead and may improve locality or enable overlap
+across work items. They can also reduce dynamic load balancing, so they are not
+always faster.
 
 #### Example
 
 Every SM has a fixed budget of four things:
-Register file, shared memory, warp slots, and block slots
+register file, shared memory, warp slots, and block slots.
 
 | Resource | Example: H100 SM | Consumed by one program based on… |
 | --- | --- | --- |
 | Register file | 65,536 × 32-bit regs | registers_per_thread × threads_per_block |
-| Shared memory | ~228 KB configurable | shared_memory_per_block (explicitly allocated in the kernel) |
+| Shared memory | ~228 KB configurable | generated shared memory per block, including compiler-managed storage |
 | Warp slots | 64 warps = 2048 threads | threads_per_block / 32 |
 | Block slots | 32 blocks | 1 per block |
 
 The number of resident programs is whatever is permitted by the tightest of these four constraints. Formally:
 
+```text
 resident_blocks_per_SM = min(
     floor(registers_per_SM / registers_per_block),
     floor(shared_memory_per_SM / shared_memory_per_block),
     floor(max_warps_per_SM / warps_per_block),
-    max_blocks_per_SM,
+    architectural_block_limit_per_SM,
 )
+```
+
+This is a simplified model. Real allocation is rounded according to
+architecture-specific granularities, and a resource that a block does not use
+does not limit residency.
