@@ -56,6 +56,7 @@ At inner-loop step k, the program loads A[i,k] and B[k,j].
 The address of A[i,k] is `a_ptr + i * a_row_stride + k * a_col_stride`.
 Similarly, the address of B[k,j] is `b_ptr + k * b_row_stride + j * b_col_stride`.
 Passing both row and column strides allows the kernels to handle strided inputs, including transposed matrices.
+The wrapper verifies that A and B are compatible 2D matrices on the same device with the same FP16 or FP32 dtype.
 The scalar accumulator starts at zero and remains FP32 for both supported input dtypes.
 Finally, `tl.store` converts the FP32 accumulator to C's element type, so the output has the same dtype as the inputs.
 
@@ -118,19 +119,18 @@ def matrix_multiplication_naive_blocked(a: torch.Tensor, b: torch.Tensor):
     return c
 ```
 
-This implementation loads the inner loop in blocks of size BLOCK_SIZE_K.
-Instead of loading individual A[i,k] and B[k,j] values, it A[i,k_start:k_end] and B[k_start:k_end,j].
-Since the K may not be divisible by BLOCK_SIZE_K, we need to use a mask to prevent out-of-bounds loads.
+This implementation performs the same dot product but traverses K in blocks of size BLOCK_SIZE_K.
+Instead of loading individual A[i,k] and B[k,j] values, it loads logical vectors A[i,k_start:k_end] and B[k_start:k_end,j].
+The `k_mask` prevents out-of-bounds loads in the final block, and `other=0.0` makes masked lanes contribute zero to the reduction when K is not divisible by BLOCK_SIZE_K.
 
-While the total number of FLOPs is the same, there are 2 significant differences between the two implementations.
-First, instead of loading, multiplying, and adding 1 element at a time, we are loading BLOCK_SIZE_K elements at a time, multiplying, and adding them.
-This reduces the instruction count, and increases the parallelism.
-Second, the access to A matrix is coalesced since we are loading contiguous values from the A matrix.
-On the other hand, the access to B matrix is not coalesced since we are loading values from different rows of the B matrix.
+Both kernels perform the same number of FLOPs and request the same input elements, but they do not issue the same load instructions or necessarily generate the same physical memory transactions.
+The blocked kernel exposes a 128-element logical vector to the Triton compiler, which maps the loads and multiplications across the threads and instructions of one program.
+Then `tl.sum` reduces the 128 products to a scalar before adding it to the FP32 accumulator.
+For the row-major contiguous matrices used by the benchmark, the blocked A loads walk along adjacent columns and can be coalesced.
+The blocked B loads walk down a column with stride N, so they remain a strided, uncoalesced access pattern.
 
-Let's benchmark these two implementations with FP16 matrices and compare them with the torch matmul function.
+The following FP16 benchmark compares square matrices from 128x128 through 1024x1024. The TFLOPS axis is logarithmic so all three implementations remain visible.
 
 ![FP16 matrix multiplication performance: naive Triton, blocked naive Triton, and PyTorch](figures/matmul_naive_vs_naiveblocked_fp16.png)
 
-We can see that the blocked naive Triton implementation is ~10x faster than the naive Triton implementation while performing way worse than the torch matmul function as one can expect.
-
+We can see that the naive blocked implementation is 10x faster than the naive implementation while performing way worse than the torch matmul function as one can expect.

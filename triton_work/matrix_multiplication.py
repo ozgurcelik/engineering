@@ -18,24 +18,34 @@ def matrix_multiplication_kernel_naive(
     a_ptr, b_ptr, c_ptr,
     M, N, K, # a is MxK, b is KxN, c is MxN
     a_row_stride, b_row_stride, c_row_stride,
+    a_col_stride, b_col_stride, c_col_stride,
 ):
     row = tl.program_id(0)
     col = tl.program_id(1)
-    # acc is fp32 even though A and B are fp16: we want to avoid losing low
-    # bits across the K accumulation. Cast back to fp16 at the store.
+    # Accumulate in fp32 for both fp16 and fp32 inputs. tl.store casts the
+    # result to c_ptr's element type, so the output dtype matches the input.
     acc = tl.zeros([], dtype=tl.float32)
     for k in range(K):
-        a_val = tl.load(a_ptr + row * a_row_stride + k)
-        b_val = tl.load(b_ptr + k * b_row_stride + col)
+        a_val = tl.load(a_ptr + row * a_row_stride + k * a_col_stride)
+        b_val = tl.load(b_ptr + k * b_row_stride + col * b_col_stride)
         acc += a_val.to(tl.float32) * b_val.to(tl.float32)
-    c_m_n_ptr = c_ptr + row * c_row_stride + col
-    tl.store(c_m_n_ptr, acc.to(tl.float16))
+    c_m_n_ptr = c_ptr + row * c_row_stride + col * c_col_stride
+    tl.store(c_m_n_ptr, acc)
 
 def matrix_multiplication_naive(a: torch.Tensor, b: torch.Tensor):
+    assert a.ndim == 2 and b.ndim == 2, "expected two 2D matrices"
     M, K = a.shape
-    K, N = b.shape
-    c = torch.empty(M, N, device=DEVICE, dtype=a.dtype)
-    matrix_multiplication_kernel_naive[(M, N)](a, b, c, M, N, K, a.stride(0), b.stride(0), c.stride(0))
+    K_b, N = b.shape
+    assert K == K_b, "incompatible matrix dimensions"
+    assert a.device == b.device, "A and B must be on the same device"
+    assert a.dtype == b.dtype, "A and B must have the same dtype"
+    assert a.dtype in (torch.float16, torch.float32), "only fp16 and fp32 are supported"
+    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+    matrix_multiplication_kernel_naive[(M, N)](
+        a, b, c, M, N, K,
+        a.stride(0), b.stride(0), c.stride(0),
+        a.stride(1), b.stride(1), c.stride(1),
+    )
     return c
 
 # %%
@@ -46,6 +56,7 @@ def matrix_multiplication_kernel_naive_blocked(
     a_ptr, b_ptr, c_ptr,
     M, N, K, # a is MxK, b is KxN, c is MxN
     a_row_stride, b_row_stride, c_row_stride,
+    a_col_stride, b_col_stride, c_col_stride,
     BLOCK_SIZE_K: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -53,49 +64,63 @@ def matrix_multiplication_kernel_naive_blocked(
     acc = tl.zeros([], dtype=tl.float32)
     for k in range(0, K, BLOCK_SIZE_K):
         a_start_ptr = a_ptr + row * a_row_stride
-        b_start_ptr = b_ptr + col
+        b_start_ptr = b_ptr + col * b_col_stride
 
         k_offsets = tl.arange(0, BLOCK_SIZE_K) + k
         k_mask = k_offsets < K
 
-        a_offsets = k_offsets
+        a_offsets = k_offsets * a_col_stride
         b_offsets = k_offsets * b_row_stride
 
         a_ptrs = a_start_ptr + a_offsets
         b_ptrs = b_start_ptr + b_offsets
 
-        a_vals = tl.load(a_ptrs, mask=k_mask).to(tl.float32)
-        b_vals = tl.load(b_ptrs, mask=k_mask).to(tl.float32)
+        a_vals = tl.load(a_ptrs, mask=k_mask, other=0.0).to(tl.float32)
+        b_vals = tl.load(b_ptrs, mask=k_mask, other=0.0).to(tl.float32)
 
         acc += tl.sum(a_vals * b_vals)
 
-    c_m_n_ptr = c_ptr + row * c_row_stride + col
-    tl.store(c_m_n_ptr, acc.to(tl.float16))
+    c_m_n_ptr = c_ptr + row * c_row_stride + col * c_col_stride
+    tl.store(c_m_n_ptr, acc)
 
 def matrix_multiplication_naive_blocked(a: torch.Tensor, b: torch.Tensor):
+    assert a.ndim == 2 and b.ndim == 2, "expected two 2D matrices"
     M, K = a.shape
-    K, N = b.shape
+    K_b, N = b.shape
+    assert K == K_b, "incompatible matrix dimensions"
+    assert a.device == b.device, "A and B must be on the same device"
+    assert a.dtype == b.dtype, "A and B must have the same dtype"
+    assert a.dtype in (torch.float16, torch.float32), "only fp16 and fp32 are supported"
     BLOCK_SIZE_K = 128
-    c = torch.empty(M, N, device=DEVICE, dtype=a.dtype)
-    matrix_multiplication_kernel_naive_blocked[(M, N)](a, b, c, M, N, K, a.stride(0), b.stride(0), c.stride(0), BLOCK_SIZE_K)
+    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+    matrix_multiplication_kernel_naive_blocked[(M, N)](
+        a, b, c, M, N, K,
+        a.stride(0), b.stride(0), c.stride(0),
+        a.stride(1), b.stride(1), c.stride(1),
+        BLOCK_SIZE_K,
+    )
     return c
 
 # %%
 @triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=['M', 'N', 'K'],
-        x_vals=[128, 256, 512, 768, 1024],
-        line_arg='provider',
-        line_vals=['triton_naive', 'triton_naive_blocked', 'torch'],
-        line_names=['Triton Naive', 'Triton Naive Blocked', 'Torch'],
-        styles=[('blue', '-'), ('orange', '-'), ('green', '-')],
-        ylabel='TFLOPS',
-        plot_name='matmul-naive-vs-naive-blocked-vs-torch-fp16',
-        args={},
-    ))
-def benchmark_naive(M, N, K, provider):
-    a = torch.randn((M, K), device=DEVICE, dtype=torch.float16)
-    b = torch.randn((K, N), device=DEVICE, dtype=torch.float16)
+    [
+        triton.testing.Benchmark(
+            x_names=['M', 'N', 'K'],
+            x_vals=[128, 256, 512, 768, 1024],
+            line_arg='provider',
+            line_vals=['triton_naive', 'triton_naive_blocked', 'torch'],
+            line_names=['Triton Naive', 'Triton Naive Blocked', 'Torch'],
+            styles=[('blue', '-'), ('orange', '-'), ('green', '-')],
+            ylabel='TFLOPS',
+            y_log=True,
+            plot_name=f'matmul_naive_vs_naiveblocked_{dtype_name}',
+            args={'dtype': dtype},
+        )
+        for dtype, dtype_name in [(torch.float16, 'fp16'), (torch.float32, 'fp32')]
+    ])
+def benchmark_naive(M, N, K, provider, dtype):
+    a = torch.randn((M, K), device=DEVICE, dtype=dtype)
+    b = torch.randn((K, N), device=DEVICE, dtype=dtype)
     stream = getattr(torch, DEVICE.type).Stream()
     getattr(torch, DEVICE.type).set_stream(stream)
 
