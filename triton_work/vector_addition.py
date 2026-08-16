@@ -24,12 +24,19 @@ def add_kernel(
     out = x + y
     tl.store(output_ptr + offsets, out, mask=mask)
 # %%
-def add(x: torch.Tensor, y: torch.Tensor, block_size: int = 32):
+def add(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    block_size: int = 32,
+    num_warps: int = 4,
+):
     output = torch.empty_like(x)
     assert x.is_cuda and y.is_cuda and output.is_cuda
     n_elements = output.numel()
     num_blocks = triton.cdiv(n_elements, block_size)
-    add_kernel[(num_blocks,)](x,y,output,n_elements,block_size)
+    add_kernel[(num_blocks,)](
+        x, y, output, n_elements, block_size, num_warps=num_warps
+    )
     return output
 
 # %%
@@ -98,4 +105,69 @@ def benchmark(size, provider, metric):
     return latency_us(ms), latency_us(min_ms), latency_us(max_ms)
 # %%
 benchmark.run(print_data=True, show_plots=True)
+# %%
+WARP_STYLES = [('tab:blue', '-'), ('tab:orange', '-'), ('tab:green', '-')]
+
+@triton.testing.perf_report([
+    triton.testing.Benchmark(
+        x_names=['size'],
+        x_vals=[2**i for i in range(12, 30, 1)],
+        x_log=True,
+        line_arg='num_warps',
+        line_vals=[1, 2, 4],
+        line_names=['1 warp/program', '2 warps/program', '4 warps/program'],
+        styles=WARP_STYLES,
+        ylabel='GB/s',
+        plot_name='vector-add-block-64-warp-comparison',
+        args={'block_size': 64},
+    ),
+    triton.testing.Benchmark(
+        x_names=['size'],
+        x_vals=[2**i for i in range(12, 30, 1)],
+        x_log=True,
+        line_arg='num_warps',
+        line_vals=[1, 2, 4],
+        line_names=['1 warp/program', '2 warps/program', '4 warps/program'],
+        styles=WARP_STYLES,
+        ylabel='GB/s',
+        plot_name='vector-add-block-16-warp-comparison',
+        args={'block_size': 16},
+    ),
+    triton.testing.Benchmark(
+        x_names=['size'],
+        x_vals=[2**i for i in range(12, 30, 1)],
+        x_log=True,
+        line_arg='num_warps',
+        line_vals=[2, 4, 8],
+        line_names=['2 warps/program', '4 warps/program', '8 warps/program'],
+        styles=WARP_STYLES,
+        ylabel='GB/s',
+        plot_name='vector-add-block-1024-warp-comparison',
+        args={'block_size': 1024},
+    ),
+    triton.testing.Benchmark(
+        x_names=['size'],
+        x_vals=[2**i for i in range(12, 30, 1)],
+        x_log=True,
+        line_arg='num_warps',
+        line_vals=[4, 8],
+        line_names=['4 warps/program', '8 warps/program'],
+        styles=WARP_STYLES[:2],
+        ylabel='GB/s',
+        plot_name='vector-add-block-4096-warp-comparison',
+        args={'block_size': 4096},
+    ),
+])
+def benchmark_num_warps(size, num_warps, block_size):
+    x = torch.rand(size, device=DEVICE, dtype=torch.float32)
+    y = torch.rand(size, device=DEVICE, dtype=torch.float32)
+    quantiles = [0.5, 0.2, 0.8]
+    ms, min_ms, max_ms = triton.testing.do_bench(
+        lambda: add(x, y, block_size, num_warps), quantiles=quantiles
+    )
+    gbps = lambda elapsed_ms: 3 * x.numel() * x.element_size() * 1e-9 / (elapsed_ms * 1e-3)
+    return gbps(ms), gbps(max_ms), gbps(min_ms)
+
+# %%
+benchmark_num_warps.run(print_data=True, show_plots=True)
 # %%

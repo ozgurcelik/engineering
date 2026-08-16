@@ -557,6 +557,7 @@ Now, lets try to make sense to these results.
 First of all, we are using a L4 GPU, and looking at the https://images.nvidia.com/aem-dam/Solutions/geforce/ada/nvidia-ada-gpu-architecture.pdf, we see that we have following properties:
 
 Streaming Multiprocessors (SMs): 58
+Maximum Resident Warps per SM: 48
 Theoritical Memory Bandwidth: 300GB/s
 FP32 Peak: 30.3 TFLOPS/s
 
@@ -596,3 +597,64 @@ Looking at the largest vector size, lets calculate how close we got to the theor
 | Torch | 232.5 | 77.5% |
 
 Reaching near 80% of the theoretical bandwidth is pretty good, and tells us the triton implementation is efficient.
+
+#### Why is Block Size 16 so poor?
+
+By default, each program is launched with 4 warps so 128 threads.
+For the block size 16, the 128 threads are not being saturated by the work where only 16 out of 128 threads are doing the useful work.
+
+Additionally, for the largest input size, the number of triton programs we launched is
+
+| Block size | Programs launched |
+|---:|---:|
+| 16 | 33,554,432 |
+| 64 | 8,388,608 |
+| 256 | 2,097,152 |
+| 1,024 | 524,288 |
+| 4,096 | 131,072 |
+
+So, for the block size 16, we launched 30 million programs which adds quite a bit of overhead.
+
+Now, with maximum resident warps per SM being 48, we are launching 12 programs per SM.
+We could launch more programs "simultaneously" by reducing the number of warps per program to 1 and 2, 48 and 24 respectively.
+But, according to https://docs.nvidia.com/cuda/ada-tuning-guide/index.html#occupancy, the maximum number of thread blocks per SM is 24, so even when the number of warps per program is 1, we are limited to 24 programs per SM.
+When we test block size 16 with 1, 2, and 4 warps per program, we get the following results:
+
+vector-add-block-16-warp-comparison:
+           size  1 warp/program  2 warps/program  4 warps/program
+0        4096.0        8.439560         8.213904         8.370572
+1        8192.0       15.753846        16.083770        15.794345
+2       16384.0       27.185840        27.185840        26.829694
+3       32768.0       51.200001        50.360657        42.666665
+4       65536.0       78.267515        81.377483        58.375296
+5      131072.0      105.817007       100.207949        72.549080
+6      262144.0      112.475970       111.836178        83.449915
+7      524288.0      144.140760       142.883721        88.522291
+8     1048576.0      165.390540       162.351772       115.076385
+9     2097152.0      173.375658       170.666661       147.010372
+10    4194304.0      187.011952       186.247951       160.071649
+11    8388608.0      207.187514       209.687240       176.251009
+12   16777216.0      223.053818       225.629609       176.708915
+13   33554432.0      224.562524       231.112358       181.354388
+14   67108864.0      229.753532       234.379762       179.938395
+15  134217728.0      222.006006       229.482222       181.717787
+16  268435456.0      228.103161       229.880509       180.549012
+17  536870912.0      223.852165       232.934656       178.700117
+
+As we can see, the performance is significantly better when we use 1 or 2 warps per program instead of 4.
+
+#### Why are large blocks can be worse for small inputs?
+
+At 4096 elements
+
+| Block size | Triton programs |
+|---:|---:|
+| 16 | 256 |
+| 64 | 64 |
+| 256 | 16 |
+| 1,024 | 4 |
+| 4,096 | 1 |
+
+We have 58 SMs in the GPU, but for the block size 4096, we use only 1 program.
+So only 1 SM is actually doing the work.
+We are missing on the grid-level parallelism of the GPU.
