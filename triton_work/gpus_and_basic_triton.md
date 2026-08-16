@@ -378,6 +378,77 @@ The ratio of resident warps on an SM to the maximum number of resident warps
 supported by that SM. High occupancy can help hide latency, but maximum
 occupancy does not necessarily produce maximum performance.
 
+### How Multiple Programs Share an SM
+
+A kernel launch normally creates many Triton program instances. On NVIDIA GPUs,
+an ordinary Triton program generally maps to one CUDA CTA, which stays on one SM
+until it finishes. An SM can keep multiple programs resident concurrently.
+
+How many programs fit depends on the SM's warp slots, block slots, register
+file, and shared memory. Considering only warp slots, a GPU that supports 48
+resident warps per SM and runs four-warp programs would permit at most:
+
+$$
+\frac{48\ \text{warps/SM}}{4\ \text{warps/program}}
+= 12\ \text{resident programs/SM}.
+$$
+
+The actual ceiling may be lower because of the architectural block limit,
+register allocation, or shared-memory allocation. It is also only a residency
+ceiling, not a guarantee that every SM always contains that many programs.
+
+```text
+One SM
+├── Program A: 4 resident warps
+├── Program B: 4 resident warps
+├── Program C: 4 resident warps
+│   ...
+└── Program L: 4 resident warps
+
+Warp schedulers choose ready warps from this pool.
+```
+
+Resident programs do not all advance in lockstep. Their warps are interleaved
+by the SM's warp schedulers, while issued arithmetic and memory operations can
+overlap in the hardware pipelines. Four useful states to distinguish are:
+
+- **Resident:** The warp's registers and execution state are allocated on the
+  SM.
+- **Ready:** The warp has an instruction whose operands and execution resource
+  are available.
+- **Executing:** An instruction from the warp has been issued or is moving
+  through a hardware pipeline.
+- **Stalled:** The warp is waiting for data, an earlier instruction, or an
+  execution resource.
+
+Suppose an SM has only one four-warp program and all four warps issue global
+memory loads:
+
+```text
+Program A
+├── warp 0: waiting for x from memory
+├── warp 1: waiting for x from memory
+├── warp 2: waiting for x from memory
+└── warp 3: waiting for x from memory
+```
+
+If these are the only resident warps, the SM may have nothing ready to issue
+while the loads are outstanding. With multiple resident programs, it has a
+larger pool of independent work:
+
+```text
+Program A: warps waiting for memory
+Program B: warps ready to issue loads
+Program C: warps ready to add
+Program D: warps ready to store
+...
+```
+
+The schedulers can issue a ready warp from another program while Program A is
+stalled. This latency hiding helps keep execution and memory pipelines busy. It
+is especially important for memory-bound kernels, which need many independent
+warps and outstanding memory requests to sustain device-memory bandwidth.
+
 ### Software Pipelining
 
 A compiler transformation that rewrites a loop so that multiple iterations
@@ -438,11 +509,16 @@ does not limit residency.
 
 ### Vector Addition Example
 
-Triton is a python-based domain-specific language for writing GPU kernels thats meant to be more readable and accessible than CUDA.
+Triton is a Python-based domain-specific language for writing GPU kernels that
+is designed to be more readable and accessible than CUDA.
 
-The key design principle of the triton is the block level programming model.
-This means that the kernels we write will be scheduled in the blocks instead of the threads like in CUDA.
-Since triton already handles and abstracts away the thread level details, our main focus will be on the block level, especially efficiently utilizing memory access patterns and parallelism.
+A key Triton design principle is its block-level programming model. A Triton
+program instance operates on blocks of values, and the compiler maps those
+blocked operations onto GPU threads and warps. CUDA also schedules thread
+blocks rather than individual threads, so the distinction is that Triton lets
+the programmer describe work at a higher level while abstracting much of the
+thread-level mapping. The programmer still needs to choose block shapes that
+produce efficient memory access and sufficient parallelism.
 
 Now lets look at a simple vector addition example in triton.
 
@@ -486,11 +562,14 @@ We first allocate an output tensor of the same size as the input tensors to whic
 The size of the output tensor is of course dependent on the operation we are performing.
 Since we are adding two vectors, the size of the output tensor will be the same as the input tensors.
 
-Afterwards, we determine the block size and calculate how many programs we will be launching.
-In this implementation, we will launch one program per block.
+Afterwards, we determine the block size and calculate how many program instances we will launch.
+For this kernel, each Triton program instance compiles to one CUDA CTA (thread block).
 It's possible that the n_elements is not divisible by the block size, so the tail programs may not be doing the "full" amount of work.
 We then launch the kernel with the `add_kernel` function.
-There, the `(num_blocks,)` represents the launch grid: the number of triton kernels we will be running in parallel.
+There, `(num_blocks,)` represents the launch grid: the number of Triton program
+instances in this kernel launch. They are eligible to run concurrently, but
+only the subset that fits the GPU's resident-resource limits can be active at
+one time; the rest execute in later scheduling waves.
 The grid can be 1D, 2D, or 3D, and in this case, we are using 1D grid.
 Along with the grid, we also pass the pointers to the input and output tensors, and the number of elements and block size to the triton kernel.
 
@@ -512,63 +591,93 @@ For throughput, we measure the number bytes processed per second.
 Since the addition operation reads 2 values from the input tensors and writes 1 value to the output tensor, we multiply the number of elements by 3.
 The full equation is `3 * x.numel() * x.element_size() * 1e-9 / (elapsed_ms * 1e-3)`.
 
-vector-add-performance:
-           size       Torch  Triton (BLOCK_SIZE=16)  Triton (BLOCK_SIZE=64)  Triton (BLOCK_SIZE=256)  Triton (BLOCK_SIZE=1024)  Triton (BLOCK_SIZE=4096)
-0        4096.0    9.365854                8.677966                9.365854                 8.486188                  9.365854                  8.126984
-1        8192.0   16.879121               17.860465               16.879121                18.450450                 16.695652                 13.900453
-2       16384.0   27.927273               27.551570               27.927273                30.266009                 27.927273                 26.597403
-3       32768.0   53.659389               44.846717               52.625267                52.512819                 55.601811                 42.965036
-4       65536.0   98.303995               57.757931               91.360591                99.497980                 93.267553                 89.367273
-5      131072.0  140.635194               72.176211              138.456339               144.564706                141.038735                145.420113
-6      262144.0  151.236923               83.308473              151.004606               153.121496                157.035145                158.045011
-7      524288.0  203.950206               89.286103              167.325960               164.870440                210.726687                204.056045
-8     1048576.0  178.329250              115.143780              175.268993               173.835544                183.146712                202.584235
-9     2097152.0  212.376990              148.285472              212.376990               209.939141                209.435955                213.356490
-10    4194304.0  216.558443              161.609458              218.271443               221.467754                216.290430                215.726790
-11    8388608.0  222.493755              178.633045              225.564893               224.646715                222.690641                222.438691
-12   16777216.0  227.411609              183.189384              227.551439               229.581666                226.886744                226.229990
-13   33554432.0  229.305540              179.366405              244.968158               232.577576                229.795493                229.860563
-14   67108864.0  231.075219              181.135098              232.163474               234.123556                231.230212                235.574395
-15  134217728.0  231.866143              179.863475              244.747778               245.075505                231.933458                236.311572
-16  268435456.0  238.529289              177.745455              246.315044               243.965398                232.164815                237.052545
-17  536870912.0  232.481433              181.384627              247.450964               246.287924                232.434990                237.304851
-vector-add-latency:
-           size         Torch  Triton (BLOCK_SIZE=16)  Triton (BLOCK_SIZE=64)  Triton (BLOCK_SIZE=256)  Triton (BLOCK_SIZE=1024)  Triton (BLOCK_SIZE=4096)
-0        4096.0      5.792000                5.888000                5.824000                 5.328000                  5.824000                  6.464000
-1        8192.0      5.824000                5.792000                5.984000                 5.344000                  5.792000                  6.624000
-2       16384.0      7.120000                7.232000                7.184000                 7.072000                  7.072000                  7.568000
-3       32768.0      7.392000                9.232000                7.424000                 6.944000                  7.328000                  8.608000
-4       65536.0      8.320000               13.024000                8.448000                 7.872000                  8.400000                  9.136000
-5      131072.0     10.784000               22.064000               11.360000                11.344000                 11.552000                 11.424000
-6      262144.0     20.000000               38.144000               22.879999                20.927999                 20.096000                 23.328001
-7      524288.0     30.432001               71.456000               37.728000                37.087999                 30.960000                 30.896001
-8     1048576.0     62.912002              109.536000               64.608000                65.087996                 63.552000                 57.151999
-9     2097152.0    120.863996              171.168000              116.927996               114.720002                118.624002                116.063997
-10    4194304.0    231.552005              313.887998              231.247999               231.552005                233.536005                231.232002
-11    8388608.0    456.191987              573.248029              454.784006               449.647993                455.199987                453.727990
-12   16777216.0    888.144016             1097.568035              823.983997               879.887998                887.647986                887.167990
-13   33554432.0   1757.951975             2262.207985             1755.328000              1739.008009               1756.176054               1754.335999
-14   67108864.0   3482.560039             4445.600033             3454.015970              3436.912060               3481.152058               3414.479971
-15  134217728.0   6949.424028             8961.568356             6581.056118              6898.399830               6941.584110               6814.399958
-16  268435456.0  13863.424301            18342.239380            13086.848259             13201.408386              13856.016159              13589.135647
-17  536870912.0  27691.680908            35732.128143            26050.304413             26206.592560              27711.135864              27164.543152
+### Throughput results
 
-Now, lets try to make sense to these results.
-First of all, we are using a L4 GPU, and looking at the https://images.nvidia.com/aem-dam/Solutions/geforce/ada/nvidia-ada-gpu-architecture.pdf, we see that we have following properties:
+The values below are effective GB/s, calculated from the algorithm's two reads
+and one write per element.
 
-Streaming Multiprocessors (SMs): 58
-Maximum Resident Warps per SM: 48
-Theoritical Memory Bandwidth: 300GB/s
-FP32 Peak: 30.3 TFLOPS/s
+| Elements | Torch | BS=16 | BS=64 | BS=256 | BS=1024 | BS=4096 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 4,096 | 9.37 | 8.68 | 9.37 | 8.49 | 9.37 | 8.13 |
+| 8,192 | 16.88 | 17.86 | 16.88 | 18.45 | 16.70 | 13.90 |
+| 16,384 | 27.93 | 27.55 | 27.93 | 30.27 | 27.93 | 26.60 |
+| 32,768 | 53.66 | 44.85 | 52.63 | 52.51 | 55.60 | 42.97 |
+| 65,536 | 98.30 | 57.76 | 91.36 | 99.50 | 93.27 | 89.37 |
+| 131,072 | 140.64 | 72.18 | 138.46 | 144.56 | 141.04 | 145.42 |
+| 262,144 | 151.24 | 83.31 | 151.00 | 153.12 | 157.04 | 158.05 |
+| 524,288 | 203.95 | 89.29 | 167.33 | 164.87 | 210.73 | 204.06 |
+| 1,048,576 | 178.33 | 115.14 | 175.27 | 173.84 | 183.15 | 202.58 |
+| 2,097,152 | 212.38 | 148.29 | 212.38 | 209.94 | 209.44 | 213.36 |
+| 4,194,304 | 216.56 | 161.61 | 218.27 | 221.47 | 216.29 | 215.73 |
+| 8,388,608 | 222.49 | 178.63 | 225.56 | 224.65 | 222.69 | 222.44 |
+| 16,777,216 | 227.41 | 183.19 | 227.55 | 229.58 | 226.89 | 226.23 |
+| 33,554,432 | 229.31 | 179.37 | 244.97 | 232.58 | 229.80 | 229.86 |
+| 67,108,864 | 231.08 | 181.14 | 232.16 | 234.12 | 231.23 | 235.57 |
+| 134,217,728 | 231.87 | 179.86 | 244.75 | 245.08 | 231.93 | 236.31 |
+| 268,435,456 | 238.53 | 177.75 | 246.32 | 243.97 | 232.16 | 237.05 |
+| 536,870,912 | 232.48 | 181.38 | 247.45 | 246.29 | 232.43 | 237.30 |
 
-Let us look at if we are in the memory-bound or compute-bound region.
-Since we are using FP32 data type, for each element-wise addition operation, we do 2 reads and 1 write totalling to 3 operations so 12 bytes of data.
-Each addition operation takes 1 FLOPS.
-So, our arithmetic intensity is 1 FLOPS / 12 bytes = 0.0833 FLOPS/byte.
-The L4's roofline transition point is approximately at AI_ridge = 30.3 TFLOPS/s / 300GB/s = 101 FLOPS/byte.
-So, we are firmly in the memory-bound region.
+![Vector-add effective bandwidth across block sizes](figures/vector_addition_gbps.png)
 
-But if we are in the memory-bound region, why are we not seeing 300GB/s of throughput?
+### Latency results
+
+The values below are median latency in microseconds.
+
+| Elements | Torch | BS=16 | BS=64 | BS=256 | BS=1024 | BS=4096 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 4,096 | 5.792 | 5.888 | 5.824 | 5.328 | 5.824 | 6.464 |
+| 8,192 | 5.824 | 5.792 | 5.984 | 5.344 | 5.792 | 6.624 |
+| 16,384 | 7.120 | 7.232 | 7.184 | 7.072 | 7.072 | 7.568 |
+| 32,768 | 7.392 | 9.232 | 7.424 | 6.944 | 7.328 | 8.608 |
+| 65,536 | 8.320 | 13.024 | 8.448 | 7.872 | 8.400 | 9.136 |
+| 131,072 | 10.784 | 22.064 | 11.360 | 11.344 | 11.552 | 11.424 |
+| 262,144 | 20.000 | 38.144 | 22.880 | 20.928 | 20.096 | 23.328 |
+| 524,288 | 30.432 | 71.456 | 37.728 | 37.088 | 30.960 | 30.896 |
+| 1,048,576 | 62.912 | 109.536 | 64.608 | 65.088 | 63.552 | 57.152 |
+| 2,097,152 | 120.864 | 171.168 | 116.928 | 114.720 | 118.624 | 116.064 |
+| 4,194,304 | 231.552 | 313.888 | 231.248 | 231.552 | 233.536 | 231.232 |
+| 8,388,608 | 456.192 | 573.248 | 454.784 | 449.648 | 455.200 | 453.728 |
+| 16,777,216 | 888.144 | 1,097.568 | 823.984 | 879.888 | 887.648 | 887.168 |
+| 33,554,432 | 1,757.952 | 2,262.208 | 1,755.328 | 1,739.008 | 1,756.176 | 1,754.336 |
+| 67,108,864 | 3,482.560 | 4,445.600 | 3,454.016 | 3,436.912 | 3,481.152 | 3,414.480 |
+| 134,217,728 | 6,949.424 | 8,961.568 | 6,581.056 | 6,898.400 | 6,941.584 | 6,814.400 |
+| 268,435,456 | 13,863.424 | 18,342.239 | 13,086.848 | 13,201.408 | 13,856.016 | 13,589.136 |
+| 536,870,912 | 27,691.681 | 35,732.128 | 26,050.304 | 26,206.593 | 27,711.136 | 27,164.543 |
+
+![Vector-add latency across block sizes](figures/vector_addition_latency.png)
+
+Now, let's make sense of these results. We are using an NVIDIA L4 GPU. The
+[NVIDIA Ada architecture whitepaper](https://images.nvidia.com/aem-dam/Solutions/geforce/ada/nvidia-ada-gpu-architecture.pdf),
+[Ada tuning guide](https://docs.nvidia.com/cuda/ada-tuning-guide/index.html#occupancy),
+and [L4 product specifications](https://www.nvidia.com/en-eu/data-center/l4/)
+give the relevant properties:
+
+- Streaming multiprocessors: 58
+- Maximum resident warps per SM: 48
+- Theoretical memory bandwidth: 300 GB/s
+- Peak FP32 throughput: 30.3 TFLOP/s
+
+For each FP32 output element, vector addition performs two 4-byte reads, one
+4-byte write, and one floating-point addition. These are three memory accesses,
+not three FLOPs. The logical memory traffic is 12 bytes and the arithmetic work
+is one FLOP, giving:
+
+$$
+\text{arithmetic intensity} = \frac{1\ \text{FLOP}}{12\ \text{bytes}}
+= 0.0833\ \text{FLOP/byte}.
+$$
+
+The L4's roofline transition point is approximately:
+
+$$
+AI_{\text{ridge}} = \frac{30.3\ \text{TFLOP/s}}{300\ \text{GB/s}}
+\approx 101\ \text{FLOP/byte}.
+$$
+
+Vector addition is therefore firmly memory-bound once the workload is large
+enough to saturate the memory system.
+
+But if we are in the memory-bound region, why are we not seeing 300 GB/s of throughput?
 Let's look at the latency results we have for block size 64 for different vector sizes:
 
 | Elements | Data moved | Ideal at 300 GB/s | Observed |
@@ -578,12 +687,14 @@ Let's look at the latency results we have for block size 64 for different vector
 | 1,048,576 | 12.58 MB | 41.9 µs | about 64.6 µs |
 | 536,870,912 | 6.44 GB | 21.5 ms | about 26.1 ms |
 
-At 4096 elements, theoritically the memory system only needs 0.16 µs, but we are seeing 5.8 µs.
-This is because we have multiple overheads such as:
-- python overhead
-- doing the torch.empty_like operation
-- kernel launch overhead
-- and insufficient work to occupy all 58 SMs for larger block sizes
+At 4,096 elements, the theoretical memory-transfer time is only 0.16 µs, but
+the measured operation takes about 5.8 µs. At this scale, fixed costs and
+underutilization dominate, including kernel dispatch/launch, the
+`torch.empty_like` caching-allocator call included in the timed function, and
+too little work to occupy the GPU—especially for larger block sizes. At large
+sizes, the gap from 300 GB/s instead reflects the difference between an ideal
+hardware specification and sustainable effective bandwidth, together with
+instruction, scheduling, and memory-system overhead.
 
 Looking at the largest vector size, lets calculate how close we got to the theoretical bandwidth.
 
@@ -596,12 +707,18 @@ Looking at the largest vector size, lets calculate how close we got to the theor
 | Triton, block 4096 | 237.3 | 79.1% |
 | Torch | 232.5 | 77.5% |
 
-Reaching near 80% of the theoretical bandwidth is pretty good, and tells us the triton implementation is efficient.
+Reaching roughly 80% of the theoretical bandwidth is a good result for this
+end-to-end benchmark and shows that the best Triton configurations use the L4's
+memory system efficiently.
 
 #### Why is Block Size 16 so poor?
 
-By default, each program is launched with 4 warps so 128 threads.
-For the block size 16, the 128 threads are not being saturated by the work where only 16 out of 128 threads are doing the useful work.
+In this Triton installation, omitting `num_warps` compiled each program with four
+warps, or 128 CUDA threads. For `BLOCK_SIZE=16`, the generated PTX maps those
+128 threads repeatedly onto only 16 element offsets. Loads are duplicated
+across warps, while only the first 16 threads are permitted to store. Caches and
+coalescing can prevent every duplicate load from becoming duplicate DRAM
+traffic, but the extra instructions and warp slots are still wasteful.
 
 Additionally, for the largest input size, the number of triton programs we launched is
 
@@ -613,37 +730,49 @@ Additionally, for the largest input size, the number of triton programs we launc
 | 1,024 | 524,288 |
 | 4,096 | 131,072 |
 
-So, for the block size 16, we launched 30 million programs which adds quite a bit of overhead.
+Thus block size 16 launches more than 33 million very small programs, adding
+substantial program-scheduling and instruction overhead.
 
-Now, with maximum resident warps per SM being 48, we are launching 12 programs per SM.
-We could launch more programs "simultaneously" by reducing the number of warps per program to 1 and 2, 48 and 24 respectively.
-But, according to https://docs.nvidia.com/cuda/ada-tuning-guide/index.html#occupancy, the maximum number of thread blocks per SM is 24, so even when the number of warps per program is 1, we are limited to 24 programs per SM.
+The L4 permits at most 48 resident warps and 24 resident thread blocks per SM.
+For this one-CTA-per-program kernel, the simplified residency ceiling is:
+
+$$
+\text{programs per SM} \leq
+\min\left(24,\left\lfloor\frac{48}{\text{num warps}}\right\rfloor\right),
+$$
+
+before considering registers and shared memory. Therefore one-, two-, and
+four-warp programs have ceilings of 24, 24, and 12 resident programs per SM,
+respectively. These are concurrent-residency limits, not the number of programs
+launched or a guarantee that every SM always reaches the limit.
 When we test block size 16 with 1, 2, and 4 warps per program, we get the following results:
 
-vector-add-block-16-warp-comparison:
-           size  1 warp/program  2 warps/program  4 warps/program
-0        4096.0        8.439560         8.213904         8.370572
-1        8192.0       15.753846        16.083770        15.794345
-2       16384.0       27.185840        27.185840        26.829694
-3       32768.0       51.200001        50.360657        42.666665
-4       65536.0       78.267515        81.377483        58.375296
-5      131072.0      105.817007       100.207949        72.549080
-6      262144.0      112.475970       111.836178        83.449915
-7      524288.0      144.140760       142.883721        88.522291
-8     1048576.0      165.390540       162.351772       115.076385
-9     2097152.0      173.375658       170.666661       147.010372
-10    4194304.0      187.011952       186.247951       160.071649
-11    8388608.0      207.187514       209.687240       176.251009
-12   16777216.0      223.053818       225.629609       176.708915
-13   33554432.0      224.562524       231.112358       181.354388
-14   67108864.0      229.753532       234.379762       179.938395
-15  134217728.0      222.006006       229.482222       181.717787
-16  268435456.0      228.103161       229.880509       180.549012
-17  536870912.0      223.852165       232.934656       178.700117
+| Elements | 1 warp/program | 2 warps/program | 4 warps/program |
+| ---: | ---: | ---: | ---: |
+| 4,096 | 8.44 | 8.21 | 8.37 |
+| 8,192 | 15.75 | 16.08 | 15.79 |
+| 16,384 | 27.19 | 27.19 | 26.83 |
+| 32,768 | 51.20 | 50.36 | 42.67 |
+| 65,536 | 78.27 | 81.38 | 58.38 |
+| 131,072 | 105.82 | 100.21 | 72.55 |
+| 262,144 | 112.48 | 111.84 | 83.45 |
+| 524,288 | 144.14 | 142.88 | 88.52 |
+| 1,048,576 | 165.39 | 162.35 | 115.08 |
+| 2,097,152 | 173.38 | 170.67 | 147.01 |
+| 4,194,304 | 187.01 | 186.25 | 160.07 |
+| 8,388,608 | 207.19 | 209.69 | 176.25 |
+| 16,777,216 | 223.05 | 225.63 | 176.71 |
+| 33,554,432 | 224.56 | 231.11 | 181.35 |
+| 67,108,864 | 229.75 | 234.38 | 179.94 |
+| 134,217,728 | 222.01 | 229.48 | 181.72 |
+| 268,435,456 | 228.10 | 229.88 | 180.55 |
+| 536,870,912 | 223.85 | 232.93 | 178.70 |
+
+![Block-size-16 throughput for different warp counts](figures/vector_addition_gbps_bs16_warps1-2-4.png)
 
 As we can see, the performance is significantly better when we use 1 or 2 warps per program instead of 4.
 
-#### Why are large blocks can be worse for small inputs?
+#### Why can large blocks be worse for small inputs?
 
 At 4096 elements
 
@@ -655,6 +784,8 @@ At 4096 elements
 | 1,024 | 4 |
 | 4,096 | 1 |
 
-We have 58 SMs in the GPU, but for the block size 4096, we use only 1 program.
-So only 1 SM is actually doing the work.
-We are missing on the grid-level parallelism of the GPU.
+The L4 has 58 SMs, but `BLOCK_SIZE=4096` creates only one program for 4,096
+elements. Because one program executes on one SM, at most one SM performs useful
+work for this launch. The kernel therefore misses nearly all available
+grid-level parallelism. This effect is separate from the fixed launch overhead,
+which also dominates such a small operation.
