@@ -25,12 +25,13 @@ Threads are not permanently assigned to individual execution units; schedulers
 issue instructions from ready warps to the appropriate pipelines.
 
 In general, storage closer to the execution pipelines has lower latency and
-higher bandwidth. Registers and L1/shared memory are inside an SM, L2 cache is
-shared across the GPU, and global memory usually resides in off-chip HBM or
-VRAM.
+higher bandwidth. Registers, shared memory, and L1 cache are inside an SM; L2
+cache is shared across the GPU; and global memory is backed by off-chip device
+memory such as GDDR or HBM.
 
-Why can't we just have very large L1 cache?
-Because it would be too expensive and too power-hungry.
+Why can't we just have a very large L1 cache? Larger caches consume more chip
+area and power, and they become harder to access with low latency and high
+bandwidth.
 
 L1 cache is managed automatically by the hardware, while shared memory is
 programmer-managed storage used for deliberate data reuse and communication
@@ -38,19 +39,19 @@ within a thread block.
 
 ## GPU Execution Model
 
-Threads: Threads execute the kernel code on their assigned data. Within a warp,
-the active lanes execute each issued instruction together.
+**Threads:** Execute the kernel code on their assigned data. Within a warp, the
+active lanes execute each issued instruction together.
 
-Blocks: Groups of threads. Each block normally runs to completion on one SM and
+**Blocks:** Groups of threads. Each block normally runs to completion on one SM and
 has its own logical shared-memory allocation. Multiple blocks may be resident on
 the same SM.
 
-Warp: On NVIDIA GPUs, threads in a block are partitioned into groups of 32 called
+**Warps:** On NVIDIA GPUs, threads in a block are partitioned into groups of 32 called
 **warps**. Threads in a warp have consecutive linear thread IDs, but the memory
 addresses they access are determined by the kernel. A warp is the primary
 scheduling unit within an SM.
 
-So, blocks are assigned to SMs, and each block is divided into warps. Each warp contains 32 threads.
+Blocks are assigned to SMs, and each block is divided into warps of 32 threads.
 
 Each thread has its own logical registers and can access the shared memory of its
 block. Independent blocks generally communicate through global memory and
@@ -61,8 +62,10 @@ exception on supported GPUs by allowing access to distributed shared memory.
 
 There are two regimes of performance:
 
-- The memory-bound regime: the GPU is bounded by memory bandwidth, how fast can it read/write data.
-- The compute-bound regime: the GPU is utilizing its compute units to the fullest.
+- The memory-bound regime: performance is limited by how quickly data can move
+  through the relevant level of the memory hierarchy.
+- The compute-bound regime: performance is limited by the available arithmetic
+  throughput.
 
 Arithmetic intensity is the amount of computation performed per byte moved:
 
@@ -90,7 +93,8 @@ Additional source: [What Shapes Do Matrix Multiplications Like?](https://www.tho
 
 Common GPU optimization techniques include:
 
-- Control divergence (not a memory bottleneck)
+- Minimizing control divergence (a control-flow concern rather than a memory
+  bottleneck)
 - Low precision computation
 - Operator fusion
 - Recomputation
@@ -102,7 +106,7 @@ memory access and reuse. Fusion reduces memory traffic and kernel-launch
 overhead. Low precision can improve both compute throughput and memory traffic.
 Recomputation explicitly trades additional compute for lower memory use.
 
-### Control divergence
+### Minimizing Control Divergence
 
 GPUs are optimized for SIMT (Single Instruction, Multiple Threads) execution.
 The active lanes in a warp execute each issued instruction together.
@@ -122,9 +126,9 @@ remaining lanes are active. This is called control divergence. The precise
 instruction sequence depends on compiler decisions such as predication, but the
 important effect is reduced lane utilization.
 
-### Low precision computation
+### Low Precision Computation
 
-#### Bits and bytes
+#### Bits and Bytes
 
 A **bit** is the smallest unit of data—a single 0 or 1. A **byte** is 8 bits
 grouped together. The relationship is always: **1 byte = 8 bits**.
@@ -133,7 +137,8 @@ The number in a data type's name tells you how many **bits** it uses:
 
 - **float32** (FP32): 32 bits = 32 / 8 = **4 bytes** per number
 - **float16** (FP16): 16 bits = 16 / 8 = **2 bytes** per number
-- **bfloat16** (BF16): 16 bits = **2 bytes** per number (different exponent/mantissa split than FP16)
+- **bfloat16** (BF16): 16 bits = **2 bytes** per number (with a different
+  exponent/fraction split than FP16)
 - **int8**: 8 bits = **1 byte** per number
 
 Why does this matter for GPUs? Values transferred to or from global memory
@@ -144,8 +149,8 @@ This directly helps in the memory-bound regime.
 
 Example from the lecture — elementwise ReLU (\(x = \max(0, x)\)) on a vector of size \(n\):
 
-- **Float32**: 1 read + 1 write = 8 bytes moved per element, 1 operation → 1/8 operation/byte
-- **Float16**: 1 read + 1 write = 4 bytes moved per element, 1 operation → 1/4 operation/byte
+- **FP32**: 1 read + 1 write = 8 bytes moved per element, 1 operation → 1/8 operation/byte
+- **FP16**: 1 read + 1 write = 4 bytes moved per element, 1 operation → 1/4 operation/byte
 
 Half the bytes means double the operational intensity. The operation may still
 remain memory-bound, but it can process more elements per unit of memory
@@ -174,14 +179,15 @@ loss scaling, but it is not a universal drop-in replacement for FP32: sensitive
 operations and accumulation may still use FP32, and numerical behavior depends
 on the model and hardware.
 
-### Operator fusion
+### Operator Fusion
 
 If we need to do multiple operations in a row, we can fuse them to reduce the
 number of global memory reads and writes.
 
 ### Recomputation
 
-The idea is doing more compute instead of storing the intermediate results in memory.
+The idea is to perform additional computation instead of storing intermediate
+results in memory.
 For example, instead of storing all forward-pass activations, we can recompute
 selected activations during the backward pass before calculating gradients.
 
@@ -193,7 +199,7 @@ global-memory coalescing is commonly described in terms of 32-byte segments. For
 example, 32 consecutive FP32 accesses cover 128 bytes and normally require four
 32-byte transactions. Strided or scattered addresses may require many more.
 
-#### Row-major layout
+#### Row-Major Layout
 
 A 2D matrix is stored in memory as a flat 1D array. In **row-major** order (the
 default in C/CUDA), rows are stored one after another:
@@ -204,11 +210,13 @@ Matrix:          Memory (flat):
 | 4  5  6 |       ^row 0^  ^row 1^  ^row 2^
 | 7  8  9 |
 ```
-Elements in the same row are adjacent in memory. Elements in the same column are separated by the row width.
+Elements in the same row are adjacent in memory. Elements in the same column
+are separated by the row width.
 
-#### Coalescing for matrix multiplication
+#### Coalescing for Matrix Multiplication
 
-Coalescing is about what all 32 threads in a warp access **simultaneously**, not what a single thread does over time.
+Coalescing is about what all 32 threads in a warp access **simultaneously**, not
+what a single thread does over time.
 
 Consider \(C = A \times B\), where each thread computes one element of \(C\).
 Each element \(C[i][j]\) is the dot product of row \(i\) of \(A\) and column
@@ -252,7 +260,7 @@ global memory and reused $T$ times within a tile. This gives an approximate
 factor-of-$T$ reduction in global-memory reads. Caching and implementation
 details can change the exact traffic.
 
-#### Complexities of tiling
+#### Complexities of Tiling
 
 Tile sizes may not divide the matrix dimensions, requiring masks and creating
 partially filled boundary tiles.
@@ -263,7 +271,8 @@ and the availability of hardware-specific matrix instructions.
 
 ### Wave Quantization
 
-Imagine a matrix of size 1792x1792. Using tile sizes of 256x128, we get
+Imagine a matrix of size $1792 \times 1792$. Using tiles of size
+$256 \times 128$, we get
 
 $$
 \frac{1792}{256} \times \frac{1792}{128} = 7 \times 14 = 98
@@ -271,7 +280,7 @@ $$
 
 tiles.
 
-But if the matrix is 1793x1793, we get
+But if the matrix is $1793 \times 1793$, we get
 
 $$
 8 \times 15 = 120
@@ -300,25 +309,25 @@ Registers are the lowest-latency, highest-bandwidth storage available to GPU
 threads and reside in the register file of each SM. Exact access latency and
 throughput depend on the architecture and instruction.
 
-Only the thread that owns it can see it.
-Threads cannot access each other's registers directly:
-they must use shared memory or, within a warp, warp-shuffle instructions.
+Each thread can directly access only its own registers. Threads must use shared
+memory or, within a warp, warp-shuffle instructions to exchange values.
 
 ### Register File
 
-Physical block of storage on each SM that holds all the registers for all the threads currently running on that SM.
+The register file is the physical storage on each SM that holds the registers
+for all threads currently resident on that SM.
 
-### SRAM (Static RAM)/Shared Memory/L1 Cache
+### SRAM (Static RAM), Shared Memory, and L1 Cache
 
-Static means it holds its value as long as it has power—no refresh is needed.
-It is fast but expensive per byte.
+SRAM retains its value as long as it has power—no refresh is needed. It is fast
+but expensive per byte.
 
 On a GPU, SRAM shows up as:
 
 - Shared memory: A small pool on each SM allocated per thread block. It is
   programmer-managed in CUDA; in Triton, the compiler may manage shared-memory
   staging for blocked operations.
-- L1 Cache: Managed automatically by the hardware to cache recent DRAM accesses.
+- L1 cache: Managed automatically by the hardware to cache global-memory data.
 
 All threads within the same CUDA block can access that block's shared-memory
 allocation. Different blocks cannot normally access one another's shared
@@ -326,15 +335,15 @@ memory, except through distributed shared memory in a supported block cluster.
 
 ### SM (Streaming Multiprocessor)
 
-Fundamental processing unit on an NVIDIA GPU.
+An SM is the fundamental processing unit on an NVIDIA GPU.
 Each SM has its own register file, shared memory, warp schedulers,
-arithmetic units (FP32, INT ...).
+and arithmetic pipelines for operations such as FP32 and integer arithmetic.
 It keeps many warps resident and issues instructions from ready warps to hide
 latency.
 
 ### Thread
 
-The smallest unit of execution.
+A thread is the smallest unit of execution.
 GPU threads are lightweight. The state of resident warps is kept on-chip, so an
 SM can switch among ready warps without an OS-style context switch. A thread has
 thread-local state and executes the kernel code once; compiler-generated local
@@ -481,8 +490,8 @@ always faster.
 
 #### Example
 
-Every SM has a fixed budget of four things:
-register file, shared memory, warp slots, and block slots.
+Every SM has a fixed budget of four major occupancy resources: register-file
+capacity, shared memory, warp slots, and block slots.
 
 | Resource | Example: H100 SM | Consumed by one program based on… |
 | --- | --- | --- |
@@ -491,7 +500,8 @@ register file, shared memory, warp slots, and block slots.
 | Warp slots | 64 warps = 2048 threads | threads_per_block / 32 |
 | Block slots | 32 blocks | 1 per block |
 
-The number of resident programs is whatever is permitted by the tightest of these four constraints. Formally:
+The number of resident programs is determined by the tightest of these four
+constraints. Formally:
 
 ```text
 resident_blocks_per_SM = min(
@@ -520,16 +530,16 @@ the programmer describe work at a higher level while abstracting much of the
 thread-level mapping. The programmer still needs to choose block shapes that
 produce efficient memory access and sufficient parallelism.
 
-Now lets look at a simple vector addition example in triton.
+Now let's look at a simple vector-addition example in Triton.
 
 ```python
 @triton.jit
 def add_kernel(
-    x_ptr, # pointer to the input vector x
-    y_ptr, # pointer to the input vector y
-    output_ptr, # pointer to the output vector
-    n_elements, # so that we will know where to stop
-    BLOCK_SIZE: tl.constexpr, # the size of the block
+    x_ptr,  # pointer to the input vector x
+    y_ptr,  # pointer to the input vector y
+    output_ptr,  # pointer to the output vector
+    n_elements,  # number of elements in the vectors
+    BLOCK_SIZE: tl.constexpr,  # elements processed by each program
 ):
     # identify which program we are running
     pid = tl.program_id(axis=0)
@@ -547,51 +557,67 @@ def add(x: torch.Tensor, y: torch.Tensor):
     n_elements = output.numel()
     block_size = 1024
     num_blocks = triton.cdiv(n_elements, block_size)
-    add_kernel[(num_blocks,)](x,y,output,n_elements,block_size)
+    add_kernel[(num_blocks,)](x, y, output, n_elements, block_size)
     return output
 ```
 
-First of all, we have 2 functions here: `add_kernel` and `add`.
-The `add` function is the CPU-side function that launches the `add_kernel` function which is the actual GPU kernel.
-The `@triton.jit` decorator is used to tell triton that the following function is a GPU kernel.
-Such functions are called triton kernels and compiled at the launch time.
+The example has two functions: `add_kernel` and `add`. The `add` function is
+the host-side wrapper that allocates the output and launches `add_kernel`, which
+is the GPU kernel. The `@triton.jit` decorator marks the function for JIT
+compilation by Triton. A kernel is compiled when a particular specialization is
+first launched, and the compiled result is cached for reuse. Changes to inputs
+such as data types, compile-time constants such as `BLOCK_SIZE`, launch options
+such as `num_warps`, or the target GPU can require another specialization.
 
-Now, lets look at the code in detail.
-In the `add` function, our inputs are the two input vectors we will be summing together.
-We first allocate an output tensor of the same size as the input tensors to which we will be writing the result.
-The size of the output tensor is of course dependent on the operation we are performing.
-Since we are adding two vectors, the size of the output tensor will be the same as the input tensors.
+Now, let's look at the code in detail. The inputs to `add` are the two vectors
+we want to add. We allocate an output tensor with the same shape and data type
+as `x`, which is appropriate for elementwise vector addition.
 
-Afterwards, we determine the block size and calculate how many program instances we will launch.
-For this kernel, each Triton program instance compiles to one CUDA CTA (thread block).
-It's possible that the n_elements is not divisible by the block size, so the tail programs may not be doing the "full" amount of work.
-We then launch the kernel with the `add_kernel` function.
+Next, we choose the block size and calculate how many program instances to
+launch. For this kernel on an NVIDIA GPU, each Triton program instance maps to
+one CUDA CTA (thread block). If `n_elements` is not divisible by the block size,
+the final program processes only a partially filled block. We then launch
+`add_kernel`.
 There, `(num_blocks,)` represents the launch grid: the number of Triton program
 instances in this kernel launch. They are eligible to run concurrently, but
 only the subset that fits the GPU's resident-resource limits can be active at
 one time; the rest execute in later scheduling waves.
-The grid can be 1D, 2D, or 3D, and in this case, we are using 1D grid.
-Along with the grid, we also pass the pointers to the input and output tensors, and the number of elements and block size to the triton kernel.
+The grid can be one-, two-, or three-dimensional; in this case, it is
+one-dimensional. Along with the grid, we pass the input and output pointers,
+the number of elements, and the block size to the Triton kernel.
 
-In the `add_kernel` function, we first need to identify which program we are running since we will have multiple programs running in parallel processing different slices of data independently.
-Since we are using a 1D grid, we learn the program id by looking at the axis=0.
-We then need to figure out the data we will be processing in our program.
-In this case, we do this in 2 steps:
-1. We find the starting index of the data we will be processing in our program.
-2. Using the starting index, we find the indices of the data we will be processing in our program.
-The `tl.arange(0, BLOCK_SIZE)` function gives us a list of indices from 0 to BLOCK_SIZE-1, so the offsets is basically a list of indices starting from the starting index and ending at the starting index + BLOCK_SIZE - 1.
-As we mentioned earlier, it's possible that some of the programs may not be processing the "full" amount of data, and we use the mask to mask off the indices that are out of the range of the data we will be processing.
-Mask is a boolean tensor that prevents us from accessing the data that is out of the range of the data we will be processing.
-With the `tl.load` function, we load the data from the input tensors at the indices specified by the offsets where the mask is true and we pass the cases where the mask is false to the `tl.load` function to ignore.
-We then add the data from the two input tensors and store the result in the output tensor at the indices specified by the offsets where the mask is true.
+Inside `add_kernel`, we first identify the current program instance. Because the
+launch grid is one-dimensional, `tl.program_id(axis=0)` returns its program ID
+along axis 0. We determine the data handled by this program in two steps:
 
-Now we benchmark the performance of this kernel for different vector and block sizes with FP32 data type.
-We measure the performance in terms of throughput and latency.
-For throughput, we measure the number bytes processed per second.
-Since the addition operation reads 2 values from the input tensors and writes 1 value to the output tensor, we multiply the number of elements by 3.
+1. Calculate the starting index of the program's block.
+2. Add a block of local indices to produce the global element offsets.
+
+`tl.arange(0, BLOCK_SIZE)` returns a Triton block of contiguous integer values in
+the half-open interval `[0, BLOCK_SIZE)`. It is a Triton tensor value constructed
+by the compiler, not a Python list. For this use, `BLOCK_SIZE` must be a power of two; Triton also
+limits the span of `tl.arange` to at most 1,048,576 elements. The tested block
+sizes satisfy these constraints. Adding `block_start` produces the offsets from
+`block_start` through `block_start + BLOCK_SIZE - 1`.
+
+The final program may contain offsets beyond `n_elements`, so `mask` is a block
+of Boolean values that guards the memory operations. Where the mask is false,
+`tl.load` does not access memory. Because no `other` value is supplied, the
+corresponding loaded value is undefined, but that is safe here because
+`tl.store` uses the same mask and does not write those positions. The kernel
+adds the loaded input blocks and stores the valid results in the output tensor.
+
+Now we benchmark the kernel across different vector and block sizes using FP32
+values. The full implementation and benchmark harness are available in
+[vector_addition.py](vector_addition.py).
+We measure performance in terms of throughput and latency.
+For throughput, we measure the number of bytes processed per second.
+Because vector addition reads two input values and writes one output value per
+element, the byte count is three times the number of elements times the size of
+each element.
 The full equation is `3 * x.numel() * x.element_size() * 1e-9 / (elapsed_ms * 1e-3)`.
 
-### Throughput results
+### Throughput Results
 
 The values below are effective GB/s, calculated from the algorithm's two reads
 and one write per element.
@@ -619,7 +645,7 @@ and one write per element.
 
 ![Vector-add effective bandwidth across block sizes](figures/vector_addition_gbps.png)
 
-### Latency results
+### Latency Results
 
 The values below are median latency in microseconds.
 
@@ -677,8 +703,8 @@ $$
 Vector addition is therefore firmly memory-bound once the workload is large
 enough to saturate the memory system.
 
-But if we are in the memory-bound region, why are we not seeing 300 GB/s of throughput?
-Let's look at the latency results we have for block size 64 for different vector sizes:
+But if this kernel is in the memory-bound regime, why don't we observe 300 GB/s?
+Consider the latency results for block size 64 across several vector sizes:
 
 | Elements | Data moved | Ideal at 300 GB/s | Observed |
 |---:|---:|---:|---:|
@@ -696,7 +722,8 @@ sizes, the gap from 300 GB/s instead reflects the difference between an ideal
 hardware specification and sustainable effective bandwidth, together with
 instruction, scheduling, and memory-system overhead.
 
-Looking at the largest vector size, lets calculate how close we got to the theoretical bandwidth.
+Looking at the largest vector size, let's calculate how close we came to the
+theoretical bandwidth.
 
 | Implementation | GB/s | Percentage of theoretical |
 |---|---:|---:|
@@ -711,7 +738,7 @@ Reaching roughly 80% of the theoretical bandwidth is a good result for this
 end-to-end benchmark and shows that the best Triton configurations use the L4's
 memory system efficiently.
 
-#### Why is Block Size 16 so poor?
+#### Why Is Block Size 16 So Poor?
 
 In this Triton installation, omitting `num_warps` compiled each program with four
 warps, or 128 CUDA threads. For `BLOCK_SIZE=16`, the generated PTX maps those
@@ -720,7 +747,8 @@ across warps, while only the first 16 threads are permitted to store. Caches and
 coalescing can prevent every duplicate load from becoming duplicate DRAM
 traffic, but the extra instructions and warp slots are still wasteful.
 
-Additionally, for the largest input size, the number of triton programs we launched is
+Additionally, for the largest input size, the number of Triton programs launched
+is:
 
 | Block size | Programs launched |
 |---:|---:|
@@ -745,7 +773,8 @@ before considering registers and shared memory. Therefore one-, two-, and
 four-warp programs have ceilings of 24, 24, and 12 resident programs per SM,
 respectively. These are concurrent-residency limits, not the number of programs
 launched or a guarantee that every SM always reaches the limit.
-When we test block size 16 with 1, 2, and 4 warps per program, we get the following results:
+Testing block size 16 with one, two, and four warps per program produces the
+following results:
 
 | Elements | 1 warp/program | 2 warps/program | 4 warps/program |
 | ---: | ---: | ---: | ---: |
@@ -770,11 +799,12 @@ When we test block size 16 with 1, 2, and 4 warps per program, we get the follow
 
 ![Block-size-16 throughput for different warp counts](figures/vector_addition_gbps_bs16_warps1-2-4.png)
 
-As we can see, the performance is significantly better when we use 1 or 2 warps per program instead of 4.
+Performance is significantly better with one or two warps per program than with
+four.
 
-#### Why can large blocks be worse for small inputs?
+#### Why Can Large Blocks Be Worse for Small Inputs?
 
-At 4096 elements
+At 4,096 elements:
 
 | Block size | Triton programs |
 |---:|---:|
