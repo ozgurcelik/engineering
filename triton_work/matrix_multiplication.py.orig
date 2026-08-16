@@ -39,6 +39,19 @@ def matrix_multiplication_naive(a: torch.Tensor, b: torch.Tensor):
     return c
 
 # %%
+# Small benchmark: triton.testing.do_bench handles warmup and CUDA synchronization.
+M, N, K = 256, 256, 256
+a_bench = torch.randn((M, K), device=DEVICE, dtype=torch.float16)
+b_bench = torch.randn((K, N), device=DEVICE, dtype=torch.float16)
+
+naive_ms = triton.testing.do_bench(lambda: matrix_multiplication_naive(a_bench, b_bench))
+torch_ms = triton.testing.do_bench(lambda: torch.matmul(a_bench, b_bench))
+
+print(f"matrix_multiplication_naive: {naive_ms:.3f} ms")
+print(f"torch.matmul:                {torch_ms:.3f} ms")
+print(f"torch speedup:               {naive_ms / torch_ms:.2f}x")
+
+# %%
 
 # calculate the each element of the result matrix separately by loading blocks of A and B
 @triton.jit
@@ -79,39 +92,6 @@ def matrix_multiplication_naive_blocked(a: torch.Tensor, b: torch.Tensor):
     c = torch.empty(M, N, device=DEVICE, dtype=a.dtype)
     matrix_multiplication_kernel_naive_blocked[(M, N)](a, b, c, M, N, K, a.stride(0), b.stride(0), c.stride(0), BLOCK_SIZE_K)
     return c
-
-# %%
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=['M', 'N', 'K'],
-        x_vals=[128, 256, 512, 768, 1024],
-        line_arg='provider',
-        line_vals=['triton_naive', 'triton_naive_blocked', 'torch'],
-        line_names=['Triton Naive', 'Triton Naive Blocked', 'Torch'],
-        styles=[('blue', '-'), ('orange', '-'), ('green', '-')],
-        ylabel='TFLOPS',
-        plot_name='matmul-naive-vs-naive-blocked-vs-torch-fp16',
-        args={},
-    ))
-def benchmark_naive(M, N, K, provider):
-    a = torch.randn((M, K), device=DEVICE, dtype=torch.float16)
-    b = torch.randn((K, N), device=DEVICE, dtype=torch.float16)
-    stream = getattr(torch, DEVICE.type).Stream()
-    getattr(torch, DEVICE.type).set_stream(stream)
-
-    if provider == 'triton_naive':
-        ms = triton.testing.do_bench(lambda: matrix_multiplication_naive(a, b))
-    elif provider == 'triton_naive_blocked':
-        ms = triton.testing.do_bench(lambda: matrix_multiplication_naive_blocked(a, b))
-    elif provider == 'torch':
-        ms = triton.testing.do_bench(lambda: torch.matmul(a, b))
-
-    tflops = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)
-    return tflops(ms)
-
-benchmark_naive.run(show_plots=True, print_data=True)
-
-# %%
 
 """
 ====================================================================
