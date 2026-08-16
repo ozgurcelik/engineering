@@ -199,7 +199,8 @@ for B, C); it lets Triton commit to the widest vectorized load
 form rather than a more conservative fallback.
 """
 
-# do it row major. load a row of A once in a kernel and calculate the entire row of the result matrix in one kernel
+# Compute one BLOCK_SIZE_N-wide section of an output row per program.
+# Programs covering different column blocks of the same row reload that row of A.
 @triton.jit
 def matrix_multiplication_kernel_naive_row_major(
     a_ptr, b_ptr, c_ptr,
@@ -231,24 +232,34 @@ def matrix_multiplication_kernel_naive_row_major(
         a_mask = k_mask
         b_mask = k_mask[:, None] & n_mask[None, :]
 
-        a_vals = tl.load(a_ptrs, mask=a_mask).to(tl.float32) # shape [BLOCK_SIZE_K]
-        b_vals = tl.load(b_ptrs, mask=b_mask).to(tl.float32) # shape [BLOCK_SIZE_K, BLOCK_SIZE_N]
+        a_vals = tl.load(a_ptrs, mask=a_mask, other=0.0).to(tl.float32) # shape [BLOCK_SIZE_K]
+        b_vals = tl.load(b_ptrs, mask=b_mask, other=0.0).to(tl.float32) # shape [BLOCK_SIZE_K, BLOCK_SIZE_N]
 
         acc += tl.sum(a_vals[:, None] * b_vals, axis=0) # shape [BLOCK_SIZE_N]
 
     c_offsets = tl.arange(0, BLOCK_SIZE_N) + col
     c_mask = c_offsets < N
     c_m_n_ptr = c_ptr + row * c_row_stride + c_offsets * c_col_stride
-    tl.store(c_m_n_ptr, acc.to(tl.float16), mask=c_mask)
+    tl.store(c_m_n_ptr, acc, mask=c_mask)
 
 def matrix_multiplication_naive_row_major(a: torch.Tensor, b: torch.Tensor):
+    assert a.ndim == 2 and b.ndim == 2, "expected two 2D matrices"
     M, K = a.shape
-    K, N = b.shape
+    K_b, N = b.shape
+    assert K == K_b, "incompatible matrix dimensions"
+    assert a.device == b.device, "A and B must be on the same device"
+    assert a.dtype == b.dtype, "A and B must have the same dtype"
+    assert a.dtype in (torch.float16, torch.float32), "only fp16 and fp32 are supported"
     BLOCK_SIZE_K = 64
     BLOCK_SIZE_N = 64
     grid_size = (M, triton.cdiv(N, BLOCK_SIZE_N))
-    c = torch.empty(M, N, device=DEVICE, dtype=a.dtype)
-    matrix_multiplication_kernel_naive_row_major[grid_size](a, b, c, M, N, K, a.stride(0), b.stride(0), c.stride(0), a.stride(1), b.stride(1), c.stride(1), BLOCK_SIZE_N, BLOCK_SIZE_K)
+    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+    matrix_multiplication_kernel_naive_row_major[grid_size](
+        a, b, c, M, N, K,
+        a.stride(0), b.stride(0), c.stride(0),
+        a.stride(1), b.stride(1), c.stride(1),
+        BLOCK_SIZE_N, BLOCK_SIZE_K,
+    )
     return c
 
 
@@ -285,26 +296,34 @@ def matrix_multiplication_tiled_kernel(
         a_mask = m_mask[:, None] & k_mask[None, :]
         b_mask = k_mask[:, None] & n_mask[None, :]
         
-        a_vals = tl.load(a_ptrs, mask=a_mask)
-        b_vals = tl.load(b_ptrs, mask=b_mask)
+        a_vals = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b_vals = tl.load(b_ptrs, mask=b_mask, other=0.0)
 
-        # With fp16 inputs Triton's tl.dot uses HMMA tensor cores by default.
-        # The accumulator stays fp32 for accuracy across the K reduction.
         acc = tl.dot(a_vals, b_vals, acc)
 
     c_offsets = m_offsets[:, None] * c_row_stride + n_offsets[None, :] * c_col_stride
     c_mask = m_mask[:, None] & n_mask[None, :]
-    tl.store(c_ptr + c_offsets, acc.to(tl.float16), mask=c_mask)
+    tl.store(c_ptr + c_offsets, acc, mask=c_mask)
 
 def matrix_multiplication_tiled(a: torch.Tensor, b: torch.Tensor):
+    assert a.ndim == 2 and b.ndim == 2, "expected two 2D matrices"
     M, K = a.shape
-    K, N = b.shape
+    K_b, N = b.shape
+    assert K == K_b, "incompatible matrix dimensions"
+    assert a.device == b.device, "A and B must be on the same device"
+    assert a.dtype == b.dtype, "A and B must have the same dtype"
+    assert a.dtype in (torch.float16, torch.float32), "only fp16 and fp32 are supported"
     BLOCK_SIZE_M = 64
     BLOCK_SIZE_N = 64
     BLOCK_SIZE_K = 64
     grid_size = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
-    c = torch.empty(M, N, device=DEVICE, dtype=a.dtype)
-    matrix_multiplication_tiled_kernel[grid_size](a, b, c, M, N, K, a.stride(0), b.stride(0), c.stride(0), a.stride(1), b.stride(1), c.stride(1), BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K)
+    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+    matrix_multiplication_tiled_kernel[grid_size](
+        a, b, c, M, N, K,
+        a.stride(0), b.stride(0), c.stride(0),
+        a.stride(1), b.stride(1), c.stride(1),
+        BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K,
+    )
     return c
 
 
@@ -783,9 +802,6 @@ def matrix_multiplication_autotuned(a: torch.Tensor, b: torch.Tensor):
 ====================================================================
 POINTER ADVANCEMENT + MODULO-TRICK MASKING
 ====================================================================
-
-Two cleanups on top of the autotuned kernel, both copied from the
-tutorial in 03-matrix-multiplication.py.
 
 (1) Pointer advancement instead of pointer recomputation
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

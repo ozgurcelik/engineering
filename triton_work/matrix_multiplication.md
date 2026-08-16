@@ -134,3 +134,92 @@ Let's benchmark these two implementations with FP16 matrices and compare them wi
 
 We can see that the blocked naive Triton implementation is ~10x faster than the naive Triton implementation while performing way worse than the torch matmul function as one can expect.
 
+## Tiled Implementation
+
+In previous implementation, we moved to a blocked implementation for the inner loop.
+Now, we will also use blocks for the outer loop.
+In tile matmul, each program computes one output tile C[m_tile, n_tile] of size BLOCK_SIZE_M x BLOCK_SIZE_N.
+To compute this, the program reads
+- One row strip of A: rows m_tile * BLOCK_SIZE_M to m_tile * BLOCK_SIZE_M + BLOCK_SIZE_M - 1, all K columns. Call this A_m
+- One column strip of B: columns n_tile * BLOCK_SIZE_N to n_tile * BLOCK_SIZE_N + BLOCK_SIZE_N - 1, all K rows. Call this B_n
+
+Thanks to the tiling, access to the both A and B matrices is coalesced.
+
+```python
+@triton.jit
+def matrix_multiplication_tiled_kernel(
+    a_ptr, b_ptr, c_ptr,
+    M, N, K, # a is MxK, b is KxN, c is MxN
+    a_row_stride, b_row_stride, c_row_stride,
+    a_col_stride, b_col_stride, c_col_stride,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    row = tl.program_id(0) * BLOCK_SIZE_M
+    col = tl.program_id(1) * BLOCK_SIZE_N
+
+    m_offsets = tl.arange(0, BLOCK_SIZE_M) + row
+    m_mask = m_offsets < M
+
+    n_offsets = tl.arange(0, BLOCK_SIZE_N) + col
+    n_mask = n_offsets < N
+
+    acc = tl.zeros([BLOCK_SIZE_M, BLOCK_SIZE_N], dtype=tl.float32)
+    for k in range(0, K, BLOCK_SIZE_K):
+        k_offsets = tl.arange(0, BLOCK_SIZE_K) + k
+        k_mask = k_offsets < K
+
+        a_offsets = m_offsets[:, None] * a_row_stride + k_offsets[None, :] * a_col_stride # shape [BLOCK_SIZE_M, BLOCK_SIZE_K]
+        b_offsets = k_offsets[:, None] * b_row_stride + n_offsets[None, :] * b_col_stride # shape [BLOCK_SIZE_K, BLOCK_SIZE_N]
+
+        a_ptrs = a_ptr + a_offsets
+        b_ptrs = b_ptr + b_offsets
+
+        a_mask = m_mask[:, None] & k_mask[None, :]
+        b_mask = k_mask[:, None] & n_mask[None, :]
+        
+        a_vals = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b_vals = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        acc = tl.dot(a_vals, b_vals, acc)
+
+    c_offsets = m_offsets[:, None] * c_row_stride + n_offsets[None, :] * c_col_stride
+    c_mask = m_mask[:, None] & n_mask[None, :]
+    tl.store(c_ptr + c_offsets, acc, mask=c_mask)
+
+def matrix_multiplication_tiled(a: torch.Tensor, b: torch.Tensor):
+    assert a.ndim == 2 and b.ndim == 2, "expected two 2D matrices"
+    M, K = a.shape
+    K_b, N = b.shape
+    assert K == K_b, "incompatible matrix dimensions"
+    assert a.device == b.device, "A and B must be on the same device"
+    assert a.dtype == b.dtype, "A and B must have the same dtype"
+    assert a.dtype in (torch.float16, torch.float32), "only fp16 and fp32 are supported"
+    BLOCK_SIZE_M = 64
+    BLOCK_SIZE_N = 64
+    BLOCK_SIZE_K = 64
+    grid_size = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
+    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+    matrix_multiplication_tiled_kernel[grid_size](
+        a, b, c, M, N, K,
+        a.stride(0), b.stride(0), c.stride(0),
+        a.stride(1), b.stride(1), c.stride(1),
+        BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K,
+    )
+    return c
+```
+
+First difference we should realize is that the grid size is now `(triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))` instead of `(M, N)`.
+That's because we are now computing one tile of the result matrix at a time in one program.
+The row and column indices are also affected by the tiling as we can see, and we need to compute the offset and masks for the rows of A and the columns of B, m and n respectively.
+Note that the accumulator is now a 2D array of size BLOCK_SIZE_M x BLOCK_SIZE_N, the same size as the output tile.
+
+As we discussed, to compute the output tile C[m_tile, n_tile], we need to compute the dot product of A_m and B_n, which are now 2D arrays of size BLOCK_SIZE_M x K and K x BLOCK_SIZE_N respectively.
+We do this operation in blocks of size BLOCK_SIZE_K in the inner loop.
+The offsets for A and B are computed as `m_offsets[:, None] * a_row_stride + k_offsets[None, :] * a_col_stride` and `k_offsets[:, None] * b_row_stride + n_offsets[None, :] * b_col_stride` respectively.
+Quite a bit symmetric as we like to see.
+Then we compute the masks for A and B, `m_mask[:, None] & k_mask[None, :]` and `k_mask[:, None] & n_mask[None, :]` respectively.
+We should realize that since we have both inner and outer blocks, the masks may have False values in both dimensions.
+
+Finally, we do the same offset and mask computation for the output tile and save the results.
