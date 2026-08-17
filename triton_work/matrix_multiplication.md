@@ -129,6 +129,7 @@ Second, the access to A matrix is coalesced since we are loading contiguous valu
 On the other hand, the access to B matrix is not coalesced since we are loading values from different rows of the B matrix.
 
 Let's benchmark these two implementations with FP16 matrices and compare them with the torch matmul function.
+We will be using square matrices here.
 
 ![FP16 matrix multiplication performance: naive Triton, blocked naive Triton, and PyTorch](figures/matmul_naive_vs_naiveblocked_fp16.png)
 
@@ -223,3 +224,84 @@ Then we compute the masks for A and B, `m_mask[:, None] & k_mask[None, :]` and `
 We should realize that since we have both inner and outer blocks, the masks may have False values in both dimensions.
 
 Finally, we do the same offset and mask computation for the output tile and save the results.
+
+Now, let's compare the performance of the tiled implementation with different block sizes (BLOCK_SIZE_MxBLOCK_SIZE_NxBLOCK_SIZE_K) and compare it with the torch matmul function.
+We will be using square matrices once again.
+
+![FP16 matrix multiplication performance: tiled Triton, and PyTorch](figures/matmul_tiled_blocksizes.png)
+
+matmul-tiled-vs-torch-fp16:
+          M        N        K  Triton 64x64x64  Triton 64x64x32  Triton 128x128x64  Triton 128x128x32      Torch
+0     256.0    256.0    256.0         3.277117         2.677999           2.638757           2.413236   3.044038
+1     512.0    512.0    512.0        16.363027        10.972446          13.228417           9.628797  19.607187
+2    1024.0   1024.0   1024.0        39.500768        32.638791          34.178652          41.845382  32.695045
+3    2048.0   2048.0   2048.0        52.727315        49.424401          57.844617          63.590078  60.582112
+4    4096.0   4096.0   4096.0        40.592372        39.786075          54.389835          58.560366  51.110964
+5    4608.0   4608.0   4608.0        40.706320        40.929206          50.553000          47.368670  48.158197
+6    5120.0   5120.0   5120.0        22.628278        25.640121          33.793592          30.160854  51.234158
+7    6144.0   6144.0   6144.0        15.961657        18.780186          29.921488          26.273706  61.671232
+8    7168.0   7168.0   7168.0        16.633684        18.375466          28.497214          25.864553  58.471390
+9    8192.0   8192.0   8192.0        18.099467        16.371548          28.072610          22.572190  53.165160
+10  16384.0  16384.0  16384.0        14.678573        11.551419          28.131726          22.752708  53.134803
+
+Remember that for the L4 GPU, we have the following properties:
+- 58 SMs
+- 48 MB L2
+- 300 GB/s memory bandwidth
+- 121 TFLOP/s FP16 performance
+
+Now, let's try to make sense of the results we are seeing.
+
+### Why do we have a large drop in performance as we increase the matrix size from 4608 to 5120?
+
+As we said before, we are using FP16 square matrices here.
+The memory of such a matrix is 2N^2 bytes.
+For the 4608x4608 matrix, this is 40.5 MB, and for the 5120x5120 matrix, this is 50 MB.
+The largest square matrix that can fit in the L2 cache is
+
+```
+\(n_\text{max}
+=
+\sqrt{\frac{48\cdot2^{20}}{2}}
+\approx5017\)
+```
+
+In this implementation, we do not have an explicit grouped tile ordering.
+Because of that, while for 4096 and 4608 matrices, one of the operands can reasonably fit in the L2 cache, after that point, programs can sweep too far across one grid dimension before returning to an operand tile which has already been evicted from the L2 cache.
+Of course, it's not just one operand taking space in the L2 cache, but after that point, 5017, we can't theoritically fit an operand anymore in the L2 cache.
+
+Why 128×128 eventually beats 64×64
+For one square \(T\times T\) output tile and the full K dimension, a program performs:
+\[
+2T^2K \text{ FLOPs}
+\]Ignoring inter-program cache reuse, it reads approximately:
+\[
+2TK + 2KT = 4TK \text{ bytes}
+\]because FP16 occupies two bytes. Therefore:
+\[
+AI_{\text{program}} =
+\frac{2T^2K}{4TK}
+=\frac{T}{2}
+\]That gives:
+Tile	Program-local arithmetic intensity
+64×64	32 FLOP/byte
+128×128	64 FLOP/byte
+
+
+A 128×128 tile loads twice as much A and B data as a 64×64 tile, but computes four times as many outputs. Thus it gets twice as much work from each byte.
+If L2 scheduling lets programs reuse approximately one operand between adjacent output tiles, the effective DRAM intensities become roughly:
+Tile	Effective HBM intensity	300 GB/s roof
+64×64	~64 FLOP/byte	~19.2 TFLOP/s
+128×128	~128 FLOP/byte	~38.4 TFLOP/s
+
+
+Compare that with your \(N=16384\) measurements:
+64×64: 14.69 TFLOP/s
+128×128: 27.56 TFLOP/s
+Those correspond to roughly:
+\[
+14.69/64 \approx 230\ \text{GB/s}
+\]and:
+\[
+27.56/128 \approx 215\ \text{GB/s}
+\]That is remarkably consistent with both kernels becoming DRAM-bandwidth-bound, with 128×128 having approximately twice the useful work per DRAM byte.

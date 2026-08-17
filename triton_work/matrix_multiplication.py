@@ -262,7 +262,7 @@ def matrix_multiplication_naive_row_major(a: torch.Tensor, b: torch.Tensor):
     )
     return c
 
-
+# %%
 @triton.jit
 def matrix_multiplication_tiled_kernel(
     a_ptr, b_ptr, c_ptr,
@@ -305,7 +305,13 @@ def matrix_multiplication_tiled_kernel(
     c_mask = m_mask[:, None] & n_mask[None, :]
     tl.store(c_ptr + c_offsets, acc, mask=c_mask)
 
-def matrix_multiplication_tiled(a: torch.Tensor, b: torch.Tensor):
+def matrix_multiplication_tiled(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    block_size_m: int = 128,
+    block_size_n: int = 128,
+    block_size_k: int = 64,
+):
     assert a.ndim == 2 and b.ndim == 2, "expected two 2D matrices"
     M, K = a.shape
     K_b, N = b.shape
@@ -313,9 +319,9 @@ def matrix_multiplication_tiled(a: torch.Tensor, b: torch.Tensor):
     assert a.device == b.device, "A and B must be on the same device"
     assert a.dtype == b.dtype, "A and B must have the same dtype"
     assert a.dtype in (torch.float16, torch.float32), "only fp16 and fp32 are supported"
-    BLOCK_SIZE_M = 64
-    BLOCK_SIZE_N = 64
-    BLOCK_SIZE_K = 64
+    BLOCK_SIZE_M = block_size_m
+    BLOCK_SIZE_N = block_size_n
+    BLOCK_SIZE_K = block_size_k
     grid_size = (triton.cdiv(M, BLOCK_SIZE_M), triton.cdiv(N, BLOCK_SIZE_N))
     c = torch.empty((M, N), device=a.device, dtype=a.dtype)
     matrix_multiplication_tiled_kernel[grid_size](
@@ -325,6 +331,67 @@ def matrix_multiplication_tiled(a: torch.Tensor, b: torch.Tensor):
         BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K,
     )
     return c
+
+# %%
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=['M', 'N', 'K'],
+        x_vals=[
+            256, 512, 1024, 2048, 4096,
+            4608, 5120, 6144, 7168,
+            8192, 16384,
+        ],
+        line_arg='provider',
+        line_vals=[
+            'triton_tiled_64_64_64',
+            'triton_tiled_64_64_32',
+            'triton_tiled_128_128_64',
+            'triton_tiled_128_128_32',
+            'torch',
+        ],
+        line_names=[
+            'Triton 64x64x64', 'Triton 64x64x32',
+            'Triton 128x128x64', 'Triton 128x128x32', 'Torch',
+        ],
+        styles=[
+            ('blue', '-'), ('blue', '--'),
+            ('orange', '-'), ('orange', '--'), ('green', '-'),
+        ],
+        ylabel='TFLOPS',
+        plot_name='matmul-tiled-vs-torch-fp16',
+        args={},
+    ))
+def benchmark_tiled(M, N, K, provider):
+    a = torch.randn((M, K), device=DEVICE, dtype=torch.float16)
+    b = torch.randn((K, N), device=DEVICE, dtype=torch.float16)
+    stream = getattr(torch, DEVICE.type).Stream()
+    getattr(torch, DEVICE.type).set_stream(stream)
+
+    if provider == 'triton_tiled_64_64_64':
+        ms = triton.testing.do_bench(
+            lambda: matrix_multiplication_tiled(a, b, 64, 64, 64)
+        )
+    elif provider == 'triton_tiled_64_64_32':
+        ms = triton.testing.do_bench(
+            lambda: matrix_multiplication_tiled(a, b, 64, 64, 32)
+        )
+    elif provider == 'triton_tiled_128_128_64':
+        ms = triton.testing.do_bench(
+            lambda: matrix_multiplication_tiled(a, b, 128, 128, 64)
+        )
+    elif provider == 'triton_tiled_128_128_32':
+        ms = triton.testing.do_bench(
+            lambda: matrix_multiplication_tiled(a, b, 128, 128, 32)
+        )
+    elif provider == 'torch':
+        ms = triton.testing.do_bench(lambda: torch.matmul(a, b))
+
+    tflops = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)
+    return tflops(ms)
+
+benchmark_tiled.run(show_plots=True, print_data=True)
+
+# %%
 
 
 """
