@@ -270,38 +270,62 @@ In this implementation, we do not have an explicit grouped tile ordering.
 Because of that, while for 4096 and 4608 matrices, one of the operands can reasonably fit in the L2 cache, after that point, programs can sweep too far across one grid dimension before returning to an operand tile which has already been evicted from the L2 cache.
 Of course, it's not just one operand taking space in the L2 cache, but after that point, 5017, we can't theoritically fit an operand anymore in the L2 cache.
 
-Why 128×128 eventually beats 64×64
-For one square \(T\times T\) output tile and the full K dimension, a program performs:
-\[
-2T^2K \text{ FLOPs}
-\]Ignoring inter-program cache reuse, it reads approximately:
-\[
-2TK + 2KT = 4TK \text{ bytes}
-\]because FP16 occupies two bytes. Therefore:
-\[
-AI_{\text{program}} =
-\frac{2T^2K}{4TK}
-=\frac{T}{2}
-\]That gives:
-Tile	Program-local arithmetic intensity
-64×64	32 FLOP/byte
-128×128	64 FLOP/byte
+### Why does 128x128 eventually beat 64x64?
 
+One program that computes one output tile of size TxT from A and B matrices of size MxK and KxN respectively performs T^2K multiplications and T^2K additions, totaling 2T^2K FLOPs.
+Ignoring the cache reuse, it reads 2TK + 2KT = 4TK bytes of data (FP16 occupies 2 bytes).
+This gives an arithmetic intensity of 2T^2K / 4TK = T/2.
 
-A 128×128 tile loads twice as much A and B data as a 64×64 tile, but computes four times as many outputs. Thus it gets twice as much work from each byte.
-If L2 scheduling lets programs reuse approximately one operand between adjacent output tiles, the effective DRAM intensities become roughly:
-Tile	Effective HBM intensity	300 GB/s roof
-64×64	~64 FLOP/byte	~19.2 TFLOP/s
-128×128	~128 FLOP/byte	~38.4 TFLOP/s
+Now looking at 64x64 and 128x128 output tiles, we expect
 
+| Output tile | No-L2-reuse arithmetic intensity | DRAM roof at 300 GB/s |
+|---|---:|---:|
+| `64×64` | 32 FLOP/byte | 9.6 TFLOP/s |
+| `128×128` | 64 FLOP/byte | 19.2 TFLOP/s |
 
-Compare that with your \(N=16384\) measurements:
-64×64: 14.69 TFLOP/s
-128×128: 27.56 TFLOP/s
-Those correspond to roughly:
-\[
-14.69/64 \approx 230\ \text{GB/s}
-\]and:
-\[
-27.56/128 \approx 215\ \text{GB/s}
-\]That is remarkably consistent with both kernels becoming DRAM-bandwidth-bound, with 128×128 having approximately twice the useful work per DRAM byte.
+At the largest matrix size we tested, 16384x16384, we have
+
+128×128×64: 28.1 TFLOP/s
+64×64×64: 14.7 TFLOP/s
+
+Quite a bit consistent with our expectations with both exceeding the DRAM roof at 300 GB/s thanks to some L2 reuse.
+
+### Why does 64x64 do better than 128x128 at smaller matrix sizes?
+
+For a matrix multiplication between two matrices of size MxK and KxN respectively, with tiling size TxT, we launch a grid of size (triton.cdiv(M, T), triton.cdiv(N, T)).
+In our case, as we use square matrices, we have (M, N) = (N, N), and as a result, we get 
+
+P = ceiling(N/T)^2
+
+programs. For small matrices, this means
+
+| Matrix | `64×64` programs | `128×128` programs |
+|---:|---:|---:|
+| 256 | 16 | 4 |
+| 512 | 64 | 16 |
+| 1024 | 256 | 64 |
+| 2048 | 1024 | 256 |
+
+Since we are using an L4 GPU, we have 58 SMs.
+But for the matrix size 256x256, only 4 programs are launched for tile size 128x128.
+So, at the lower end, we have a severe underutilization of the SMs, and simply put this problem is more severe for 128x128 than 64x64.
+This is why 64x64 does better than 128x128 at smaller matrix sizes.
+
+### Why does performance peak around 2048x2048?
+
+We see that for all tile and inner loop block sizes, performance peaks around 2048x2048 input matrices.
+Why is that?
+Let's look at the memory requirements for the different matrix sizes.
+
+| Matrix | Memory (MB) |
+|---:|---:|
+| 1024 | 2 |
+| 2048 | 8 |
+| 4096 | 32 |
+| 8192 | 128 |
+| 16384 | 512 |
+
+Given that we have 48 MB of L2 cache, up to and including 2048x2048 matrices, we can fit both operands in the L2 cache.
+In fact, as output writes can outcompete the operand reads for L2 cache, it's good that we can fit even the output matrix in the L2 cache along with the operands for the 2048x2048 matrix case.
+But for the 4096x4096 matrix, we no longer can fit both operands in the L2 cache.
+And as we discussed before, starting from 5120x5120 matrices, we can't even fit one operand in the L2 cache which led to significant drop in performance.
