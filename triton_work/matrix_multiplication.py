@@ -336,7 +336,7 @@ def matrix_multiplication_tiled(
     )
     return c
 
-# %%
+
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=['M', 'N', 'K'],
@@ -556,23 +556,91 @@ def matrix_multiplication_tiled_kernel_supergrouped(
     tl.store(c_ptr + c_offsets, acc.to(tl.float16), mask=c_mask)
 
 
-def matrix_multiplication_tiled_supergrouped(a: torch.Tensor, b: torch.Tensor):
+def matrix_multiplication_tiled_supergrouped(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    block_size_m: int = 64,
+    block_size_n: int = 64,
+    block_size_k: int = 64,
+    group_size_m: int = 8,
+    num_warps: int = 4,
+    num_stages: int = 3,
+):
+    assert a.ndim == 2 and b.ndim == 2, "expected two 2D matrices"
     M, K = a.shape
-    K, N = b.shape
-    BLOCK_SIZE_M = 64
-    BLOCK_SIZE_N = 64
-    BLOCK_SIZE_K = 64
-    GROUP_SIZE_M = 8
+    K_b, N = b.shape
+    assert K == K_b, "incompatible matrix dimensions"
+    assert a.device == b.device, "A and B must be on the same device"
+    assert a.dtype == b.dtype, "A and B must have the same dtype"
+    assert a.dtype in (torch.float16, torch.float32), "only fp16 and fp32 are supported"
+    BLOCK_SIZE_M = block_size_m
+    BLOCK_SIZE_N = block_size_n
+    BLOCK_SIZE_K = block_size_k
+    GROUP_SIZE_M = group_size_m
     # 1D launch grid is required for the supergrouped pid -> (pid_m, pid_n) mapping
     grid_size = (triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),)
-    c = torch.empty(M, N, device=DEVICE, dtype=a.dtype)
+    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
     matrix_multiplication_tiled_kernel_supergrouped[grid_size](
         a, b, c, M, N, K,
         a.stride(0), b.stride(0), c.stride(0),
         a.stride(1), b.stride(1), c.stride(1),
         BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return c
+
+
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=['M', 'N', 'K'],
+        x_vals=[
+            256, 512, 1024, 2048, 4096,
+            4608, 5120, 6144, 7168,
+            8192, 16384,
+        ],
+        line_arg='provider',
+        line_vals=[
+            'triton_supergrouped_64_64_64',
+            'triton_supergrouped_128_128_64',
+            'torch',
+        ],
+        line_names=[
+            'Triton Supergrouped 64x64x64',
+            'Triton Supergrouped 128x128x64',
+            'Torch',
+        ],
+        styles=[
+            ('blue', '-'),
+            ('orange', '-'),
+            ('green', '-'),
+        ],
+        ylabel='TFLOPS',
+        plot_name='matmul-supergrouped-vs-torch-fp16',
+        args={},
+    ))
+def benchmark_tiled_supergrouped(M, N, K, provider):
+    a = torch.randn((M, K), device=DEVICE, dtype=torch.float16)
+    b = torch.randn((K, N), device=DEVICE, dtype=torch.float16)
+    stream = getattr(torch, DEVICE.type).Stream()
+    getattr(torch, DEVICE.type).set_stream(stream)
+
+    if provider == 'triton_supergrouped_64_64_64':
+        ms = triton.testing.do_bench(
+            lambda: matrix_multiplication_tiled_supergrouped(a, b, 64, 64, 64)
+        )
+    elif provider == 'triton_supergrouped_128_128_64':
+        ms = triton.testing.do_bench(
+            lambda: matrix_multiplication_tiled_supergrouped(a, b, 128, 128, 64)
+        )
+    elif provider == 'torch':
+        ms = triton.testing.do_bench(lambda: torch.matmul(a, b))
+
+    tflops = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)
+    return tflops(ms)
+
+
+benchmark_tiled_supergrouped.run(show_plots=True, print_data=True)
 
 
 """
