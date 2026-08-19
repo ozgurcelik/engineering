@@ -311,6 +311,8 @@ def matrix_multiplication_tiled(
     block_size_m: int = 128,
     block_size_n: int = 128,
     block_size_k: int = 64,
+    num_warps: int = 4,
+    num_stages: int = 3,
 ):
     assert a.ndim == 2 and b.ndim == 2, "expected two 2D matrices"
     M, K = a.shape
@@ -329,6 +331,8 @@ def matrix_multiplication_tiled(
         a.stride(0), b.stride(0), c.stride(0),
         a.stride(1), b.stride(1), c.stride(1),
         BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return c
 
