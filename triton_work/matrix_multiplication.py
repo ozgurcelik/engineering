@@ -348,18 +348,16 @@ def matrix_multiplication_tiled(
         line_arg='provider',
         line_vals=[
             'triton_tiled_64_64_64',
-            'triton_tiled_64_64_32',
             'triton_tiled_128_128_64',
-            'triton_tiled_128_128_32',
             'torch',
         ],
         line_names=[
-            'Triton 64x64x64', 'Triton 64x64x32',
-            'Triton 128x128x64', 'Triton 128x128x32', 'Torch',
+            'Triton 64x64x64',
+            'Triton 128x128x64', 'Torch',
         ],
         styles=[
-            ('blue', '-'), ('blue', '--'),
-            ('orange', '-'), ('orange', '--'), ('green', '-'),
+            ('blue', '-'),
+            ('orange', '-'), ('green', '-'),
         ],
         ylabel='TFLOPS',
         plot_name='matmul-tiled-vs-torch-fp16',
@@ -375,17 +373,9 @@ def benchmark_tiled(M, N, K, provider):
         ms = triton.testing.do_bench(
             lambda: matrix_multiplication_tiled(a, b, 64, 64, 64)
         )
-    elif provider == 'triton_tiled_64_64_32':
-        ms = triton.testing.do_bench(
-            lambda: matrix_multiplication_tiled(a, b, 64, 64, 32)
-        )
     elif provider == 'triton_tiled_128_128_64':
         ms = triton.testing.do_bench(
             lambda: matrix_multiplication_tiled(a, b, 128, 128, 64)
-        )
-    elif provider == 'triton_tiled_128_128_32':
-        ms = triton.testing.do_bench(
-            lambda: matrix_multiplication_tiled(a, b, 128, 128, 32)
         )
     elif provider == 'torch':
         ms = triton.testing.do_bench(lambda: torch.matmul(a, b))
