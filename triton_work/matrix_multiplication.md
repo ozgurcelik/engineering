@@ -580,3 +580,10 @@ For `pid_m`, we add `first_pid_m` to convert the row offset within the group int
 
 The remainder of the kernel is identical to the tiled implementation.
 The only difference is how programs are assigned to output tiles: instead of obtaining the tile coordinates directly from `tl.program_id(0)` and `tl.program_id(1)`, we derive `(pid_m, pid_n)` from the scalar program ID using the grouped ordering.
+
+
+## Persistent Kernel
+
+## Block Pointers Implementation (Same performance but simpler implementation)
+
+## Autotuning
