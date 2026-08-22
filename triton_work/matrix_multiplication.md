@@ -340,62 +340,66 @@ To compute this, the program reads
 Two programs that share the same m_tile reads the same A_m, and two programs that share the same n_tile reads the same B_n.
 L2 reuse comes from arranging programs so that ones close in time (close in pid) share A_m or B_n.
 
-====================================================================
-CONCRETE EXAMPLE: 6 x 8 grid of output tiles, GROUP_SIZE_M = 2
-====================================================================
-num_pid_m = 6, num_pid_n = 8, GROUP_SIZE_M = 2
-=> num_pid_in_group = 2 * 8 = 16
-=> 48 programs total, 3 groups of 16
+### Concrete example: 6 × 8 grid, `GROUP_SIZE_M = 2`
 
-Row-major mapping (what a 2D grid effectively gives us):
+- `num_pid_m = 6`, `num_pid_n = 8`, `GROUP_SIZE_M = 2`
+- `num_pid_in_group = 2 × 8 = 16`
+- 48 programs total, 3 groups of 16
 
-         n=0  n=1  n=2  n=3  n=4  n=5  n=6  n=7
-   m=0 |   0    1    2    3    4    5    6    7
-   m=1 |   8    9   10   11   12   13   14   15
-   m=2 |  16   17   18   19   20   21   22   23
-   m=3 |  24   25   26   27   28   29   30   31
-   m=4 |  32   33   34   35   36   37   38   39
-   m=5 |  40   41   42   43   44   45   46   47
+#### Row-major mapping
 
-Supergrouped mapping (column-major within each height-2 strip):
+One possible flattened row-major ordering of the logical tile grid. Each cell shows the scalar program ID (`pid`) assigned to tile `(m, n)`:
 
-         n=0  n=1  n=2  n=3  n=4  n=5  n=6  n=7
-   m=0 |   0    2    4    6    8   10   12   14   <- group 0
-   m=1 |   1    3    5    7    9   11   13   15
-   m=2 |  16   18   20   22   24   26   28   30   <- group 1
-   m=3 |  17   19   21   23   25   27   29   31
-   m=4 |  32   34   36   38   40   42   44   46   <- group 2
-   m=5 |  33   35   37   39   41   43   45   47
+| m \ n | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+|------:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 0 | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+| 1 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 |
+| 2 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 |
+| 3 | 24 | 25 | 26 | 27 | 28 | 29 | 30 | 31 |
+| 4 | 32 | 33 | 34 | 35 | 36 | 37 | 38 | 39 |
+| 5 | 40 | 41 | 42 | 43 | 44 | 45 | 46 | 47 |
 
-Both schedules compute the exact same 48 tiles and produce identical
-results. Only the order changes -- and therefore which inputs the GPU is
-hammering at any given moment.
+#### Supergrouped mapping
 
+Column-major within each height-2 strip. Groups cover rows `(0,1)`, `(2,3)`, and `(4,5)`:
 
-====================================================================
-L2 TRACE: 4 SMs concurrent, L2 holds 6 strips (toy numbers)
-====================================================================
+| m \ n | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+|------:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 0 | 0 | 2 | 4 | 6 | 8 | 10 | 12 | 14 |
+| 1 | 1 | 3 | 5 | 7 | 9 | 11 | 13 | 15 |
+| 2 | 16 | 18 | 20 | 22 | 24 | 26 | 28 | 30 |
+| 3 | 17 | 19 | 21 | 23 | 25 | 27 | 29 | 31 |
+| 4 | 32 | 34 | 36 | 38 | 40 | 42 | 44 | 46 |
+| 5 | 33 | 35 | 37 | 39 | 41 | 43 | 45 | 47 |
 
-ROW-MAJOR:
-    wave 1  pids 0..3   tiles (m=0,n=0,1,2,3)   load A0 + B0,B1,B2,B3            -> 5 HBM
-    wave 2  pids 4..7   tiles (m=0,n=4,5,6,7)   A0 hit, load B4,B5,B6,B7         -> 4 HBM
-                                        (B0,B1,B2,B3 evicted to make room)
-    wave 3  pids 8..11  tiles (m=1,n=0,1,2,3)   load A1 + B0,B1,B2,B3            -> 5 HBM
-                                        (A0, B0,B1,B2,B3 evicted to make room)
-    wave 4  pids 12..15 tiles (m=1,n=4,5,6,7)   A1 hit, load B4,B5,B6,B7         -> 4 HBM
-                                        (B0,B1,B2,B3 evicted to make room)
-    ... pattern repeats for m=2,3,4,5
+Both schedules compute the exact same 48 tiles and produce identical results. Only the order changes — and therefore which inputs the GPU is hammering at any given moment.
 
-SUPERGROUPED (GROUP_SIZE_M=2):
-    wave 1  pids 0..3   tiles (m=0,1,n=0,1)   load A0,A1 + B0,B1          -> 4 HBM
-    wave 2  pids 4..7   tiles (m=0,1,n=2,3)   A0,A1 hit, load B2,B3       -> 2 HBM
-    wave 3  pids 8..11  tiles (m=0,1,n=4,5)   A0,A1 hit, load B4,B5       -> 2 HBM
-                                        (B0,B1 evicted to make room)
-    wave 4  pids 12..15 tiles (m=0,1,n=6,7)   A0,A1 hit, load B6,B7       -> 2 HBM
-                                        (B2,B3 evicted to make room)
-    ... when a group is done, we launch the next group and the pattern repeats
+### L2 trace: 4 SMs concurrent, L2 holds 6 strips (toy numbers)
+
+Assume 4 programs run at a time and L2 can hold roughly 6 operand strips.
+
+#### Row-major
+
+| Wave | PIDs | Tiles | Loads | HBM | Notes |
+|---:|---|---|---|---:|---|
+| 1 | 0–3 | `(m=0, n=0..3)` | A₀ + B₀,B₁,B₂,B₃ | 5 | |
+| 2 | 4–7 | `(m=0, n=4..7)` | A₀ hit; B₄,B₅,B₆,B₇ | 4 | B₀–B₃ evicted |
+| 3 | 8–11 | `(m=1, n=0..3)` | A₁ + B₀,B₁,B₂,B₃ | 5 | A₀ and B₀–B₃ evicted |
+| 4 | 12–15 | `(m=1, n=4..7)` | A₁ hit; B₄,B₅,B₆,B₇ | 4 | B₀–B₃ evicted |
+| … | | | | | repeats for m = 2, 3, 4, 5 |
+
+#### Supergrouped (`GROUP_SIZE_M = 2`)
+
+| Wave | PIDs | Tiles | Loads | HBM | Notes |
+|---:|---|---|---|---:|---|
+| 1 | 0–3 | `(m=0,1, n=0,1)` | A₀,A₁ + B₀,B₁ | 4 | |
+| 2 | 4–7 | `(m=0,1, n=2,3)` | A₀,A₁ hit; B₂,B₃ | 2 | |
+| 3 | 8–11 | `(m=0,1, n=4,5)` | A₀,A₁ hit; B₄,B₅ | 2 | B₀,B₁ evicted |
+| 4 | 12–15 | `(m=0,1, n=6,7)` | A₀,A₁ hit; B₆,B₇ | 2 | B₂,B₃ evicted |
+| … | | | | | next group when current group finishes |
 
 As we can see, the supergrouped mapping is more efficient than the row-major mapping.
+
 Now, let's look at the implementation.
 
 ```python
@@ -504,29 +508,75 @@ def matrix_multiplication_tiled_supergrouped(
     return c
 ```
 
-First of all, notice that we no longer have a 2D grid.
-Instead, we have a 1D grid of size `(triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),)`.
-This is because we will do the mapping ourselves instead of relying on the 2D grid which gives us a row-major mapping.
-In the triton kernel, we identify the program id we have and determine the dimensions of the supergrouped grid we will construct.
-Since we define the groups as the horizontal strips of programs, they will cover the entire column space of the output matrix C.
-So, the `GROUP_SIZE_M` is the height of the group in the vertical direction.
-Given the strip size in horizontal direction, we can determine the number of programs in each group as `GROUP_SIZE_M * triton.cdiv(N, BLOCK_SIZE_N)`.
+First, notice that the kernel is launched with a 1D grid rather than a 2D grid:
 
-Afterwards, we will need to find our position in the supergrouped grid.
-Note that we have `pid = tl.program_id(0)` which is the program id we have from the 1D grid.
-But, we need to map it to a 2D position in the supergrouped grid.
-We start by identifying the group we are in with `group_id = pid // num_pid_in_group`.
-Then, we find the starting position of our group in the vertical direction in the 2D supergrouped grid with `first_pid_m = group_id * GROUP_SIZE_M`.
-Note that this is not a program id, but an index in the vertical direction.
-We then find the height of the group we are in with `group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)`.
-This can be less than `GROUP_SIZE_M` if the height of the supergrouped grid is not a multiple of `GROUP_SIZE_M`.
+```python
+(triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),)
+```
 
-Now, we need to determine the position of our program in the supergrouped grid.
-The `local_pid = pid % num_pid_in_group` gives us an absolute index from 0 to `num_pid_in_group - 1`.
-Now, we need to determine the position of our program in the group.
-This program will be in the `local_pid % group_size_m` row and `local_pid // group_size_m` column.
-The column index within the group directly gives us the column index in 2D supergrouped grid since a group covers the entire column space of the output matrix C.
-For the row index, we need to add the starting position of the group so we get `pid_m = first_pid_m + (local_pid % group_size_m)` for the row index in the 2D supergrouped grid.
+The logical output-tile grid is still two-dimensional, with dimensions `num_pid_m` × `num_pid_n`.
+The difference is that we now explicitly map each scalar program ID to a tile coordinate `(pid_m, pid_n)`, allowing us to choose a grouped ordering.
 
-The rest of the computation is identical to the tiled implementation.
-Except, instead of using `tl.program_id(0)` and `tl.program_id(1)` to get the row and column indices of the output tile, we use `pid_m` and `pid_n` which are the row and column indices of our program in the supergrouped grid.
+Each group is a horizontal band of the output-tile grid.
+It spans all `num_pid_n` tile columns and contains at most `GROUP_SIZE_M` tile rows.
+Therefore, a full group contains
+
+```python
+num_pid_in_group = GROUP_SIZE_M * num_pid_n
+```
+
+programs.
+
+Given `pid = tl.program_id(0)`, we first determine which group contains the program:
+
+```python
+group_id = pid // num_pid_in_group
+```
+
+The first tile row covered by this group is
+
+```python
+first_pid_m = group_id * GROUP_SIZE_M
+```
+
+Here, `first_pid_m` is a tile-row index, not a program ID.
+The final group may contain fewer than `GROUP_SIZE_M` tile rows, so its actual height is
+
+```python
+group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+```
+
+Next, we compute the program's index relative to the beginning of its group:
+
+```python
+local_pid = pid % num_pid_in_group
+```
+
+For a full group, `local_pid` ranges from `0` to `num_pid_in_group - 1`.
+In the final partial group, it instead ranges from `0` to `group_size_m * num_pid_n - 1`.
+
+Within a group, programs are mapped in column-major order.
+Thus, the tile-row offset within the group is
+
+```python
+local_pid % group_size_m
+```
+
+and the tile-column index is
+
+```python
+local_pid // group_size_m
+```
+
+Therefore, the final output-tile coordinates are
+
+```python
+pid_m = first_pid_m + local_pid % group_size_m
+pid_n = local_pid // group_size_m
+```
+
+Because every group spans all tile columns, `pid_n` is already the global tile-column index.
+For `pid_m`, we add `first_pid_m` to convert the row offset within the group into a global tile-row index.
+
+The remainder of the kernel is identical to the tiled implementation.
+The only difference is how programs are assigned to output tiles: instead of obtaining the tile coordinates directly from `tl.program_id(0)` and `tl.program_id(1)`, we derive `(pid_m, pid_n)` from the scalar program ID using the grouped ordering.
