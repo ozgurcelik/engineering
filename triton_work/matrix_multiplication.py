@@ -641,116 +641,157 @@ def benchmark_tiled_supergrouped(M, N, K, provider):
 
 
 benchmark_tiled_supergrouped.run(show_plots=True, print_data=True)
+# %%
+@triton.jit
+def matrix_multiplication_block_pointers_kernel(
+    a_ptr, b_ptr, c_ptr,
+    M, N, K,
+    a_row_stride, b_row_stride, c_row_stride,
+    a_col_stride, b_col_stride, c_col_stride,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+
+    local_pid = pid % num_pid_in_group
+    pid_m = first_pid_m + (local_pid % group_size_m)
+    pid_n = local_pid // group_size_m
+
+    a_block_ptr = tl.make_block_ptr(
+        a_ptr,
+        shape=(M, K),
+        strides=(a_row_stride, a_col_stride),
+        offsets=(pid_m * BLOCK_SIZE_M, 0),
+        block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_K),
+        order=(1, 0),
+    )
+    b_block_ptr = tl.make_block_ptr(
+        b_ptr,
+        shape=(K, N),
+        strides=(b_row_stride, b_col_stride),
+        offsets=(0, pid_n * BLOCK_SIZE_N),
+        block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_N),
+        order=(1, 0),
+    )
+    c_block_ptr = tl.make_block_ptr(
+        c_ptr,
+        shape=(M, N),
+        strides=(c_row_stride, c_col_stride),
+        offsets=(pid_m * BLOCK_SIZE_M, pid_n * BLOCK_SIZE_N),
+        block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N),
+        order=(1, 0),
+    )
+
+    acc = tl.zeros([BLOCK_SIZE_M, BLOCK_SIZE_N], dtype=tl.float32)
+    for _ in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        a_vals = tl.load(
+            a_block_ptr, boundary_check=(0, 1), padding_option="zero"
+        )
+        b_vals = tl.load(
+            b_block_ptr, boundary_check=(0, 1), padding_option="zero"
+        )
+
+        acc = tl.dot(a_vals, b_vals, acc)
+
+        a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_SIZE_K))
+        b_block_ptr = tl.advance(b_block_ptr, (BLOCK_SIZE_K, 0))
+
+    tl.store(c_block_ptr, acc.to(tl.float16), boundary_check=(0, 1))
 
 
-"""
-====================================================================
-DOES SUPERGROUPING ACTUALLY HELP? (fp16, 64x64x64 blocks, no tuning)
-====================================================================
-
-Run the benchmark below (sweep N from 256 to 16384) and you get:
-
-    N         Tiled (2D)    Supergrouped (1D)    Torch     Sg / Tiled
-     4096       240.5            241.8           373.4       1.01x
-     6144       238.8            240.0           363.4       1.01x
-     8192       235.2            234.9           396.8       1.00x
-     9216       218.9            230.8           395.7       1.05x
-    10240       212.0            230.6           379.8       1.09x
-    12288       210.8            231.2           394.8       1.10x
-    14336       188.6            229.9           393.7       1.22x
-    15360       184.2            230.8           393.6       1.25x
-    16384       172.3            232.4           393.7       1.35x
-
-Two regimes, separated almost exactly at N=8192:
-
-1. N <= 8192: both schedules sit at ~235 TFLOPS. Supergrouping does
-   nothing visible. The kernel is HMMA-issue / load-latency bound at
-   the blocks we picked, not L2-traffic bound, so reordering pids
-   can't move the needle.
-
-2. N >= 9216: the plain 2D-tiled curve falls off a cliff -- 240 -> 172
-   TFLOPS by 16384 -- while the supergroup curve stays flat at ~232.
-   That's L2 thrashing on the 2D-tiled side, exactly the situation
-   supergrouping was designed for. The pid reordering buys back ~35%
-   on this GPU with nothing else touched.
-
-Aside: tensor-core MMA instruction families
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-The "MMA" family of SASS instructions all execute one tile of
-D = A*B + C on the tensor cores; they differ only in operand dtype:
-- HMMA: half-precision (FP16/BF16) matrix multiply-accumulate. This
-  is what a Triton tl.dot on FP16 inputs lowers to on Ampere/Hopper.
-- IMMA: integer (INT8/INT4) variant.
-- DMMA: double-precision (FP64) variant.
-- QMMA: FP8 variant on Hopper.
-
-Why the cliff is at 8192-9216
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-The reuse-critical quantity is B alone. Under the natural row-major
-schedule, B's reuse distance is one full sweep across N: tile (r, j)
-loads B[:, j*BN:(j+1)*BN], and the same col-strip is needed again at
-tile (r+1, j) -- after ~2*N^2 bytes of intervening B traffic (one full
-sweep loads every B col-strip exactly once = sizeof(B)). For B to
-survive that distance in L2 we need
-
-    sizeof(B) = 2*N^2 bytes  <=  L2
-
-The L2 on this card is 128 MB, so the threshold is N <= 8192:
-
-    N=4096  -> sizeof(B) =  32 MB    (0.25x L2)
-    N=8192  -> sizeof(B) = 128 MB    (1.0x L2)
-    N=9216  -> sizeof(B) = 162 MB    (1.27x L2)
-    N=16384 -> sizeof(B) = 512 MB    (4.0x L2)
-
-A doesn't enter the criterion. Its row-strip is loaded once and reused
-by every column tile of one C-row back-to-back, then never touched
-again -- short reuse interval, and the strip itself is small
-(BLOCK_M*N*2 = 2 MB at N=16384). It fits trivially.
-
-Above N=8192, B can't survive cross-row reuse, so every new C-row
-re-streams all of B from HBM. As a side effect, the ~512 MB of B
-streaming traffic during one C-row at N=16384 also evicts the in-use
-A row-strip mid-row, so A starts re-fetching too -- but the trigger
-is purely B no longer fitting.
-
-Supergrouping fixes this by traversing groups of GROUP_SIZE_M=8 row
-tiles in column-major order WITHIN each group. A single wave (188 SMs
-on a Blackwell PRO 6000) covers ~8 distinct A row-strips and ~24
-distinct B col-strips at a time -- a working set that comfortably fits
-in L2 even at 16384. So the schedule never has to re-stream A from
-HBM.
-
-Where 8 and 24 come from:
-- 8 = GROUP_SIZE_M, set literally in the launcher. Inside a group,
-  pids are laid out column-major, so 8 consecutive pids form one
-  vertical column of C-tiles -> 8 distinct A row-strips, 1 B col-strip.
-- 24 ~= 188 SMs / 8-tall-column = 23.5. A wave of 188 concurrent
-  programs therefore spans ~24 such columns side by side, sharing the
-  same 8 A row-strips across all of them.
-
-Working set at N=16384: each strip is 64 * N * 2 = 2 MB, so
-8 A + 24 B = (8+24) * 2 MB = 64 MB -- half of the 128 MB L2. The plain
-row-major wave at the same N would touch 1 A row-strip + 188 B
-col-strips ~= 378 MB, ~3x oversubscribed. Supergrouping trades a
-slightly wider A footprint (1 -> 8) for a much narrower B footprint
-(188 -> 24); each B col-strip a program loads is reused 7 more times
-by the rest of its column before being allowed to leave L2. Larger N
-benefits from larger GROUP_SIZE_M for the same reason -- see autotune
-section below.
-
-What this benchmark does NOT show
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-We're at ~232 TFLOPS at the upper end; cuBLAS is at ~394 TFLOPS. The
-remaining ~40% gap is not a scheduling problem, it's a configuration
-problem: bigger blocks (e.g. 128x128x32), num_stages > 1 (software
-pipelining), num_warps = 8, and shape-specific autotune. Those
-optimizations are what would close the gap to cuBLAS, but they belong
-in a separate exercise.
-"""
+def matrix_multiplication_block_pointers(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    block_size_m: int = 64,
+    block_size_n: int = 64,
+    block_size_k: int = 64,
+    group_size_m: int = 8,
+    num_warps: int = 4,
+    num_stages: int = 3,
+):
+    assert a.ndim == 2 and b.ndim == 2, "expected two 2D matrices"
+    M, K = a.shape
+    K_b, N = b.shape
+    assert K == K_b, "incompatible matrix dimensions"
+    assert a.device == b.device, "A and B must be on the same device"
+    assert a.dtype == b.dtype, "A and B must have the same dtype"
+    assert a.dtype in (torch.float16, torch.float32), "only fp16 and fp32 are supported"
+    grid_size = (
+        triton.cdiv(M, block_size_m) * triton.cdiv(N, block_size_n),
+    )
+    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+    matrix_multiplication_block_pointers_kernel[grid_size](
+        a, b, c, M, N, K,
+        a.stride(0), b.stride(0), c.stride(0),
+        a.stride(1), b.stride(1), c.stride(1),
+        block_size_m, block_size_n, block_size_k, group_size_m,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    return c
 
 
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=['M', 'N', 'K'],
+        x_vals=[
+            256, 512, 1024, 2048, 4096,
+            4608, 5120, 6144, 7168,
+            8192, 16384,
+        ],
+        line_arg='provider',
+        line_vals=[
+            'triton_block_pointers_64_64_64',
+            'triton_block_pointers_128_128_64',
+            'torch',
+        ],
+        line_names=[
+            'Triton Block Pointers 64x64x64',
+            'Triton Block Pointers 128x128x64',
+            'Torch',
+        ],
+        styles=[
+            ('blue', '-'),
+            ('orange', '-'),
+            ('green', '-'),
+        ],
+        ylabel='TFLOPS',
+        plot_name='matmul-block-pointers-vs-torch-fp16',
+        args={},
+    ))
+def benchmark_block_pointers(M, N, K, provider):
+    a = torch.randn((M, K), device=DEVICE, dtype=torch.float16)
+    b = torch.randn((K, N), device=DEVICE, dtype=torch.float16)
+    stream = getattr(torch, DEVICE.type).Stream()
+    getattr(torch, DEVICE.type).set_stream(stream)
+
+    if provider == 'triton_block_pointers_64_64_64':
+        ms = triton.testing.do_bench(
+            lambda: matrix_multiplication_block_pointers(a, b, 64, 64, 64)
+        )
+    elif provider == 'triton_block_pointers_128_128_64':
+        ms = triton.testing.do_bench(
+            lambda: matrix_multiplication_block_pointers(a, b, 128, 128, 64)
+        )
+    elif provider == 'torch':
+        ms = triton.testing.do_bench(lambda: torch.matmul(a, b))
+
+    tflops = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)
+    return tflops(ms)
+
+
+benchmark_block_pointers.run(show_plots=True, print_data=True)
+# %%
 """
 ====================================================================
 AUTOTUNING
@@ -1172,106 +1213,6 @@ def matrix_multiplication_persistent(a: torch.Tensor, b: torch.Tensor):
     return c
 
 
-@triton.autotune(
-    configs=get_autotune_configs(),
-    key=['M', 'N', 'K'],
-)
-@triton.jit
-def matrix_multiplication_block_pointers_kernel(
-    a_ptr, b_ptr, c_ptr,
-    M, N, K,
-    a_row_stride, b_row_stride, c_row_stride,
-    a_col_stride, b_col_stride, c_col_stride,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
-):
-
-    pid_start = tl.program_id(0)
-    p_count = tl.num_programs(0)
-
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    num_pid_total = num_pid_m * num_pid_n
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-
-    tl.assume(a_row_stride > 0)
-    tl.assume(a_col_stride > 0)
-    tl.assume(b_row_stride > 0)
-    tl.assume(b_col_stride > 0)
-    tl.assume(c_row_stride > 0)
-    tl.assume(c_col_stride > 0)
-
-    for pid in range(pid_start, num_pid_total, p_count):
-        group_id = pid // num_pid_in_group
-        first_pid_m = group_id * GROUP_SIZE_M
-        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-
-        local_pid = pid % num_pid_in_group
-        pid_m = first_pid_m + (local_pid % group_size_m)
-        pid_n = local_pid // group_size_m
-        
-        tl.assume(pid_m >= 0)
-        tl.assume(pid_n >= 0)
-
-        
-        a_block_ptr = tl.make_block_ptr(
-            a_ptr,
-            shape=(M, K),
-            strides=(a_row_stride, a_col_stride),
-            offsets=(pid_m * BLOCK_SIZE_M, 0),
-            block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_K),
-            order=(1,0),
-        )
-        b_block_ptr = tl.make_block_ptr(
-            b_ptr,
-            shape=(K, N),
-            strides=(b_row_stride, b_col_stride),
-            offsets=(0, pid_n * BLOCK_SIZE_N),
-            block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_N),
-            order=(1,0),
-        )
-        c_block_ptr = tl.make_block_ptr(
-            c_ptr,
-            shape=(M, N),
-            strides=(c_row_stride, c_col_stride),
-            offsets=(pid_m * BLOCK_SIZE_M, pid_n * BLOCK_SIZE_N),
-            block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N),
-            order=(1,0),
-        )
-        acc = tl.zeros([BLOCK_SIZE_M, BLOCK_SIZE_N], dtype=tl.float32)
-
-        for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-            a_vals = tl.load(a_block_ptr, boundary_check=(0, 1), padding_option="zero")
-            b_vals = tl.load(b_block_ptr, boundary_check=(0, 1), padding_option="zero")
-
-            acc = tl.dot(a_vals, b_vals, acc)
-
-            a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_SIZE_K))
-            b_block_ptr = tl.advance(b_block_ptr, (BLOCK_SIZE_K, 0))
-
-        tl.store(c_block_ptr, acc.to(tl.float16), boundary_check=(0, 1))
-
-def matrix_multiplication_block_pointers(a: torch.Tensor, b: torch.Tensor):
-    M, K = a.shape
-    K, N = b.shape
-    c = torch.empty(M, N, device=DEVICE, dtype=a.dtype)
-    # Same persistent-grid sizing as matrix_multiplication_persistent: cap at
-    # NUM_SMS so each program walks multiple tiles via the persistent loop,
-    # and drop below NUM_SMS only when the workload has fewer tiles than SMs.
-    grid = lambda META: (
-        min(
-            NUM_SMS,
-            triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']),
-        ),
-    )
-    matrix_multiplication_block_pointers_kernel[grid](
-        a, b, c, M, N, K,
-        a.stride(0), b.stride(0), c.stride(0),
-        a.stride(1), b.stride(1), c.stride(1),
-    )
-    return c
 
 
 # %%

@@ -230,19 +230,21 @@ We will be using square matrices once again.
 
 ![FP16 matrix multiplication performance: tiled Triton, and PyTorch](figures/matmul_tiled_blocksizes.png)
 
-matmul-tiled-vs-torch-fp16:
-          M        N        K  Triton 64x64x64  Triton 128x128x64      Torch
-0     256.0    256.0    256.0         3.321312           2.617146   3.063213
-1     512.0    512.0    512.0        16.344097          13.393646  17.739589
-2    1024.0   1024.0   1024.0        40.089692          32.203279  33.063282
-3    2048.0   2048.0   2048.0        52.578786          58.014931  60.604645
-4    4096.0   4096.0   4096.0        43.445212          53.805863  52.393391
-5    4608.0   4608.0   4608.0        40.038352          48.826759  52.697203
-6    5120.0   5120.0   5120.0        26.867392          37.117943  54.394575
-7    6144.0   6144.0   6144.0        17.078184          29.612991  64.068548
-8    7168.0   7168.0   7168.0        21.833254          28.313260  59.709510
-9    8192.0   8192.0   8192.0        17.893498          26.176944  56.509382
-10  16384.0  16384.0  16384.0        14.667996          28.089333  55.831171
+**matmul-tiled-vs-torch-fp16** (TFLOP/s)
+
+| M | N | K | Triton 64×64×64 | Triton 128×128×64 | Torch |
+|---:|---:|---:|---:|---:|---:|
+| 256 | 256 | 256 | 3.321312 | 2.617146 | 3.063213 |
+| 512 | 512 | 512 | 16.344097 | 13.393646 | 17.739589 |
+| 1024 | 1024 | 1024 | 40.089692 | 32.203279 | 33.063282 |
+| 2048 | 2048 | 2048 | 52.578786 | 58.014931 | 60.604645 |
+| 4096 | 4096 | 4096 | 43.445212 | 53.805863 | 52.393391 |
+| 4608 | 4608 | 4608 | 40.038352 | 48.826759 | 52.697203 |
+| 5120 | 5120 | 5120 | 26.867392 | 37.117943 | 54.394575 |
+| 6144 | 6144 | 6144 | 17.078184 | 29.612991 | 64.068548 |
+| 7168 | 7168 | 7168 | 21.833254 | 28.313260 | 59.709510 |
+| 8192 | 8192 | 8192 | 17.893498 | 26.176944 | 56.509382 |
+| 16384 | 16384 | 16384 | 14.667996 | 28.089333 | 55.831171 |
 
 Remember that for the L4 GPU, we have the following properties:
 - 58 SMs
@@ -581,9 +583,119 @@ For `pid_m`, we add `first_pid_m` to convert the row offset within the group int
 The remainder of the kernel is identical to the tiled implementation.
 The only difference is how programs are assigned to output tiles: instead of obtaining the tile coordinates directly from `tl.program_id(0)` and `tl.program_id(1)`, we derive `(pid_m, pid_n)` from the scalar program ID using the grouped ordering.
 
+Now let's look at the results:
 
-## Persistent Kernel
+![FP16 matrix multiplication performance: supergrouped Triton, and PyTorch](figures/matmul_supergrouped.png)
+
+As we can see, the sharp drop in performance around 5120x5120 which was due to L2 cache misses is now gone.
 
 ## Block Pointers Implementation (Same performance but simpler implementation)
+
+Now, let's introduce a simplified version of implementing the kernels using block pointers.
+
+```python
+@triton.jit
+def matrix_multiplication_block_pointers_kernel(
+    a_ptr, b_ptr, c_ptr,
+    M, N, K,
+    a_row_stride, b_row_stride, c_row_stride,
+    a_col_stride, b_col_stride, c_col_stride,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+
+    local_pid = pid % num_pid_in_group
+    pid_m = first_pid_m + (local_pid % group_size_m)
+    pid_n = local_pid // group_size_m
+
+    row = pid_m * BLOCK_SIZE_M
+    col = pid_n * BLOCK_SIZE_N
+
+    a_block_ptr = tl.make_block_ptr(
+        a_ptr,
+        shape=(M, K),
+        strides=(a_row_stride, a_col_stride),
+        offsets=(row, 0),
+        block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_K),
+        order=(1, 0),
+    )
+    b_block_ptr = tl.make_block_ptr(
+        b_ptr,
+        shape=(K, N),
+        strides=(b_row_stride, b_col_stride),
+        offsets=(0, col),
+        block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_N),
+        order=(1, 0),
+    )
+    c_block_ptr = tl.make_block_ptr(
+        c_ptr,
+        shape=(M, N),
+        strides=(c_row_stride, c_col_stride),
+        offsets=(row, col),
+        block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N),
+        order=(1, 0),
+    )
+
+    acc = tl.zeros([BLOCK_SIZE_M, BLOCK_SIZE_N], dtype=tl.float32)
+    for _ in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        a_vals = tl.load(
+            a_block_ptr, boundary_check=(0, 1), padding_option="zero"
+        )
+        b_vals = tl.load(
+            b_block_ptr, boundary_check=(0, 1), padding_option="zero"
+        )
+
+        acc = tl.dot(a_vals, b_vals, acc)
+
+        a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_SIZE_K))
+        b_block_ptr = tl.advance(b_block_ptr, (BLOCK_SIZE_K, 0))
+
+    tl.store(c_block_ptr, acc.to(tl.float16), boundary_check=(0, 1))
+```
+
+In block pointers implementation, we use the `tl.make_block_ptr` function to create block pointers for the matrices we will be using.
+In this case, these matrices are A and B input matrices, and C output matrix.
+What these block pointers do is they allow us to select a region of memory and advance the selection to the next region of memory when needed.
+
+When defining a block pointer, we need to specify the following:
+- The pointer to the first element of the block in the matrix
+- The overall shape of the matrix we create the block for
+- The strides of the matrix
+- The starting points (offsets) of the block in the matrix
+- The shape of the block to load/store at a time
+- The order of the dimensions in memory from major to minor
+    - (1,0) means row major. meaning for a 2D MxN matrix, the strides are (N,1)
+
+For example, for the A matrix, notice that our offset is `row, 0` which is the location of the first element in the row `row`.
+And the block shape is `(BLOCK_SIZE_M, BLOCK_SIZE_K)`.
+So, these are very similar to what we did in the tiled implementation.
+
+Now, in the loop, we load blocks with `tl.load` function.
+`boundary_check=(0, 1)` means both row and column might be out of bounds and `padding_option="zero"` means that out of bounds elements are padded with 0.
+
+Then, when it comes to moving to the next block, we use the `tl.advance` function.
+This function takes the block pointer and the offsets to advance the block pointer.
+So, instead of choosing new k offsets, we can just advance the block pointer by a `BLOCK_SIZE_K` offset in the necessary direction.
+For the A matrix, we stay in the same row and advance the column by `BLOCK_SIZE_K`, and for the B matrix, we advance the row by `BLOCK_SIZE_K` while staying in the same column.
+
+Now the results for this implementation is
+
+![FP16 matrix multiplication performance: block pointers Triton, and PyTorch](figures/matmul_blockpointers.png)
+
+As we can see, the performance is very close to the tiled implementation.
+The purpose of block pointers implementation is not necessarily to improve the performance upon the tiled implementation, but rather to simplify the implementation and make it more readable.
+
+## Persistent Kernel
 
 ## Autotuning
