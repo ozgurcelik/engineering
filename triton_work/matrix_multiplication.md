@@ -329,3 +329,204 @@ Given that we have 48 MB of L2 cache, up to and including 2048x2048 matrices, we
 In fact, as output writes can outcompete the operand reads for L2 cache, it's good that we can fit even the output matrix in the L2 cache along with the operands for the 2048x2048 matrix case.
 But for the 4096x4096 matrix, we no longer can fit both operands in the L2 cache.
 And as we discussed before, starting from 5120x5120 matrices, we can't even fit one operand in the L2 cache which led to significant drop in performance.
+
+## Supergrouped Implementation
+
+As we have said, in tile matmul, each program computes one output tile C[m_tile, n_tile] of size BLOCK_SIZE_M x BLOCK_SIZE_N.
+To compute this, the program reads
+- One row strip of A: rows m_tile * BLOCK_SIZE_M to m_tile * BLOCK_SIZE_M + BLOCK_SIZE_M - 1, all K columns. Call this A_m
+- One column strip of B: columns n_tile * BLOCK_SIZE_N to n_tile * BLOCK_SIZE_N + BLOCK_SIZE_N - 1, all K rows. Call this B_n
+
+Two programs that share the same m_tile reads the same A_m, and two programs that share the same n_tile reads the same B_n.
+L2 reuse comes from arranging programs so that ones close in time (close in pid) share A_m or B_n.
+
+====================================================================
+CONCRETE EXAMPLE: 6 x 8 grid of output tiles, GROUP_SIZE_M = 2
+====================================================================
+num_pid_m = 6, num_pid_n = 8, GROUP_SIZE_M = 2
+=> num_pid_in_group = 2 * 8 = 16
+=> 48 programs total, 3 groups of 16
+
+Row-major mapping (what a 2D grid effectively gives us):
+
+         n=0  n=1  n=2  n=3  n=4  n=5  n=6  n=7
+   m=0 |   0    1    2    3    4    5    6    7
+   m=1 |   8    9   10   11   12   13   14   15
+   m=2 |  16   17   18   19   20   21   22   23
+   m=3 |  24   25   26   27   28   29   30   31
+   m=4 |  32   33   34   35   36   37   38   39
+   m=5 |  40   41   42   43   44   45   46   47
+
+Supergrouped mapping (column-major within each height-2 strip):
+
+         n=0  n=1  n=2  n=3  n=4  n=5  n=6  n=7
+   m=0 |   0    2    4    6    8   10   12   14   <- group 0
+   m=1 |   1    3    5    7    9   11   13   15
+   m=2 |  16   18   20   22   24   26   28   30   <- group 1
+   m=3 |  17   19   21   23   25   27   29   31
+   m=4 |  32   34   36   38   40   42   44   46   <- group 2
+   m=5 |  33   35   37   39   41   43   45   47
+
+Both schedules compute the exact same 48 tiles and produce identical
+results. Only the order changes -- and therefore which inputs the GPU is
+hammering at any given moment.
+
+
+====================================================================
+L2 TRACE: 4 SMs concurrent, L2 holds 6 strips (toy numbers)
+====================================================================
+
+ROW-MAJOR:
+    wave 1  pids 0..3   tiles (m=0,n=0,1,2,3)   load A0 + B0,B1,B2,B3            -> 5 HBM
+    wave 2  pids 4..7   tiles (m=0,n=4,5,6,7)   A0 hit, load B4,B5,B6,B7         -> 4 HBM
+                                        (B0,B1,B2,B3 evicted to make room)
+    wave 3  pids 8..11  tiles (m=1,n=0,1,2,3)   load A1 + B0,B1,B2,B3            -> 5 HBM
+                                        (A0, B0,B1,B2,B3 evicted to make room)
+    wave 4  pids 12..15 tiles (m=1,n=4,5,6,7)   A1 hit, load B4,B5,B6,B7         -> 4 HBM
+                                        (B0,B1,B2,B3 evicted to make room)
+    ... pattern repeats for m=2,3,4,5
+
+SUPERGROUPED (GROUP_SIZE_M=2):
+    wave 1  pids 0..3   tiles (m=0,1,n=0,1)   load A0,A1 + B0,B1          -> 4 HBM
+    wave 2  pids 4..7   tiles (m=0,1,n=2,3)   A0,A1 hit, load B2,B3       -> 2 HBM
+    wave 3  pids 8..11  tiles (m=0,1,n=4,5)   A0,A1 hit, load B4,B5       -> 2 HBM
+                                        (B0,B1 evicted to make room)
+    wave 4  pids 12..15 tiles (m=0,1,n=6,7)   A0,A1 hit, load B6,B7       -> 2 HBM
+                                        (B2,B3 evicted to make room)
+    ... when a group is done, we launch the next group and the pattern repeats
+
+As we can see, the supergrouped mapping is more efficient than the row-major mapping.
+Now, let's look at the implementation.
+
+```python
+@triton.jit
+def matrix_multiplication_tiled_kernel_supergrouped(
+    a_ptr, b_ptr, c_ptr,
+    M, N, K, # a is MxK, b is KxN, c is MxN
+    a_row_stride, b_row_stride, c_row_stride,
+    a_col_stride, b_col_stride, c_col_stride,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    # Let us see how many blocks we have in each dimension
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    
+    # Groups are horizontal strips of programs, so they cover entire column space of C
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+
+    group_id = pid // num_pid_in_group # which group this program is in
+    first_pid_m = group_id * GROUP_SIZE_M # where does this group start
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M) # if the num_pid_m is not a multiple of GROUP_SIZE_M, then the last group will have fewer than GROUP_SIZE_M programs
+
+    local_pid = pid % num_pid_in_group # 0 ... num_pid_in_group - 1
+    pid_m = first_pid_m + (local_pid % group_size_m) 
+    pid_n = local_pid // group_size_m
+
+    """
+    Within a group, local_pid ranges over group_size_m x num_pid_n positions.
+    We traverse those positions in column-major order.
+    - local_pid % group_size_m is which row inside the group
+    - local_pid // group_size_m is which column inside the group
+    """
+
+    # From here on, the computation is identical to matrix_multiplication_tiled_kernel.
+    # Only the (pid_m, pid_n) -> output-tile mapping changes. Same work, different order.
+    row = pid_m * BLOCK_SIZE_M
+    col = pid_n * BLOCK_SIZE_N
+
+    m_offsets = tl.arange(0, BLOCK_SIZE_M) + row
+    m_mask = m_offsets < M
+
+    n_offsets = tl.arange(0, BLOCK_SIZE_N) + col
+    n_mask = n_offsets < N
+
+    acc = tl.zeros([BLOCK_SIZE_M, BLOCK_SIZE_N], dtype=tl.float32)
+    for k in range(0, K, BLOCK_SIZE_K):
+        k_offsets = tl.arange(0, BLOCK_SIZE_K) + k
+        k_mask = k_offsets < K
+
+        a_offsets = m_offsets[:, None] * a_row_stride + k_offsets[None, :] * a_col_stride
+        b_offsets = k_offsets[:, None] * b_row_stride + n_offsets[None, :] * b_col_stride
+
+        a_ptrs = a_ptr + a_offsets
+        b_ptrs = b_ptr + b_offsets
+
+        a_mask = m_mask[:, None] & k_mask[None, :]
+        b_mask = k_mask[:, None] & n_mask[None, :]
+
+        a_vals = tl.load(a_ptrs, mask=a_mask)
+        b_vals = tl.load(b_ptrs, mask=b_mask)
+
+        acc = tl.dot(a_vals, b_vals, acc)
+
+    c_offsets = m_offsets[:, None] * c_row_stride + n_offsets[None, :] * c_col_stride
+    c_mask = m_mask[:, None] & n_mask[None, :]
+    tl.store(c_ptr + c_offsets, acc.to(tl.float16), mask=c_mask)
+
+
+def matrix_multiplication_tiled_supergrouped(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    block_size_m: int = 64,
+    block_size_n: int = 64,
+    block_size_k: int = 64,
+    group_size_m: int = 8,
+    num_warps: int = 4,
+    num_stages: int = 3,
+):
+    assert a.ndim == 2 and b.ndim == 2, "expected two 2D matrices"
+    M, K = a.shape
+    K_b, N = b.shape
+    assert K == K_b, "incompatible matrix dimensions"
+    assert a.device == b.device, "A and B must be on the same device"
+    assert a.dtype == b.dtype, "A and B must have the same dtype"
+    assert a.dtype in (torch.float16, torch.float32), "only fp16 and fp32 are supported"
+    BLOCK_SIZE_M = block_size_m
+    BLOCK_SIZE_N = block_size_n
+    BLOCK_SIZE_K = block_size_k
+    GROUP_SIZE_M = group_size_m
+    # 1D launch grid is required for the supergrouped pid -> (pid_m, pid_n) mapping
+    grid_size = (triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),)
+    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+    matrix_multiplication_tiled_kernel_supergrouped[grid_size](
+        a, b, c, M, N, K,
+        a.stride(0), b.stride(0), c.stride(0),
+        a.stride(1), b.stride(1), c.stride(1),
+        BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    return c
+```
+
+First of all, notice that we no longer have a 2D grid.
+Instead, we have a 1D grid of size `(triton.cdiv(M, BLOCK_SIZE_M) * triton.cdiv(N, BLOCK_SIZE_N),)`.
+This is because we will do the mapping ourselves instead of relying on the 2D grid which gives us a row-major mapping.
+In the triton kernel, we identify the program id we have and determine the dimensions of the supergrouped grid we will construct.
+Since we define the groups as the horizontal strips of programs, they will cover the entire column space of the output matrix C.
+So, the `GROUP_SIZE_M` is the height of the group in the vertical direction.
+Given the strip size in horizontal direction, we can determine the number of programs in each group as `GROUP_SIZE_M * triton.cdiv(N, BLOCK_SIZE_N)`.
+
+Afterwards, we will need to find our position in the supergrouped grid.
+Note that we have `pid = tl.program_id(0)` which is the program id we have from the 1D grid.
+But, we need to map it to a 2D position in the supergrouped grid.
+We start by identifying the group we are in with `group_id = pid // num_pid_in_group`.
+Then, we find the starting position of our group in the vertical direction in the 2D supergrouped grid with `first_pid_m = group_id * GROUP_SIZE_M`.
+Note that this is not a program id, but an index in the vertical direction.
+We then find the height of the group we are in with `group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)`.
+This can be less than `GROUP_SIZE_M` if the height of the supergrouped grid is not a multiple of `GROUP_SIZE_M`.
+
+Now, we need to determine the position of our program in the supergrouped grid.
+The `local_pid = pid % num_pid_in_group` gives us an absolute index from 0 to `num_pid_in_group - 1`.
+Now, we need to determine the position of our program in the group.
+This program will be in the `local_pid % group_size_m` row and `local_pid // group_size_m` column.
+The column index within the group directly gives us the column index in 2D supergrouped grid since a group covers the entire column space of the output matrix C.
+For the row index, we need to add the starting position of the group so we get `pid_m = first_pid_m + (local_pid % group_size_m)` for the row index in the 2D supergrouped grid.
+
+The rest of the computation is identical to the tiled implementation.
+Except, instead of using `tl.program_id(0)` and `tl.program_id(1)` to get the row and column indices of the output tile, we use `pid_m` and `pid_n` which are the row and column indices of our program in the supergrouped grid.
