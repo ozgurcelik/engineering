@@ -741,56 +741,6 @@ def matrix_multiplication_block_pointers(
     return c
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=['M', 'N', 'K'],
-        x_vals=[
-            256, 512, 1024, 2048, 4096,
-            4608, 5120, 6144, 7168,
-            8192, 16384,
-        ],
-        line_arg='provider',
-        line_vals=[
-            'triton_block_pointers_64_64_64',
-            'triton_block_pointers_128_128_64',
-            'torch',
-        ],
-        line_names=[
-            'Triton Block Pointers 64x64x64',
-            'Triton Block Pointers 128x128x64',
-            'Torch',
-        ],
-        styles=[
-            ('blue', '-'),
-            ('orange', '-'),
-            ('green', '-'),
-        ],
-        ylabel='TFLOPS',
-        plot_name='matmul-block-pointers-vs-torch-fp16',
-        args={},
-    ))
-def benchmark_block_pointers(M, N, K, provider):
-    a = torch.randn((M, K), device=DEVICE, dtype=torch.float16)
-    b = torch.randn((K, N), device=DEVICE, dtype=torch.float16)
-    stream = getattr(torch, DEVICE.type).Stream()
-    getattr(torch, DEVICE.type).set_stream(stream)
-
-    if provider == 'triton_block_pointers_64_64_64':
-        ms = triton.testing.do_bench(
-            lambda: matrix_multiplication_block_pointers(a, b, 64, 64, 64)
-        )
-    elif provider == 'triton_block_pointers_128_128_64':
-        ms = triton.testing.do_bench(
-            lambda: matrix_multiplication_block_pointers(a, b, 128, 128, 64)
-        )
-    elif provider == 'torch':
-        ms = triton.testing.do_bench(lambda: torch.matmul(a, b))
-
-    tflops = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)
-    return tflops(ms)
-
-
-benchmark_block_pointers.run(show_plots=True, print_data=True)
 # %%
 @triton.jit
 def matrix_multiplication_persistent_kernel(
@@ -802,17 +752,19 @@ def matrix_multiplication_persistent_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    NUM_PROGRAMS: tl.constexpr,
 ):
     pid_start = tl.program_id(0)
-    num_programs = tl.num_programs(0)
 
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
     num_pid_total = num_pid_m * num_pid_n
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
 
-    # Each launched program computes every num_programs-th output tile.
-    for pid in range(pid_start, num_pid_total, num_programs):
+    # Each launched program computes every NUM_PROGRAMS-th output tile.
+    for pid in tl.range(
+        pid_start, num_pid_total, NUM_PROGRAMS, flatten=True
+    ):
         group_id = pid // num_pid_in_group
         first_pid_m = group_id * GROUP_SIZE_M
         group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
@@ -880,18 +832,18 @@ def matrix_multiplication_persistent(
     assert a.device == b.device, "A and B must be on the same device"
     assert a.dtype == b.dtype, "A and B must have the same dtype"
     assert a.dtype in (torch.float16, torch.float32), "only fp16 and fp32 are supported"
-    grid_size = (
-        min(
-            NUM_SMS,
-            triton.cdiv(M, block_size_m) * triton.cdiv(N, block_size_n),
-        ),
+    num_programs = min(
+        NUM_SMS,
+        triton.cdiv(M, block_size_m) * triton.cdiv(N, block_size_n),
     )
+    grid_size = (num_programs,)
     c = torch.empty((M, N), device=a.device, dtype=a.dtype)
     matrix_multiplication_persistent_kernel[grid_size](
         a, b, c, M, N, K,
         a.stride(0), b.stride(0), c.stride(0),
         a.stride(1), b.stride(1), c.stride(1),
         block_size_m, block_size_n, block_size_k, group_size_m,
+        NUM_PROGRAMS=num_programs,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -908,33 +860,47 @@ def matrix_multiplication_persistent(
         ],
         line_arg='provider',
         line_vals=[
+            'triton_block_pointers_64_64_64',
             'triton_persistent_64_64_64',
+            'triton_block_pointers_128_128_64',
             'triton_persistent_128_128_64',
             'torch',
         ],
         line_names=[
+            'Triton Block Pointers 64x64x64',
             'Triton Persistent Block Pointers 64x64x64',
+            'Triton Block Pointers 128x128x64',
             'Triton Persistent Block Pointers 128x128x64',
             'Torch',
         ],
         styles=[
             ('blue', '-'),
+            ('blue', '--'),
             ('orange', '-'),
+            ('orange', '--'),
             ('green', '-'),
         ],
         ylabel='TFLOPS',
-        plot_name='matmul-persistent-block-pointers-vs-torch-fp16',
+        plot_name='matmul-block-pointers-vs-persistent-vs-torch-fp16',
         args={},
     ))
-def benchmark_persistent(M, N, K, provider):
+def benchmark_block_pointers_vs_persistent(M, N, K, provider):
     a = torch.randn((M, K), device=DEVICE, dtype=torch.float16)
     b = torch.randn((K, N), device=DEVICE, dtype=torch.float16)
     stream = getattr(torch, DEVICE.type).Stream()
     getattr(torch, DEVICE.type).set_stream(stream)
 
-    if provider == 'triton_persistent_64_64_64':
+    if provider == 'triton_block_pointers_64_64_64':
+        ms = triton.testing.do_bench(
+            lambda: matrix_multiplication_block_pointers(a, b, 64, 64, 64)
+        )
+    elif provider == 'triton_persistent_64_64_64':
         ms = triton.testing.do_bench(
             lambda: matrix_multiplication_persistent(a, b, 64, 64, 64)
+        )
+    elif provider == 'triton_block_pointers_128_128_64':
+        ms = triton.testing.do_bench(
+            lambda: matrix_multiplication_block_pointers(a, b, 128, 128, 64)
         )
     elif provider == 'triton_persistent_128_128_64':
         ms = triton.testing.do_bench(
@@ -947,71 +913,10 @@ def benchmark_persistent(M, N, K, provider):
     return tflops(ms)
 
 
-benchmark_persistent.run(show_plots=True, print_data=True)
+benchmark_block_pointers_vs_persistent.run(show_plots=True, print_data=True)
 # %%
-"""
-====================================================================
-AUTOTUNING
-====================================================================
-
-The supergrouped kernel above hard-codes BLOCK_SIZE_M = BLOCK_SIZE_N =
-BLOCK_SIZE_K = 64, GROUP_SIZE_M = 8, and inherits Triton's defaults
-for num_warps and num_stages (num_warps=4, num_stages=1 here). None of
-those choices are optimal across all shapes:
-
-- Small/medium N is compute-bound. The bottleneck is keeping the
-  tensor cores fed without bubbles. Bigger output tiles (more work per
-  program) and num_stages >= 3 (software-pipelined K-loop -- load
-  stage k+1 while computing stage k) help most.
-- Large N is L2-bound (the regime the supergrouping fixed). Smaller
-  blocks plus a larger GROUP_SIZE_M can shrink the per-wave working
-  set even further.
-
-There is no single (BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K,
-GROUP_SIZE_M, num_warps, num_stages) that wins both regimes. So we
-hand Triton a list of plausible configurations and let it benchmark
-each one on the actual shape:
-
-@triton.autotune(configs=[...], key=['M', 'N', 'K'])
-@triton.jit
-def kernel(...): ...
-
-Mechanics:
-- Each triton.Config bundles tl.constexpr values (block sizes,
-  GROUP_SIZE_M) with compilation knobs (num_warps, num_stages).
-- The `key` argument names runtime arguments whose values, when
-  changed, invalidate the cache and trigger a fresh search. (M,N,K)
-  is correct here: a new shape gets re-tuned once, then cached.
-- The launch grid becomes a callable `lambda META: ...` because the
-  caller no longer knows BLOCK_SIZE_*. Triton invokes the lambda with
-  the chosen Config's constexpr dict.
-- First call with a new (M,N,K) compiles and times every config;
-  expect tens of seconds of warm-up. Subsequent calls reuse the cached
-  winner and pay no overhead.
-
-Caveats:
-- Not every (BLOCK_SIZE_M, BLOCK_SIZE_N, num_warps) is legal for
-  tl.dot; illegal combinations are pruned by the autotuner rather
-  than crashing.
-- A long config list multiplies first-call latency. Keep it focused.
-- `tl.assume(...)` is a free perf hint: it tells the integer analysis
-  pass that ids/strides are non-negative so address arithmetic can
-  drop sign handling.
-"""
-
-
 def get_autotune_configs():
-    # The two compilation knobs that aren't constexprs in the kernel signature:
-    # - num_warps: how many warps of 32 threads share one program/output tile.
-    #   More warps spreads tl.dot across more tensor-core lanes and hides
-    #   instruction latency, at the cost of registers per warp.
-    # - num_stages: how many K-loop iterations are software-pipelined.
-    #   num_stages=3 means while the tensor cores compute on stage k, the loads
-    #   for k+1 are issued and k+2's loads are arriving in shared memory. This
-    #   is the single biggest reason the default-config kernel above sits at
-    #   ~232 TFLOPS vs cuBLAS at ~394.
     return [
-        # Compute-bound regime: large output tiles + deep pipelining.
         triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
         triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
         triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
@@ -1020,9 +925,6 @@ def get_autotune_configs():
         triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
         triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
-        # Memory-bound regime (large N): smaller tiles with a wider GROUP_SIZE_M
-        # shrink the per-wave L2 working set further than the supergrouped
-        # default could.
         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 16}, num_stages=4, num_warps=4),
         triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 16}, num_stages=4, num_warps=4),
         triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 16}, num_stages=3, num_warps=8),
@@ -1074,37 +976,46 @@ def matrix_multiplication_autotuned_kernel(
     tl.assume(c_row_stride > 0)
     tl.assume(c_col_stride > 0)
 
-    row = pid_m * BLOCK_SIZE_M
-    col = pid_n * BLOCK_SIZE_N
-
-    m_offsets = tl.arange(0, BLOCK_SIZE_M) + row
-    m_mask = m_offsets < M
-
-    n_offsets = tl.arange(0, BLOCK_SIZE_N) + col
-    n_mask = n_offsets < N
+    a_block_ptr = tl.make_block_ptr(
+        a_ptr,
+        shape=(M, K),
+        strides=(a_row_stride, a_col_stride),
+        offsets=(pid_m * BLOCK_SIZE_M, 0),
+        block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_K),
+        order=(1, 0),
+    )
+    b_block_ptr = tl.make_block_ptr(
+        b_ptr,
+        shape=(K, N),
+        strides=(b_row_stride, b_col_stride),
+        offsets=(0, pid_n * BLOCK_SIZE_N),
+        block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_N),
+        order=(1, 0),
+    )
+    c_block_ptr = tl.make_block_ptr(
+        c_ptr,
+        shape=(M, N),
+        strides=(c_row_stride, c_col_stride),
+        offsets=(pid_m * BLOCK_SIZE_M, pid_n * BLOCK_SIZE_N),
+        block_shape=(BLOCK_SIZE_M, BLOCK_SIZE_N),
+        order=(1, 0),
+    )
 
     acc = tl.zeros([BLOCK_SIZE_M, BLOCK_SIZE_N], dtype=tl.float32)
-    for k in range(0, K, BLOCK_SIZE_K):
-        k_offsets = tl.arange(0, BLOCK_SIZE_K) + k
-        k_mask = k_offsets < K
-
-        a_offsets = m_offsets[:, None] * a_row_stride + k_offsets[None, :] * a_col_stride
-        b_offsets = k_offsets[:, None] * b_row_stride + n_offsets[None, :] * b_col_stride
-
-        a_ptrs = a_ptr + a_offsets
-        b_ptrs = b_ptr + b_offsets
-
-        a_mask = m_mask[:, None] & k_mask[None, :]
-        b_mask = k_mask[:, None] & n_mask[None, :]
-
-        a_vals = tl.load(a_ptrs, mask=a_mask)
-        b_vals = tl.load(b_ptrs, mask=b_mask)
+    for _ in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        a_vals = tl.load(
+            a_block_ptr, boundary_check=(0, 1), padding_option="zero"
+        )
+        b_vals = tl.load(
+            b_block_ptr, boundary_check=(0, 1), padding_option="zero"
+        )
 
         acc = tl.dot(a_vals, b_vals, acc)
 
-    c_offsets = m_offsets[:, None] * c_row_stride + n_offsets[None, :] * c_col_stride
-    c_mask = m_mask[:, None] & n_mask[None, :]
-    tl.store(c_ptr + c_offsets, acc.to(tl.float16), mask=c_mask)
+        a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_SIZE_K))
+        b_block_ptr = tl.advance(b_block_ptr, (BLOCK_SIZE_K, 0))
+
+    tl.store(c_block_ptr, acc.to(tl.float16), boundary_check=(0, 1))
 
 
 def matrix_multiplication_autotuned(a: torch.Tensor, b: torch.Tensor):
@@ -1125,267 +1036,39 @@ def matrix_multiplication_autotuned(a: torch.Tensor, b: torch.Tensor):
     return c
 
 
-"""
-====================================================================
-POINTER ADVANCEMENT + MODULO-TRICK MASKING
-====================================================================
-
-(1) Pointer advancement instead of pointer recomputation
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-The autotuned kernel rebuilds a_offsets/b_offsets/a_ptrs/b_ptrs from
-scratch on every K iteration -- a 2D outer-product of m_offsets and
-k_offsets (and similarly for B). The compiler often CSEs that, but
-not always; the safer pattern is to compute the initial pointer
-blocks ONCE before the loop, then increment by a 1D offset every
-iteration:
-
-    a_ptrs += BLOCK_SIZE_K * a_col_stride   # shifts entire block right
-    b_ptrs += BLOCK_SIZE_K * b_row_stride   # shifts entire block down
-
-Each iteration now does one elementwise add of a scalar onto a
-[M, K] block of pointers instead of regenerating the whole 2D
-address grid. Modest cycle savings in the inner loop -- exactly
-where they matter.
-
-(2) Modulo-trick for M/N boundary handling
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-The autotuned kernel paid for explicit m_mask, n_mask, k_mask AND
-combined them into a_mask = m_mask & k_mask, b_mask = k_mask & n_mask.
-That's a per-iteration 2D predicate computation plus a per-element
-predicate evaluation inside tl.load.
-
-The tutorial trick: clamp M/N out-of-bounds offsets back into bounds
-with `% M` / `% N`. Out-of-bounds rows of A wrap to in-bounds rows
-(garbage data from the kernel's perspective), out-of-bounds cols of
-B wrap to in-bounds cols (also garbage), and the dot product computes
-garbage values for rows/cols past M/N -- but those output positions
-are then DISCARDED by the c_mask at the final tl.store. Net result:
-correct output, no per-iteration M/N masking in the hot loop.
-
-The K dimension still needs a real mask because contributions from
-out-of-bounds K elements get summed into VALID output rows, and that
-WOULD corrupt the result. The mask `offs_k < K - k * BLOCK_SIZE_K`
-zeros out those contributions. Only the last iteration ever has any
-masked elements, so the cost is one cheap predicate per iteration
-that the tensor cores can usually overlap with the main load.
-"""
-
-
-@triton.autotune(
-    configs=get_autotune_configs(),
-    key=['M', 'N', 'K'],
-)
-@triton.jit
-def matrix_multiplication_pointer_kernel(
-    a_ptr, b_ptr, c_ptr,
-    M, N, K,
-    a_row_stride, b_row_stride, c_row_stride,
-    a_col_stride, b_col_stride, c_col_stride,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
-):
-    pid = tl.program_id(0)
-
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-
-    local_pid = pid % num_pid_in_group
-    pid_m = first_pid_m + (local_pid % group_size_m)
-    pid_n = local_pid // group_size_m
-
-    tl.assume(pid_m >= 0)
-    tl.assume(pid_n >= 0)
-    tl.assume(a_row_stride > 0)
-    tl.assume(a_col_stride > 0)
-    tl.assume(b_row_stride > 0)
-    tl.assume(b_col_stride > 0)
-    tl.assume(c_row_stride > 0)
-    tl.assume(c_col_stride > 0)
-
-    # Modulo trick: out-of-bounds row/col indices wrap into bounds. The data
-    # loaded for those positions is garbage from the math's POV, but the
-    # corresponding output positions are discarded by the c_mask at the
-    # final tl.store -- so the computed garbage never escapes the kernel.
-    # Maps to old's `m_offsets`/`n_offsets` + `m_mask`/`n_mask`, but the
-    # mask is replaced by the wrap and hoisted out of the K loop entirely.
-    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-    # Note: NO `+ k` here. Old version did `k_offsets = tl.arange(BSK) + k`
-    # inside the loop; the `+ k` shift now lives in the pointer advance below.
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-
-    # Initial pointer blocks. Built once; then we only ever ADVANCE them.
-    # Old version rebuilt this 2D outer product (m_offsets[:,None]*stride +
-    # k_offsets[None,:]*stride) on every K iteration -- we do it just once.
-    a_ptrs = a_ptr + (offs_am[:, None] * a_row_stride + offs_k[None, :] * a_col_stride)
-    b_ptrs = b_ptr + (offs_k[:, None] * b_row_stride + offs_bn[None, :] * b_col_stride)
-
-    acc = tl.zeros([BLOCK_SIZE_M, BLOCK_SIZE_N], dtype=tl.float32)
-    # k is now an iteration counter (0, 1, 2, ...), not an element offset
-    # like old's `range(0, K, BLOCK_SIZE_K)`. Iteration count is identical.
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        # Only the K dimension is masked. K out-of-bounds elements WOULD
-        # corrupt valid output rows/cols if accumulated, so we zero them
-        # via `other=0.0`. The mask is 1D in K, evaluated against the
-        # per-iteration tail size K - k * BLOCK_SIZE_K.
-        # Equivalent to old's `k_offsets < K`: that's `(k*BSK + j) < K`,
-        # i.e. `j < K - k*BSK`, i.e. `offs_k < K - k*BSK`. Only the LAST
-        # iteration ever has any element masked off.
-        a_vals = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
-        b_vals = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
-
-        acc = tl.dot(a_vals, b_vals, acc)
-
-        # Advance the entire pointer block by one K-tile. No 2D recompute.
-        # This scalar add reproduces old's per-iter shift: at iter n, old's
-        # a_offsets equalled iter-0's plus n*BSK*a_col_stride. Same for B,
-        # but along K's row axis (b_row_stride), since K is rows in B.
-        a_ptrs += BLOCK_SIZE_K * a_col_stride
-        b_ptrs += BLOCK_SIZE_K * b_row_stride
-
-    # Final store uses the REAL M/N bounds, discarding any wrap-around
-    # output positions produced by the modulo trick. This is the ONE place
-    # the M/N boundary check is paid -- the old kernel paid it every K iter.
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = c_ptr + offs_cm[:, None] * c_row_stride + offs_cn[None, :] * c_col_stride
-    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, acc.to(tl.float16), mask=c_mask)
-
-
-def matrix_multiplication_pointer(a: torch.Tensor, b: torch.Tensor):
-    M, K = a.shape
-    K, N = b.shape
-    c = torch.empty(M, N, device=DEVICE, dtype=a.dtype)
-    grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']),)
-    matrix_multiplication_pointer_kernel[grid](
-        a, b, c, M, N, K,
-        a.stride(0), b.stride(0), c.stride(0),
-        a.stride(1), b.stride(1), c.stride(1),
-    )
-    return c
-
-
-
-
-
-
-
-# %%
-# Correctness check, in fp16. We compare against an fp32 reference so the
-# tolerances bound rounding from accumulating fp16 products into fp32 and
-# casting back to fp16. K=192 here keeps the absolute round-off small enough
-# that 1e-2 / 1e-2 is comfortable.
-torch.manual_seed(0)
-a = torch.randn((512, 192), device=DEVICE, dtype=torch.float16)
-b = torch.randn((192, 128), device=DEVICE, dtype=torch.float16)
-c_triton = matrix_multiplication_naive(a, b)
-c_triton_blocked = matrix_multiplication_naive_blocked(a, b)
-c_triton_row_major = matrix_multiplication_naive_row_major(a, b)
-c_triton_tiled = matrix_multiplication_tiled(a, b)
-c_triton_tiled_supergrouped = matrix_multiplication_tiled_supergrouped(a, b)
-c_triton_autotuned = matrix_multiplication_autotuned(a, b)
-c_triton_pointer = matrix_multiplication_pointer(a, b)
-c_triton_persistent = matrix_multiplication_persistent(a, b)
-c_triton_block_pointers = matrix_multiplication_block_pointers(a, b)
-c_torch = torch.matmul(a.to(torch.float32), b.to(torch.float32)).to(torch.float16)
-assert torch.allclose(c_triton, c_torch, atol=1e-2, rtol=1e-2), (c_triton, c_torch)
-assert torch.allclose(c_triton_blocked, c_torch, atol=1e-2, rtol=1e-2), (c_triton_blocked, c_torch)
-assert torch.allclose(c_triton_row_major, c_torch, atol=1e-2, rtol=1e-2), (c_triton_row_major, c_torch)
-assert torch.allclose(c_triton_tiled, c_torch, atol=1e-1, rtol=1e-1), (c_triton_tiled, c_torch)
-assert torch.allclose(c_triton_tiled_supergrouped, c_torch, atol=1e-1, rtol=1e-1), (c_triton_tiled_supergrouped, c_torch)
-assert torch.allclose(c_triton_autotuned, c_torch, atol=1e-1, rtol=1e-1), (c_triton_autotuned, c_torch)
-assert torch.allclose(c_triton_pointer, c_torch, atol=1e-1, rtol=1e-1), (c_triton_pointer, c_torch)
-assert torch.allclose(c_triton_persistent, c_torch, atol=1e-1, rtol=1e-1), (c_triton_persistent, c_torch)
-assert torch.allclose(c_triton_block_pointers, c_torch, atol=1e-1, rtol=1e-1), (c_triton_block_pointers, c_torch)
-# %%
-# Benchmark in fp16: plain tiled (2D grid) vs supergrouped (1D grid) vs torch.
-# Both Triton kernels use the same block sizes (64x64x64) and Triton's
-# default num_stages / num_warps -- nothing else is tuned. The only
-# question is whether the pid -> (pid_m, pid_n) reordering buys us anything
-# on its own.
-#
-# The sweep is pushed up to 16384 because supergrouping is a cache-locality
-# optimization, and locality only matters once the working set genuinely
-# stops fitting in L2. At fp16, A+B = 2 * N^2 * 2 bytes:
-#     N=4096   ->   64 MB     (fits in 128 MB L2 with room to spare)
-#     N=5760   ->  128 MB     (right at L2 capacity)
-#     N=8192   ->  256 MB     (2x L2)
-#     N=12288  ->  576 MB     (4.5x L2)
-#     N=16384  -> 1024 MB     (8x L2)
-# So the upper half of the sweep is solidly in L2-overflow territory and is
-# where the supergrouping is most likely to show up. Whether it actually
-# does -- given that the kernel is also far from the tensor-core ceiling --
-# is the empirical question this benchmark answers.
-
-
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=['M', 'N', 'K'],
-        # Three regions:
-        #   small (256..4096)  -> fits in L2, pid order should not matter
-        #   medium (4096..8192) -> straddles L2 boundary
-        #   large (>8192)      -> A+B many x L2; supergroup should pay off
-        #                         IF the kernel is memory-bound here
-        x_vals=[256, 512, 1024, 1536, 2048, 2560, 3072, 3584, 4096,
-                4608, 5120, 5632, 6144, 6656, 7168, 7680, 8192,
-                9216, 10240, 11264, 12288, 13312, 14336, 15360, 16384],
+        x_vals=[
+            256, 512, 1024, 2048, 4096,
+            4608, 5120, 6144, 7168,
+            8192, 16384,
+        ],
         line_arg='provider',
-        line_vals=[
-            'triton_tiled',
-            'triton_tiled_supergrouped',
-            'triton_autotuned',
-            'triton_pointer',
-            'triton_persistent',
-            'triton_block_pointers',
-            'torch',
-        ],
-        line_names=[
-            "Triton Tiled (2D grid)",
-            "Triton Supergrouped (1D grid)",
-            "Triton Autotuned (supergrouped + autotune)",
-            "Triton Pointer (autotuned + ptr-advance + modulo mask)",
-            "Triton Persistent (block pointers + persistent NUM_SMS-grid)",
-            "Triton Block Pointers (make_block_ptr + boundary_check)",
-            "Torch (fp16, cuBLAS)",
-        ],
-        styles=[('orange', '-'), ('blue', '-'), ('red', '-'), ('purple', '-'), ('brown', '-'), ('pink', '-'), ('green', '-')],
-        ylabel="TFLOPS",
-        plot_name="matmul-performance-fp16",
+        line_vals=['triton_autotuned', 'torch'],
+        line_names=['Triton Autotuned Block Pointers', 'Torch'],
+        styles=[('blue', '-'), ('green', '-')],
+        ylabel='TFLOPS',
+        plot_name='matmul-autotuned-block-pointers-vs-torch-fp16',
         args={},
     ))
-def benchmark(M, N, K, provider):
+def benchmark_autotuned(M, N, K, provider):
     a = torch.randn((M, K), device=DEVICE, dtype=torch.float16)
     b = torch.randn((K, N), device=DEVICE, dtype=torch.float16)
     stream = getattr(torch, DEVICE.type).Stream()
     getattr(torch, DEVICE.type).set_stream(stream)
-    if provider == 'torch':
-        ms = triton.testing.do_bench(lambda: torch.matmul(a, b))
-    if provider == 'triton_tiled':
-        ms = triton.testing.do_bench(lambda: matrix_multiplication_tiled(a, b))
-    if provider == 'triton_tiled_supergrouped':
-        ms = triton.testing.do_bench(lambda: matrix_multiplication_tiled_supergrouped(a, b))
+
     if provider == 'triton_autotuned':
-        ms = triton.testing.do_bench(lambda: matrix_multiplication_autotuned(a, b))
-    if provider == 'triton_pointer':
-        ms = triton.testing.do_bench(lambda: matrix_multiplication_pointer(a, b))
-    if provider == 'triton_persistent':
-        ms = triton.testing.do_bench(lambda: matrix_multiplication_persistent(a, b))
-    if provider == 'triton_block_pointers':
-        ms = triton.testing.do_bench(lambda: matrix_multiplication_block_pointers(a, b))
-    # FLOPs for matmul: 2 * M * N * K (one multiply + one add per output element per K dim)
+        ms = triton.testing.do_bench(
+            lambda: matrix_multiplication_autotuned(a, b)
+        )
+    elif provider == 'torch':
+        ms = triton.testing.do_bench(lambda: torch.matmul(a, b))
+
     tflops = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)
     return tflops(ms)
 
 
-benchmark.run(show_plots=True, print_data=True)
+benchmark_autotuned.run(show_plots=True, print_data=True)
+
 # %%

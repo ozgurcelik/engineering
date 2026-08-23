@@ -696,6 +696,56 @@ Now the results for this implementation is
 As we can see, the performance is very close to the tiled implementation.
 The purpose of block pointers implementation is not necessarily to improve the performance upon the tiled implementation, but rather to simplify the implementation and make it more readable.
 
-## Persistent Kernel
-
 ## Autotuning
+
+In the tiled and supergrouped implementations, we have seen that the performance is highly dependent on the choices like block sizes.
+But there are other factors like warp sizes, number of stages, etc. that can also affect the performance.
+With autotuning, we can automatically find the best configuration for the kernel.
+
+We achieve the autotuning like this
+
+```python
+def get_autotune_configs():
+    return [
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 16}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 16}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 16}, num_stages=3, num_warps=8),
+    ]
+
+
+# Two decorators, in this order: triton.autotune wraps triton.jit. The
+# outer decorator is what the call site actually invokes; it picks a
+# Config, then forwards into the JIT'd inner kernel with the constexprs
+# from that Config injected.
+@triton.autotune(
+    configs=get_autotune_configs(),
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def matrix_multiplication_autotuned_kernel(
+    a_ptr, b_ptr, c_ptr,
+    M, N, K,
+    a_row_stride, b_row_stride, c_row_stride,
+    a_col_stride, b_col_stride, c_col_stride,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+```
+
+by using two decorators, `triton.autotune` and `triton.jit` for the kernel.
+
+The results for this implementation is
+
+![FP16 matrix multiplication performance: autotuned Triton, and PyTorch](figures/matmul_autotuning.png)
+
+As we can see, the performance matches the torch implementation quite well.
