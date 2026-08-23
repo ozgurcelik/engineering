@@ -218,6 +218,8 @@ Note that the accumulator is now a 2D array of size BLOCK_SIZE_M x BLOCK_SIZE_N,
 
 As we discussed, to compute the output tile C[m_tile, n_tile], we need to compute the dot product of A_m and B_n, which are now 2D arrays of size BLOCK_SIZE_M x K and K x BLOCK_SIZE_N respectively.
 We do this operation in blocks of size BLOCK_SIZE_K in the inner loop.
+The important change is not only that the memory accesses are coalesced. For these FP16 tile shapes on the NVIDIA L4, Triton can lower `tl.dot` to Tensor Core matrix multiply-accumulate instructions while accumulating into the FP32 `acc` tensor. The naive blocked kernel instead expresses the work as elementwise multiplication followed by `tl.sum`, so it does not expose a block matrix operation that can use Tensor Cores.
+
 The offsets for A and B are computed as `m_offsets[:, None] * a_row_stride + k_offsets[None, :] * a_col_stride` and `k_offsets[:, None] * b_row_stride + n_offsets[None, :] * b_col_stride` respectively.
 Quite a bit symmetric as we like to see.
 Then we compute the masks for A and B, `m_mask[:, None] & k_mask[None, :]` and `k_mask[:, None] & n_mask[None, :]` respectively.
@@ -234,21 +236,21 @@ We will be using square matrices once again.
 
 | M | N | K | Triton 64×64×64 | Triton 128×128×64 | Torch |
 |---:|---:|---:|---:|---:|---:|
-| 256 | 256 | 256 | 3.321312 | 2.617146 | 3.063213 |
-| 512 | 512 | 512 | 16.344097 | 13.393646 | 17.739589 |
-| 1024 | 1024 | 1024 | 40.089692 | 32.203279 | 33.063282 |
-| 2048 | 2048 | 2048 | 52.578786 | 58.014931 | 60.604645 |
-| 4096 | 4096 | 4096 | 43.445212 | 53.805863 | 52.393391 |
-| 4608 | 4608 | 4608 | 40.038352 | 48.826759 | 52.697203 |
-| 5120 | 5120 | 5120 | 26.867392 | 37.117943 | 54.394575 |
-| 6144 | 6144 | 6144 | 17.078184 | 29.612991 | 64.068548 |
-| 7168 | 7168 | 7168 | 21.833254 | 28.313260 | 59.709510 |
-| 8192 | 8192 | 8192 | 17.893498 | 26.176944 | 56.509382 |
-| 16384 | 16384 | 16384 | 14.667996 | 28.089333 | 55.831171 |
+| 256 | 256 | 256 | 3.3 | 2.6 | 3.1 |
+| 512 | 512 | 512 | 16.3 | 13.4 | 17.7 |
+| 1024 | 1024 | 1024 | 40.1 | 32.2 | 33.1 |
+| 2048 | 2048 | 2048 | 52.6 | 58.0 | 60.6 |
+| 4096 | 4096 | 4096 | 43.4 | 53.8 | 52.4 |
+| 4608 | 4608 | 4608 | 40.0 | 48.8 | 52.7 |
+| 5120 | 5120 | 5120 | 26.9 | 37.1 | 54.4 |
+| 6144 | 6144 | 6144 | 17.1 | 29.6 | 64.1 |
+| 7168 | 7168 | 7168 | 21.8 | 28.3 | 59.7 |
+| 8192 | 8192 | 8192 | 17.9 | 26.2 | 56.5 |
+| 16384 | 16384 | 16384 | 14.7 | 28.1 | 55.8 |
 
 Remember that for the L4 GPU, we have the following properties:
 - 58 SMs
-- 48 MB L2
+- 48 MiB L2
 - 300 GB/s memory bandwidth
 - 121 TFLOP/s FP16 performance
 
@@ -258,32 +260,41 @@ Now, let's try to make sense of the results we are seeing.
 
 As we said before, we are using FP16 square matrices here.
 The memory of such a matrix is 2N^2 bytes.
-For the 4608x4608 matrix, this is 40.5 MB, and for the 5120x5120 matrix, this is 50 MB.
+For the 4608x4608 matrix, this is 40.5 MiB, and for the 5120x5120 matrix, this is 50 MiB.
 The largest square matrix that can fit in the L2 cache is
 
-```
-\(n_\text{max}
+$$
+n_\text{max}
 =
-\sqrt{\frac{48\cdot2^{20}}{2}}
-\approx5017\)
-```
+\sqrt{\frac{48 \cdot 2^{20}}{2}}
+\approx 5017
+$$
 
 In this implementation, we do not have an explicit grouped tile ordering.
 Because of that, while for 4096 and 4608 matrices, one of the operands can reasonably fit in the L2 cache, after that point, programs can sweep too far across one grid dimension before returning to an operand tile which has already been evicted from the L2 cache.
-Of course, it's not just one operand taking space in the L2 cache, but after that point, 5017, we can't theoritically fit an operand anymore in the L2 cache.
+Of course, an operand is not the only data occupying L2. But beyond this theoretical threshold of 5017, even one complete operand cannot fit in the cache.
 
 ### Why does 128x128 eventually beat 64x64?
 
 One program that computes one output tile of size TxT from A and B matrices of size MxK and KxN respectively performs T^2K multiplications and T^2K additions, totaling 2T^2K FLOPs.
-Ignoring the cache reuse, it reads 2TK + 2KT = 4TK bytes of data (FP16 occupies 2 bytes).
-This gives an arithmetic intensity of 2T^2K / 4TK = T/2.
+Ignoring cache reuse, it reads 2TK + 2KT = 4TK bytes from A and B and writes 2T^2 bytes to C, because FP16 occupies 2 bytes.
+The resulting arithmetic intensity is
 
-Now looking at 64x64 and 128x128 output tiles, we expect
+$$
+\frac{2T^2K}{4TK + 2T^2}
+=
+\frac{TK}{2K + T}
+\approx
+\frac{T}{2}
+\quad\text{when } K \gg T.
+$$
+
+For the largest benchmark, where K=16384, this gives
 
 | Output tile | No-L2-reuse arithmetic intensity | DRAM roof at 300 GB/s |
 |---|---:|---:|
-| `64×64` | 32 FLOP/byte | 9.6 TFLOP/s |
-| `128×128` | 64 FLOP/byte | 19.2 TFLOP/s |
+| `64×64` | 31.9 FLOP/byte | 9.6 TFLOP/s |
+| `128×128` | 63.8 FLOP/byte | 19.1 TFLOP/s |
 
 At the largest matrix size we tested, 16384x16384, we have
 
@@ -297,7 +308,9 @@ Quite a bit consistent with our expectations with both exceeding the DRAM roof a
 For a matrix multiplication between two matrices of size MxK and KxN respectively, with tiling size TxT, we launch a grid of size (triton.cdiv(M, T), triton.cdiv(N, T)).
 In our case, as we use square matrices, we have (M, N) = (N, N), and as a result, we get 
 
-P = ceiling(N/T)^2
+$$
+P = \left\lceil \frac{N}{T} \right\rceil^2
+$$
 
 programs. For small matrices, this means
 
@@ -310,8 +323,8 @@ programs. For small matrices, this means
 
 Since we are using an L4 GPU, we have 58 SMs.
 But for the matrix size 256x256, only 4 programs are launched for tile size 128x128.
-So, at the lower end, we have a severe underutilization of the SMs, and simply put this problem is more severe for 128x128 than 64x64.
-This is why 64x64 does better than 128x128 at smaller matrix sizes.
+So, at the lower end, we have severe underutilization of the SMs, and this problem is more pronounced for 128x128 than for 64x64.
+This explains the 256 and 512 cases. At 1024, the 128x128 configuration launches 64 programs, which is already enough to cover the L4's 58 SMs. Its lower performance there must therefore also involve factors such as per-program register use, occupancy, and the chosen warp and pipeline configuration.
 
 ### Why does performance peak around 2048x2048?
 
@@ -319,7 +332,7 @@ We see that for all tile and inner loop block sizes, performance peaks around 20
 Why is that?
 Let's look at the memory requirements for the different matrix sizes.
 
-| Matrix | Memory (MB) |
+| Matrix | Memory per FP16 matrix (MiB) |
 |---:|---:|
 | 1024 | 2 |
 | 2048 | 8 |
@@ -327,7 +340,7 @@ Let's look at the memory requirements for the different matrix sizes.
 | 8192 | 128 |
 | 16384 | 512 |
 
-Given that we have 48 MB of L2 cache, up to and including 2048x2048 matrices, we can fit both operands in the L2 cache.
+Given that we have 48 MiB of L2 cache, up to and including 2048x2048 matrices, we can fit both operands in the L2 cache.
 In fact, as output writes can outcompete the operand reads for L2 cache, it's good that we can fit even the output matrix in the L2 cache along with the operands for the 2048x2048 matrix case.
 But for the 4096x4096 matrix, we no longer can fit both operands in the L2 cache.
 And as we discussed before, starting from 5120x5120 matrices, we can't even fit one operand in the L2 cache which led to significant drop in performance.
@@ -465,14 +478,14 @@ def matrix_multiplication_tiled_kernel_supergrouped(
         a_mask = m_mask[:, None] & k_mask[None, :]
         b_mask = k_mask[:, None] & n_mask[None, :]
 
-        a_vals = tl.load(a_ptrs, mask=a_mask)
-        b_vals = tl.load(b_ptrs, mask=b_mask)
+        a_vals = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b_vals = tl.load(b_ptrs, mask=b_mask, other=0.0)
 
         acc = tl.dot(a_vals, b_vals, acc)
 
     c_offsets = m_offsets[:, None] * c_row_stride + n_offsets[None, :] * c_col_stride
     c_mask = m_mask[:, None] & n_mask[None, :]
-    tl.store(c_ptr + c_offsets, acc.to(tl.float16), mask=c_mask)
+    tl.store(c_ptr + c_offsets, acc, mask=c_mask)
 
 
 def matrix_multiplication_tiled_supergrouped(
@@ -589,7 +602,7 @@ Now let's look at the results:
 
 As we can see, the sharp drop in performance around 5120x5120 which was due to L2 cache misses is now gone.
 
-## Block Pointers Implementation (Same performance but simpler implementation)
+## Block Pointers Implementation (Same grouped algorithm, simpler addressing)
 
 Now, let's introduce a simplified version of implementing the kernels using block pointers.
 
@@ -661,7 +674,7 @@ def matrix_multiplication_block_pointers_kernel(
         a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_SIZE_K))
         b_block_ptr = tl.advance(b_block_ptr, (BLOCK_SIZE_K, 0))
 
-    tl.store(c_block_ptr, acc.to(tl.float16), boundary_check=(0, 1))
+    tl.store(c_block_ptr, acc, boundary_check=(0, 1))
 ```
 
 In block pointers implementation, we use the `tl.make_block_ptr` function to create block pointers for the matrices we will be using.
@@ -693,14 +706,14 @@ Now the results for this implementation is
 
 ![FP16 matrix multiplication performance: block pointers Triton, and PyTorch](figures/matmul_blockpointers.png)
 
-As we can see, the performance is very close to the tiled implementation.
-The purpose of block pointers implementation is not necessarily to improve the performance upon the tiled implementation, but rather to simplify the implementation and make it more readable.
+As we can see, the performance is very close to the supergrouped implementation because the program ordering and computation are unchanged.
+The purpose of the block-pointer implementation is not necessarily to improve performance over the supergrouped implementation, but to express the same addressing and boundary handling more clearly.
 
 ## Autotuning
 
 In the tiled and supergrouped implementations, we have seen that the performance is highly dependent on the choices like block sizes.
 But there are other factors like warp sizes, number of stages, etc. that can also affect the performance.
-With autotuning, we can automatically find the best configuration for the kernel.
+With autotuning, we can automatically search for the best configuration for the kernel among a set of configurations.
 
 We achieve the autotuning like this
 
@@ -749,3 +762,13 @@ The results for this implementation is
 ![FP16 matrix multiplication performance: autotuned Triton, and PyTorch](figures/matmul_autotuning.png)
 
 As we can see, the performance matches the torch implementation quite well.
+
+## Conclusion
+
+The progression through these kernels highlights five lessons:
+
+- Blocking the K dimension exposes more parallelism within each Triton program.
+- Tiling the output enables Tensor Core matrix-multiply instructions and reuses loaded values across many outputs.
+- Program scheduling affects which operand tiles remain reusable in L2 cache.
+- Block pointers simplify multidimensional addressing and boundary handling without changing the grouped algorithm.
+- Autotuning selects block sizes, warps per program, and pipeline stages for each matrix shape.

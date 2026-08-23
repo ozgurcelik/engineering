@@ -109,8 +109,9 @@ def matrix_multiplication_naive_blocked(a: torch.Tensor, b: torch.Tensor):
             x_vals=[128, 256, 512, 768, 1024],
             line_arg='provider',
             line_vals=['triton_naive', 'triton_naive_blocked', 'torch'],
-            line_names=['Triton Naive', 'Triton Naive Blocked', 'Torch'],
+            line_names=['Naive', 'K-blocked', 'PyTorch'],
             styles=[('blue', '-'), ('orange', '-'), ('green', '-')],
+            xlabel='M=N=K',
             ylabel='TFLOPS',
             y_log=True,
             plot_name=f'matmul_naive_vs_naiveblocked_{dtype_name}',
@@ -352,13 +353,14 @@ def matrix_multiplication_tiled(
             'torch',
         ],
         line_names=[
-            'Triton 64x64x64',
-            'Triton 128x128x64', 'Torch',
+            '64x64x64',
+            '128x128x64', 'PyTorch',
         ],
         styles=[
             ('blue', '-'),
             ('orange', '-'), ('green', '-'),
         ],
+        xlabel='M=N=K',
         ylabel='TFLOPS',
         plot_name='matmul-tiled-vs-torch-fp16',
         args={},
@@ -546,14 +548,14 @@ def matrix_multiplication_tiled_kernel_supergrouped(
         a_mask = m_mask[:, None] & k_mask[None, :]
         b_mask = k_mask[:, None] & n_mask[None, :]
 
-        a_vals = tl.load(a_ptrs, mask=a_mask)
-        b_vals = tl.load(b_ptrs, mask=b_mask)
+        a_vals = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b_vals = tl.load(b_ptrs, mask=b_mask, other=0.0)
 
         acc = tl.dot(a_vals, b_vals, acc)
 
     c_offsets = m_offsets[:, None] * c_row_stride + n_offsets[None, :] * c_col_stride
     c_mask = m_mask[:, None] & n_mask[None, :]
-    tl.store(c_ptr + c_offsets, acc.to(tl.float16), mask=c_mask)
+    tl.store(c_ptr + c_offsets, acc, mask=c_mask)
 
 
 def matrix_multiplication_tiled_supergrouped(
@@ -606,15 +608,16 @@ def matrix_multiplication_tiled_supergrouped(
             'torch',
         ],
         line_names=[
-            'Triton Supergrouped 64x64x64',
-            'Triton Supergrouped 128x128x64',
-            'Torch',
+            'Grouped 64x64x64',
+            'Grouped 128x128x64',
+            'PyTorch',
         ],
         styles=[
             ('blue', '-'),
             ('orange', '-'),
             ('green', '-'),
         ],
+        xlabel='M=N=K',
         ylabel='TFLOPS',
         plot_name='matmul-supergrouped-vs-torch-fp16',
         args={},
@@ -706,7 +709,7 @@ def matrix_multiplication_block_pointers_kernel(
         a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_SIZE_K))
         b_block_ptr = tl.advance(b_block_ptr, (BLOCK_SIZE_K, 0))
 
-    tl.store(c_block_ptr, acc.to(tl.float16), boundary_check=(0, 1))
+    tl.store(c_block_ptr, acc, boundary_check=(0, 1))
 
 
 def matrix_multiplication_block_pointers(
@@ -812,7 +815,7 @@ def matrix_multiplication_persistent_kernel(
             a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_SIZE_K))
             b_block_ptr = tl.advance(b_block_ptr, (BLOCK_SIZE_K, 0))
 
-        tl.store(c_block_ptr, acc.to(tl.float16), boundary_check=(0, 1))
+        tl.store(c_block_ptr, acc, boundary_check=(0, 1))
 
 
 def matrix_multiplication_persistent(
@@ -867,11 +870,11 @@ def matrix_multiplication_persistent(
             'torch',
         ],
         line_names=[
-            'Triton Block Pointers 64x64x64',
-            'Triton Persistent Block Pointers 64x64x64',
-            'Triton Block Pointers 128x128x64',
-            'Triton Persistent Block Pointers 128x128x64',
-            'Torch',
+            'Block ptr 64x64x64',
+            'Persistent 64x64x64',
+            'Block ptr 128x128x64',
+            'Persistent 128x128x64',
+            'PyTorch',
         ],
         styles=[
             ('blue', '-'),
@@ -880,6 +883,7 @@ def matrix_multiplication_persistent(
             ('orange', '--'),
             ('green', '-'),
         ],
+        xlabel='M=N=K',
         ylabel='TFLOPS',
         plot_name='matmul-block-pointers-vs-persistent-vs-torch-fp16',
         args={},
@@ -1015,7 +1019,7 @@ def matrix_multiplication_autotuned_kernel(
         a_block_ptr = tl.advance(a_block_ptr, (0, BLOCK_SIZE_K))
         b_block_ptr = tl.advance(b_block_ptr, (BLOCK_SIZE_K, 0))
 
-    tl.store(c_block_ptr, acc.to(tl.float16), boundary_check=(0, 1))
+    tl.store(c_block_ptr, acc, boundary_check=(0, 1))
 
 
 def matrix_multiplication_autotuned(a: torch.Tensor, b: torch.Tensor):
@@ -1046,8 +1050,9 @@ def matrix_multiplication_autotuned(a: torch.Tensor, b: torch.Tensor):
         ],
         line_arg='provider',
         line_vals=['triton_autotuned', 'torch'],
-        line_names=['Triton Autotuned Block Pointers', 'Torch'],
+        line_names=['Autotuned', 'PyTorch'],
         styles=[('blue', '-'), ('green', '-')],
+        xlabel='M=N=K',
         ylabel='TFLOPS',
         plot_name='matmul-autotuned-block-pointers-vs-torch-fp16',
         args={},
