@@ -7,9 +7,10 @@ The matrix A is of size MxK and the matrix B is of size KxN, and the matrix C is
 ## Naive Implementation
 
 The C[i,j] element is computed as:
-```
-C[i,j] = sum_{k=0}^{K-1} A[i,k] * B[k,j]
-```
+
+$$
+C[i,j] = \sum_{k=0}^{K-1} A[i,k] \cdot B[k,j]
+$$
 
 The naive implementation is to compute each element of the C separately in a different program.
 
