@@ -1,6 +1,6 @@
 # Flash Attention v2 Implementation
 
-## Introduction
+## Introduction to attention mechanisms
 
 In its essence, the self-attention operation is
 
@@ -141,3 +141,43 @@ So, in summary
 | $Q$ | $[B,H_q,L,d_h]$ | Same | Same |
 | $K$ | $[B,H_q,L,d_h]$ | $[B,H_{kv},L,d_h]$ | $[B,1,L,d_h]$ |
 | $V$ | $[B,H_q,L,d_h]$ | $[B,H_{kv},L,d_h]$ | $[B,1,L,d_h]$ |
+
+In our case, we will be focusing on the MHA case.
+
+## Naive attention implementation
+
+```python
+def naive_attention(Q: Float[Tensor, " ... L d_h"],
+                    K: Float[Tensor, " ... L d_k"],
+                    V: Float[Tensor, " ... L d_k"],
+                    mask: Bool[Tensor, " ... L L"] | None = None) -> Float[Tensor, " ... L d_k"]:
+    """
+    Naive attention implementation.
+    """
+    d_k = K.shape[-1]
+    scores = einsum(Q, K, "... query d, ... key d -> ... query key") / math.sqrt(d_k)
+    if mask is not None:
+        scores = torch.where(mask, scores, float("-inf"))
+    weights = torch.softmax(scores, dim=-1)
+    return einsum(weights, V, "... query key, ... key d -> ... query d")
+
+def pytorch_attention(Q: Float[Tensor, " ... L d_h"],
+                      K: Float[Tensor, " ... L d_k"],
+                      V: Float[Tensor, " ... L d_k"],
+                      mask: Bool[Tensor, " ... L L"] | None = None) -> Float[Tensor, " ... L d_k"]:
+    """
+    PyTorch attention implementation.
+    """
+    return torch.nn.functional.scaled_dot_product_attention(Q, K, V, attn_mask=mask)
+```
+
+When we compare the naive attention implementation with the PyTorch official implementation with batch_size=4, num_heads=8, head_dim=96, dtype=torch.float16 on L4 GPU, we get the following results:
+
+![Naive attention implementation vs PyTorch official implementation](figures/flash_attention_naive_vs_pytorch.png)
+
+Now the main problem with the naive implementation is that it is not efficient.
+We compute the $QK^T$ matrix by reading the $Q$ and $K$ into memory and then save the result to memory.
+Then read that result to compute softmax and then save it to memory.
+And then read that new result to do the matrix multiplication with the $V$ matrix and return it.
+This is a lot of memory reads and writes, and the goal of the flash attention is to minimize this overhead.
+
