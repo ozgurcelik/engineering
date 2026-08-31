@@ -181,3 +181,15 @@ Then read that result to compute softmax and then save it to memory.
 And then read that new result to do the matrix multiplication with the $V$ matrix and return it.
 This is a lot of memory reads and writes, and the goal of the flash attention is to minimize this overhead.
 
+## Flash Attention Implementation
+
+Now, we will first try to understand how the flash attention implementation works conceptually.
+For the sake of simplicity, we will focus on a single head with no batch dimension and $d_h = d_k = d$.
+So, we have $Q, K, V \in \mathbb{R}^{L \times d}$.
+
+Let's call the $\frac{QK^T}{\sqrt{d}}$ matrix as the scores matrix, $S \in \mathbb{R}^{L \times L}$, $P = \text{softmax}(S) \in \mathbb{R}^{L \times L}$, and $O = PV \in \mathbb{R}^{L \times d}$.
+
+In this case, $S_{i,j} = \frac{1}{\sqrt{d}} \sum_{r=1}^{d} Q_{i,r} K_{j, r}$, so a row $i$ of $Q$ is multiplied by the row $j$ of $K$.
+Then, $P_{i,j} = \frac{e^{S_{i,j}}}{\sum_{l=1}^{L} e^{S_{i,l}}}$ is the softmax of the scores matrix.
+This means that to compute a row of $P$, we only need the corresponding row of $Q$ but all the rows of $K$.
+Continuing on, $O_{i,j} = \sum_{l=1}^{L} P_{i,l} V_{l,j}$, so a row $i$ of $O$ depends on the corresponding row of $P$ and entire $V$.
