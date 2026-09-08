@@ -252,8 +252,9 @@ def online_softmax(x):
     return [exp(xi - m) / l for xi in x]
 ```
 
-Now, going back to our problem, assume that we are at the $i$ step for the $Q$ and $j$ step for the $K$ and $V$.
+Now, going back to our problem, assume that we are at tile $i$ for the $Q$ and tile $j$ for the $K$ and $V$.
 We also have $l_i^{j-1} \in \mathbb{R}^{B_q \times B_k}$ and $m_i^{j-1} \in \mathbb{R}^{B_q}$ along with $O_i^{j-1} \in \mathbb{R}^{B_q \times d}$ from the previous step.
+Here, $l$ is the running proxy for the denominator of the softmax just like we had in the online softmax algorithm, and $m$ is the running maximum value in the row.
 For the $Q_i$ and $K^{(j)}, V^{(j)}$ tiles, we can compute the $S_i^{j} = \frac{1}{\sqrt{d}} Q_i K^{(j)^T} \in \mathbb{R}^{B_q \times B_k}$ matrix.
 We have $B_q$ rows, and since each row is independent of the others, we compute the $m_i^{j} = max(m_i^{j-1}, rowmax(S_i^{j})) \in \mathbb{R}^{B_q}$ vector.
 Then, $\tilde{P}_i^{j} = e^{S_i^{j} - m_i^{j}} \in \mathbb{R}^{B_q \times B_k}$ matrix.
@@ -267,11 +268,14 @@ $$
 Now, for a batch of rows in the $O$ matrix, we can compute the partial results for each tile of $K$ and $V$ in the inner loop and update the old results as we accumulate them.
 
 $$
-O_i^{j} = diag(e^{m_i^{j-1} - m_i^{j}}) O_i^{j-1} + \tilde{P}_i^{j} O_i^{j-1}
+O_i^{j} = diag(e^{m_i^{j-1} - m_i^{j}}) O_i^{j-1} + \tilde{P}_i^{j} V_i^{j-1}
 $$
 
 Here, note that the $O_i^{j}$ is the numerator of the final result.
 Once the inner loop is done, we will update it as $O_i = diag(l_i^{T_k})^ {-1} O_i^{T_k}$.
 So, basically we will divide the result by the summed exponential coming from the softmax computation.
 The full algorithm is as follows:
-# TODO: Add the algorithm
+
+![Flash Attention Forward Pass](figures/flash_attention_forward.png)
+
+The logsum 
