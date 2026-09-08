@@ -10,9 +10,7 @@ $$
 
 so matrix multiplications and a softmax.
 
-Easiest attention mechanism to implement is
-
-Now, there are 3 common attention mechanisms:
+There are 3 common attention mechanisms:
 
 1. Multi-head attention
 2. Multi-query attention
@@ -190,6 +188,90 @@ So, we have $Q, K, V \in \mathbb{R}^{L \times d}$.
 Let's call the $\frac{QK^T}{\sqrt{d}}$ matrix as the scores matrix, $S \in \mathbb{R}^{L \times L}$, $P = \text{softmax}(S) \in \mathbb{R}^{L \times L}$, and $O = PV \in \mathbb{R}^{L \times d}$.
 
 In this case, $S_{i,j} = \frac{1}{\sqrt{d}} \sum_{r=1}^{d} Q_{i,r} K_{j, r}$, so a row $i$ of $Q$ is multiplied by the row $j$ of $K$.
-Then, $P_{i,j} = \frac{e^{S_{i,j}}}{\sum_{l=1}^{L} e^{S_{i,l}}}$ is the softmax of the scores matrix.
+Then, $P_{i,j} = softmax(S_{i,j}) = \frac{e^{S_{i,j}}}{\sum_{l=1}^{L} e^{S_{i,l}}}$ is the softmax of the scores matrix.
 This means that to compute a row of $P$, we only need the corresponding row of $Q$ but all the rows of $K$.
 Continuing on, $O_{i,j} = \sum_{l=1}^{L} P_{i,l} V_{l,j}$, so a row $i$ of $O$ depends on the corresponding row of $P$ and entire $V$.
+What this tells us is that every row of $O$ needs only the corresponding row from the $Q$ matrix.
+It then intuitively makes sense that we iterate over the rows of $Q$ (in batches) in outer loop and $K$ and $V$ in inner loop.
+
+Now, we can't load the entire $K$ and $V$ matrices into memory at once.
+So, we will process them in batches of rows as well.
+
+<picture>
+  <source srcset="figures/flash_attention_tiled_flow.webp" type="image/webp">
+  <img src="figures/flash_attention_tiled_flow.gif" width="500" alt="FlashAttention tiled matrix flow: a query tile stays fixed while key and value tiles stream through and accumulate the corresponding output rows">
+</picture>
+
+## TODO: Add m and l to the animation
+
+Let's say we have tiles of sizes $B_q$ and $B_k$ for the $Q$ and $K, V$ matrices respectively.
+We can then split $Q$ into $T_q = \left\lceil \frac{L}{B_q} \right\rceil$ tiles $Q_1, \ldots, Q_{T_q}$ of size $B_q \times d$.
+Similarly, we can split $K, V$ into $T_k = \left\lceil \frac{L}{B_k} \right\rceil$ tiles $K^{(1)}, \ldots, K^{(T_k)}$ and $V^{(1)}, \ldots, V^{(T_k)}$ of size $B_k \times d$.
+
+Now, for any $Q_i$, assume we start with $K^{(1)}$ and $V^{(1)}$ in memory.
+We can easily compute the $S_i^{1} = \frac{1}{\sqrt{d}} Q_i K^{(1)^T} \in \mathbb{R}^{B_q \times B_k}$ matrix.
+But how can we then compute the softmax of it?
+The problem is the softmax is dependent on the entire row of $S$, so all $L$ elements of the row, but we only have the $B_k$ columns of that row in memory at any given time.
+There, the online softmax algorithm comes to the rescue.
+
+### Online softmax algorithm
+
+The softmax is defined as:
+$$
+\text{softmax}(x)_i = \frac{e^{x_i}}{\sum_{j=1}^{L} e^{x_j}} = \frac{e^{x_i - m_x}}{\sum_{j=1}^{L} e^{x_j - m_x}}
+$$
+where $m_x = \max(x)$ is the maximum value in the vector $x$ for the sake of numerical stability.
+Again, the problem there is, both the $m_x$ and the sum of the exponential terms are dependent on the entire row of $S$, but we get them in chunks of $B_k$ columns at a time.
+Now, say that $m_i$ is the maximum element in the vector from 1 to $i$, and $l_i$ is the sum of the exponential terms from 1 to $i$, $l_i = \sum_{j=1}^{i} e^{x_j - m_i}$.
+
+Then, expanding the sum and re-centering the exponentials around the previous maximum gives the recurrence:
+
+$$
+\begin{aligned}
+l_i &= \sum_{j=1}^{i} e^{x_j - m_i} \\
+&= \sum_{j=1}^{i-1} e^{x_j - m_i} + e^{x_i - m_i} \\
+&= \sum_{j=1}^{i-1} e^{x_j - m_{i-1}} \cdot e^{m_{i-1} - m_i} + e^{x_i - m_i} \\
+&= l_{i-1} \cdot e^{m_{i-1} - m_i} + e^{x_i - m_i}
+\end{aligned}
+$$
+
+This then gives us the following algorithm for online softmax:
+
+```python
+def online_softmax(x):
+    m = float("-inf")
+    l = 0.0
+
+    # Online pass: compute the final maximum and denominator.
+    for xi in x:
+        m_new = max(m, xi)
+        l = l * exp(m - m_new) + exp(xi - m_new)
+        m = m_new
+
+    # Output pass: compute the normalized probabilities.
+    return [exp(xi - m) / l for xi in x]
+```
+
+Now, going back to our problem, assume that we are at the $i$ step for the $Q$ and $j$ step for the $K$ and $V$.
+We also have $l_i^{j-1} \in \mathbb{R}^{B_q \times B_k}$ and $m_i^{j-1} \in \mathbb{R}^{B_q}$ along with $O_i^{j-1} \in \mathbb{R}^{B_q \times d}$ from the previous step.
+For the $Q_i$ and $K^{(j)}, V^{(j)}$ tiles, we can compute the $S_i^{j} = \frac{1}{\sqrt{d}} Q_i K^{(j)^T} \in \mathbb{R}^{B_q \times B_k}$ matrix.
+We have $B_q$ rows, and since each row is independent of the others, we compute the $m_i^{j} = max(m_i^{j-1}, rowmax(S_i^{j})) \in \mathbb{R}^{B_q}$ vector.
+Then, $\tilde{P}_i^{j} = e^{S_i^{j} - m_i^{j}} \in \mathbb{R}^{B_q \times B_k}$ matrix.
+Now, we need to compute the $l_i^{j} \in \mathbb{R}^{B_q}$ vector.
+Looking at the online softmax algorithm, and keeping in mind we are not looking at a single element, rather a batch of columns in each row, we can see that the recurrence relation for $l_i^{j}$ is:
+
+$$
+l_i^{j} = l_i^{j-1} \cdot e^{m_i^{j-1} - m_i^{j}} + rowsum(\tilde{P}_i^{j})
+$$
+
+Now, for a batch of rows in the $O$ matrix, we can compute the partial results for each tile of $K$ and $V$ in the inner loop and update the old results as we accumulate them.
+
+$$
+O_i^{j} = diag(e^{m_i^{j-1} - m_i^{j}}) O_i^{j-1} + \tilde{P}_i^{j} O_i^{j-1}
+$$
+
+Here, note that the $O_i^{j}$ is the numerator of the final result.
+Once the inner loop is done, we will update it as $O_i = diag(l_i^{T_k})^ {-1} O_i^{T_k}$.
+So, basically we will divide the result by the summed exponential coming from the softmax computation.
+The full algorithm is as follows:
+# TODO: Add the algorithm
