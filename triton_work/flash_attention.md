@@ -181,6 +181,10 @@ This is a lot of memory reads and writes, and the goal of the flash attention is
 
 ## Flash Attention Implementation
 
+Overarching goal is to fuse the three steps of attention into a single kernel.
+The naive implementation is three kernel launches and the intermediates $S$ and $P$ are O(N^2), so they get fully materialized in HBM and reread by the next launch.
+Fusing means $S_{ij}$ and $P_{ij}$ stay in registers / SRAM and never touch HBM.
+
 Now, we will first try to understand how the flash attention implementation works conceptually.
 For the sake of simplicity, we will focus on a single head with no batch dimension and $d_h = d_k = d$.
 So, we have $Q, K, V \in \mathbb{R}^{L \times d}$.
