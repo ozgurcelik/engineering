@@ -169,7 +169,7 @@ def pytorch_attention(Q: Float[Tensor, " ... L d_h"],
     return torch.nn.functional.scaled_dot_product_attention(Q, K, V, attn_mask=mask)
 ```
 
-When we compare the naive attention implementation with the PyTorch official implementation with batch_size=4, num_heads=8, head_dim=96, dtype=torch.float16 on L4 GPU, we get the following results:
+When we compare the non-causal naive attention implementation with the PyTorch official implementation with batch_size=4, num_heads=8, head_dim=96, dtype=torch.float16 on L4 GPU, we get the following results:
 
 ![Naive attention implementation vs PyTorch official implementation](figures/flash_attention_naive_vs_pytorch.png)
 

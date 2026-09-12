@@ -3,12 +3,10 @@
 import triton
 import triton.language as tl
 import torch
-import matplotlib.pyplot as plt
-import numpy as np
 from torch import Tensor
 import math
-from einops import einsum, rearrange
-from jaxtyping import Bool, Float, Int
+from einops import einsum
+from jaxtyping import Bool, Float
 from typing import Tuple
 # %%
 def naive_attention(Q: Float[Tensor, " ... L d_h"],
@@ -35,29 +33,6 @@ def pytorch_attention(Q: Float[Tensor, " ... L d_h"],
     return torch.nn.functional.scaled_dot_product_attention(Q, K, V, attn_mask=mask)
 
 # %%
-torch.manual_seed(0)
-
-batch_size = 2
-num_heads = 4
-sequence_length = 32
-head_dim = 16
-
-Q = torch.randn(batch_size, num_heads, sequence_length, head_dim)
-K = torch.randn(batch_size, num_heads, sequence_length, head_dim)
-V = torch.randn(batch_size, num_heads, sequence_length, head_dim)
-
-naive_output = naive_attention(Q, K, V)
-pytorch_output = pytorch_attention(Q, K, V)
-
-max_absolute_difference = (naive_output - pytorch_output).abs().max().item()
-print(f"Maximum absolute difference: {max_absolute_difference:.3e}")
-torch.testing.assert_close(naive_output, pytorch_output, rtol=1e-5, atol=1e-6)
-
-# %%
-DEVICE = triton.runtime.driver.active.get_active_torch_device()
-
-
-# %%
 @triton.jit
 def flash_attention_forward_kernel(
     Q_ptr, #[B, Hq, Lq, D]
@@ -76,6 +51,7 @@ def flash_attention_forward_kernel(
     Q_TILE_SIZE: tl.constexpr,
     K_TILE_SIZE: tl.constexpr,
     is_causal: tl.constexpr,
+    TK_trick: tl.constexpr,
 ):
     query_tile_index = tl.program_id(0)
     batch_index = tl.program_id(1)
@@ -131,7 +107,24 @@ def flash_attention_forward_kernel(
     li = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32) # (Q_TILE_SIZE,)
     mi = tl.full((Q_TILE_SIZE,), -float('inf'), dtype=tl.float32) # (Q_TILE_SIZE,)
     
-    Tk = tl.cdiv(N_KEYS, K_TILE_SIZE)
+    # For causal attention, key tiles whose smallest key index is already past
+    # the largest query index in this query tile would have Sij entirely masked
+    # to -inf -- which is a no-op for the running (mi, li, Oi) state but still
+    # costs two tl.loads, a tl.dot, and the mask/exp work. Tightening the loop
+    # bound to skip those tiles cuts work roughly in half for causal and is
+    # what makes causal attention actually faster than full attention.
+    if is_causal and TK_trick:
+        # Last reachable key index for this query tile is
+        #   (query_tile_index + 1) * Q_TILE_SIZE - 1,
+        # so the number of key tiles we need to visit is
+        #   ceil(((query_tile_index + 1) * Q_TILE_SIZE) / K_TILE_SIZE).
+        # Also clamp to the actual number of key tiles so we don't run past N_KEYS.
+        Tk = tl.minimum(
+            tl.cdiv((query_tile_index + 1) * Q_TILE_SIZE, K_TILE_SIZE),
+            tl.cdiv(N_KEYS, K_TILE_SIZE),
+        )
+    else:
+        Tk = tl.cdiv(N_KEYS, K_TILE_SIZE)
     for j in range(Tk):
         Kj = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero") # (K_TILE_SIZE, D)
         Vj = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero") # (K_TILE_SIZE, D)
@@ -144,6 +137,10 @@ def flash_attention_forward_kernel(
         # But we need to take care of the padding along the 0th dimension of K, since padded parts there will be adding columns filled with 0s to the Sij matrix, which then messes up the denominator of softmax
         k_offsets = j * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE) # (K_TILE_SIZE,)
         Sij = tl.where(k_offsets[None, :] < N_KEYS, Sij, -float('inf'))
+        if is_causal:
+            q_offsets = query_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE) # (Q_TILE_SIZE,)
+            mask = q_offsets[:, None] >= k_offsets[None, :] # (Q_TILE_SIZE, K_TILE_SIZE)
+            Sij = tl.where(mask, Sij, -float('inf'))
         mi_new = tl.maximum(mi, tl.max(Sij, axis=-1)) # (Q_TILE_SIZE,)
         Pij = tl.exp(Sij - mi_new[:, None]) # (Q_TILE_SIZE, K_TILE_SIZE)
         li = tl.exp(mi - mi_new) * li + tl.sum(Pij, axis=-1) # (Q_TILE_SIZE,)
@@ -160,7 +157,8 @@ def flash_attention_forward_kernel(
 def flash_attention_forward(Q: Float[Tensor, " ... L d_h"],
                             K: Float[Tensor, " ... L d_k"],
                             V: Float[Tensor, " ... L d_k"],
-                            is_causal: bool = False) -> Tuple[Float[Tensor, " ... L d_k"], Float[Tensor, " ... L"]]:    
+                            is_causal: bool = False,
+                            TK_trick: bool = True) -> Tuple[Float[Tensor, " ... L d_k"], Float[Tensor, " ... L"]]:    
     """
     Flash attention forward pass.
     """
@@ -185,114 +183,9 @@ def flash_attention_forward(Q: Float[Tensor, " ... L d_h"],
         Lq, Lk,
         scale,
         D,
-        Q_TILE_SIZE, K_TILE_SIZE, is_causal,
+        Q_TILE_SIZE, K_TILE_SIZE, is_causal, TK_trick,
     )
     return O, L
-
-# %%
-# Reuse the inputs from the naive-vs-PyTorch comparison as BF16 on the GPU.
-Q_gpu, K_gpu, V_gpu = (tensor.to(device=DEVICE, dtype=torch.bfloat16) for tensor in (Q, K, V))
-flash_output, _ = flash_attention_forward(Q_gpu, K_gpu, V_gpu, is_causal=False)
-pytorch_gpu_output = pytorch_attention(Q_gpu, K_gpu, V_gpu)
-
-max_absolute_difference = (flash_output - pytorch_gpu_output).abs().max().item()
-print(f"Flash vs PyTorch maximum absolute difference: {max_absolute_difference:.3e}")
-# Allow for BF16 rounding differences between the two implementations.
-torch.testing.assert_close(flash_output, pytorch_gpu_output, rtol=2e-2, atol=2e-2)
-# %%
-
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["sequence_length"],
-        x_vals=[128, 256, 512, 1024, 2048, 4096, 8192],
-        line_arg="provider",
-        line_vals=["naive", "flash", "pytorch"],
-        line_names=["Standard", "Triton Flash", "PyTorch Official"],
-        styles=[("blue", "-"), ("orange", "-"), ("green", "-")],
-        xlabel="Sequence length",
-        ylabel="TFLOPs/sec",
-        y_log=True,
-        plot_name="attention_naive_vs_flash_vs_pytorch_fp16",
-        args={
-            "batch_size": 4,
-            "num_heads": 8,
-            "head_dim": 96,
-            "dtype": torch.float16,
-        },
-    )
-)
-def benchmark_attention(
-    sequence_length,
-    provider,
-    batch_size,
-    num_heads,
-    head_dim,
-    dtype,
-):
-    shape = (batch_size, num_heads, sequence_length, head_dim)
-    Q = torch.randn(shape, device=DEVICE, dtype=dtype)
-    K = torch.randn(shape, device=DEVICE, dtype=dtype)
-    V = torch.randn(shape, device=DEVICE, dtype=dtype)
-
-    stream = getattr(torch, DEVICE.type).Stream()
-    getattr(torch, DEVICE.type).set_stream(stream)
-
-    if provider == "naive":
-        ms = triton.testing.do_bench(lambda: naive_attention(Q, K, V))
-    elif provider == "flash":
-        ms = triton.testing.do_bench(lambda: flash_attention_forward(Q, K, V, is_causal=False))
-    elif provider == "pytorch":
-        ms = triton.testing.do_bench(lambda: pytorch_attention(Q, K, V))
-    else:
-        raise ValueError(f"Unknown provider: {provider}")
-
-    # Count the multiply and add in each of QK^T and softmax(QK^T)V.
-    flops = 4 * batch_size * num_heads * sequence_length**2 * head_dim
-    return flops * 1e-12 / (ms * 1e-3)
-
-
-def plot_attention_results(result):
-    """Plot benchmark results as grouped bars with values above each bar."""
-    provider_colors = {
-        "Standard": "tab:blue",
-        "Triton Flash": "tab:orange",
-        "PyTorch Official": "tab:green",
-    }
-
-    plt.close("all")
-    sequence_lengths = result["sequence_length"].astype(int)
-    providers = [column for column in result.columns if column != "sequence_length"]
-    x_positions = np.arange(len(sequence_lengths))
-    bar_width = 0.8 / len(providers)
-
-    fig, ax = plt.subplots(figsize=(14, 7))
-    for provider_index, provider in enumerate(providers):
-        offset = (provider_index - (len(providers) - 1) / 2) * bar_width
-        bars = ax.bar(
-            x_positions + offset,
-            result[provider],
-            width=bar_width,
-            label=provider,
-            color=provider_colors.get(provider),
-        )
-        ax.bar_label(bars, fmt="%.2f", padding=3)
-
-    provider_names = " vs ".join(providers)
-    ax.set_title(f"Attention TFLOPs/sec: {provider_names} (FP16)")
-    ax.set_xlabel("Sequence Length")
-    ax.set_ylabel("TFLOPs/sec")
-    ax.set_xticks(x_positions, sequence_lengths)
-    ax.grid(axis="y", linestyle="--", alpha=0.5)
-    ax.margins(y=0.1)
-    ax.legend()
-    fig.tight_layout()
-
-    plt.show()
-
-
-benchmark_results = benchmark_attention.run(print_data=True, return_df=True)
-plot_attention_results(benchmark_results)
-
 
 # %%
 # TODO: Better grouping the programs
