@@ -128,7 +128,8 @@ def flash_attention_forward_kernel(
     for j in range(Tk):
         Kj = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero") # (K_TILE_SIZE, D)
         Vj = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero") # (K_TILE_SIZE, D)
-        Sij = tl.dot(Qi, Kj.T) * scale # (Q_TILE_SIZE, K_TILE_SIZE)
+        # Scale by log2(e) so the softmax update can use exp2 directly.
+        Sij = tl.dot(Qi, Kj.T) * (scale * 1.4426950408889634) # (Q_TILE_SIZE, K_TILE_SIZE)
         # Due to padding, some parts of the Sij matrix will be 0
         # But, this would mess up the softmax operation,
         # so we need to identify the padded elements and set the corresponding elements of Sij to -inf
@@ -138,27 +139,55 @@ def flash_attention_forward_kernel(
         k_offsets = j * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE) # (K_TILE_SIZE,)
         Sij = tl.where(k_offsets[None, :] < N_KEYS, Sij, -float('inf'))
         if is_causal:
-            q_offsets = query_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE) # (Q_TILE_SIZE,)
-            mask = q_offsets[:, None] >= k_offsets[None, :] # (Q_TILE_SIZE, K_TILE_SIZE)
-            Sij = tl.where(mask, Sij, -float('inf'))
+            if TK_trick:
+                # Only tiles overlapping this query block need a causal mask.
+                # Compare positions so rectangular query/key tiles work too.
+                if (j + 1) * K_TILE_SIZE > query_tile_index * Q_TILE_SIZE:
+                    q_offsets = query_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE) # (Q_TILE_SIZE,)
+                    mask = q_offsets[:, None] >= k_offsets[None, :] # (Q_TILE_SIZE, K_TILE_SIZE)
+                    Sij = tl.where(mask, Sij, -float('inf'))
+            else:
+                q_offsets = query_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE) # (Q_TILE_SIZE,)
+                mask = q_offsets[:, None] >= k_offsets[None, :] # (Q_TILE_SIZE, K_TILE_SIZE)
+                Sij = tl.where(mask, Sij, -float('inf'))
         mi_new = tl.maximum(mi, tl.max(Sij, axis=-1)) # (Q_TILE_SIZE,)
-        Pij = tl.exp(Sij - mi_new[:, None]) # (Q_TILE_SIZE, K_TILE_SIZE)
-        li = tl.exp(mi - mi_new) * li + tl.sum(Pij, axis=-1) # (Q_TILE_SIZE,)
-        Oi = tl.exp(mi - mi_new)[:, None] * Oi + tl.dot(Pij.to(Vj.dtype), Vj) # (Q_TILE_SIZE, D)
+        Pij = tl.exp2(Sij - mi_new[:, None]) # (Q_TILE_SIZE, K_TILE_SIZE)
+        alpha = tl.exp2(mi - mi_new)
+        li = alpha * li + tl.sum(Pij, axis=-1) # (Q_TILE_SIZE,)
+        Oi = tl.dot(Pij.to(Vj.dtype), Vj, Oi * alpha[:, None]) # (Q_TILE_SIZE, D)
         mi = mi_new
         K_block_ptr = tl.advance(K_block_ptr, (K_TILE_SIZE, 0))
         V_block_ptr = tl.advance(V_block_ptr, (K_TILE_SIZE, 0))
     
     Oi = Oi * (1.0 / li[:, None])
-    Li = mi + tl.log(li)
+    # Convert the base-2 softmax state back to natural-log logsumexp.
+    Li = (mi + tl.log2(li)) * 0.6931471805599453
     tl.store(O_block_ptr, Oi.to(O_block_ptr.type.element_ty), boundary_check=(0, 1))
     tl.store(L_block_ptr, Li, boundary_check=(0,))
+
+# Include the fixed 32x32 / 4-warp / 3-stage baseline and larger tiles
+# to improve reuse of K/V across query rows.
+flash_attention_forward_kernel_autotuned = triton.autotune(
+    configs=[
+        triton.Config(
+            {"Q_TILE_SIZE": q_tile, "K_TILE_SIZE": k_tile},
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+        for q_tile, k_tile in ((32, 32), (64, 32), (64, 64), (128, 32), (128, 64), (128, 128))
+        for num_warps in (4, 8)
+        for num_stages in (2, 3)
+    ],
+    key=["N_QUERIES", "N_KEYS", "D", "is_causal", "TK_trick"],
+)(flash_attention_forward_kernel)
+
 
 def flash_attention_forward(Q: Float[Tensor, " ... L d_h"],
                             K: Float[Tensor, " ... L d_k"],
                             V: Float[Tensor, " ... L d_k"],
                             is_causal: bool = False,
-                            TK_trick: bool = True) -> Tuple[Float[Tensor, " ... L d_k"], Float[Tensor, " ... L"]]:    
+                            TK_trick: bool = True,
+                            autotune: bool = False) -> Tuple[Float[Tensor, " ... L d_k"], Float[Tensor, " ... L"]]:
     """
     Flash attention forward pass.
     """
@@ -170,9 +199,15 @@ def flash_attention_forward(Q: Float[Tensor, " ... L d_h"],
     K_TILE_SIZE = 32
     O = torch.empty((B, Hq, Lq, D), device=Q.device, dtype=Q.dtype)
     L = torch.empty((B, Hq, Lq), device=Q.device, dtype=torch.float32)
-    Tq = triton.cdiv(Lq, Q_TILE_SIZE)
-    grid_size = (Tq, B, Hq)
-    flash_attention_forward_kernel[(Tq, B, Hq)](
+    kernel = flash_attention_forward_kernel_autotuned if autotune else flash_attention_forward_kernel
+    grid = lambda meta: (triton.cdiv(Lq, meta["Q_TILE_SIZE"]), B, Hq)
+    tile_args = {} if autotune else {
+        "Q_TILE_SIZE": Q_TILE_SIZE,
+        "K_TILE_SIZE": K_TILE_SIZE,
+        "num_warps": 4,
+        "num_stages": 3,
+    }
+    kernel[grid](
         Q, K, V,
         O, L,
         Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
@@ -183,7 +218,7 @@ def flash_attention_forward(Q: Float[Tensor, " ... L d_h"],
         Lq, Lk,
         scale,
         D,
-        Q_TILE_SIZE, K_TILE_SIZE, is_causal, TK_trick,
+        is_causal=is_causal, TK_trick=TK_trick, **tile_args,
     )
     return O, L
 

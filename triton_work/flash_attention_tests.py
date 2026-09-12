@@ -5,7 +5,12 @@ import torch
 import triton
 import triton.testing
 
-from flash_attention import flash_attention_forward, naive_attention, pytorch_attention
+from flash_attention import (
+    flash_attention_forward,
+    flash_attention_forward_kernel_autotuned,
+    naive_attention,
+    pytorch_attention,
+)
 
 # %%
 torch.manual_seed(0)
@@ -57,7 +62,7 @@ torch.testing.assert_close(flash_output, pytorch_gpu_output, rtol=2e-2, atol=2e-
         args={
             "batch_size": 4,
             "num_heads": 8,
-            "head_dim": 96,
+            "head_dim": 128,
             "dtype": torch.float16,
         },
     )
@@ -97,13 +102,13 @@ def benchmark_attention(
         x_names=["sequence_length"],
         x_vals=[128, 256, 512, 1024, 2048, 4096, 8192],
         line_arg="provider",
-        line_vals=["flash", "flash_tk", "pytorch"],
-        line_names=["Triton Flash", "Triton Flash + TK trick", "PyTorch Official"],
-        styles=[("orange", "-"), ("purple", "-"), ("green", "-")],
+        line_vals=["flash", "flash_tk", "flash_tk_autotuned", "pytorch"],
+        line_names=["Triton Flash", "Triton Flash + TK trick", "Triton Flash + TK + autotuning", "PyTorch Official"],
+        styles=[("orange", "-"), ("purple", "-"), ("blue", "-"), ("green", "-")],
         xlabel="Sequence length",
         ylabel="TFLOPs/sec",
         y_log=True,
-        plot_name="causal_attention_flash_vs_flash_tk_vs_pytorch_fp16",
+        plot_name="causal_attention_flash_vs_flash_tk_vs_autotuned_vs_pytorch_fp16",
         args={
             "batch_size": 4,
             "num_heads": 8,
@@ -131,12 +136,15 @@ def benchmark_causal_attention(
     def flash_tk():
         return flash_attention_forward(Q, K, V, is_causal=True, TK_trick=True)
 
+    def flash_tk_autotuned():
+        return flash_attention_forward(Q, K, V, is_causal=True, TK_trick=True, autotune=True)
+
     def pytorch():
         return torch.nn.functional.scaled_dot_product_attention(Q, K, V, is_causal=True)
 
-    # Check causal outputs before timing; correctness checks are not timed.
+    # Check causal outputs and complete autotuning before timing.
     pytorch_output = pytorch()
-    for implementation in (flash, flash_tk):
+    for implementation in (flash, flash_tk, flash_tk_autotuned):
         flash_output, _ = implementation()
         torch.testing.assert_close(flash_output, pytorch_output, rtol=2e-2, atol=2e-2)
 
@@ -144,6 +152,9 @@ def benchmark_causal_attention(
         ms = triton.testing.do_bench(flash)
     elif provider == "flash_tk":
         ms = triton.testing.do_bench(flash_tk)
+    elif provider == "flash_tk_autotuned":
+        print(f"N={sequence_length}: {flash_attention_forward_kernel_autotuned.best_config}")
+        ms = triton.testing.do_bench(flash_tk_autotuned)
     elif provider == "pytorch":
         ms = triton.testing.do_bench(pytorch)
     else:
@@ -162,6 +173,7 @@ def plot_attention_results(result, is_causal=False):
         "Standard": "tab:blue",
         "Triton Flash": "tab:orange",
         "Triton Flash + TK trick": "tab:purple",
+        "Triton Flash + TK + autotuning": "tab:blue",
         "PyTorch Official": "tab:green",
     }
 
