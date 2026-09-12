@@ -8,6 +8,8 @@ import triton.testing
 from flash_attention import (
     flash_attention_forward,
     flash_attention_forward_kernel_autotuned,
+    flash_attention_forward_kernel_tk_trick_autotuned,
+    flash_attention_forward_stages_autotuned,
     naive_attention,
     pytorch_attention,
 )
@@ -102,17 +104,32 @@ def benchmark_attention(
         x_names=["sequence_length"],
         x_vals=[128, 256, 512, 1024, 2048, 4096, 8192],
         line_arg="provider",
-        line_vals=["flash", "flash_tk", "flash_tk_autotuned", "pytorch"],
-        line_names=["Triton Flash", "Triton Flash + TK trick", "Triton Flash + TK + autotuning", "PyTorch Official"],
-        styles=[("orange", "-"), ("purple", "-"), ("blue", "-"), ("green", "-")],
+        line_vals=[
+            "flash_autotuned",
+            "flash_tk_autotuned",
+            "flash_stages_autotuned",
+            "pytorch",
+        ],
+        line_names=[
+            "flash_attention_forward_kernel + autotuned",
+            "flash_attention_forward_kernel_tk_trick + autotuned",
+            "flash_attention_forward_stages + autotuned",
+            "PyTorch Official",
+        ],
+        styles=[
+            ("orange", "-"),
+            ("purple", "-"),
+            ("blue", "-"),
+            ("green", "-"),
+        ],
         xlabel="Sequence length",
         ylabel="TFLOPs/sec",
         y_log=True,
-        plot_name="causal_attention_flash_vs_flash_tk_vs_autotuned_vs_pytorch_fp16",
+        plot_name="causal_attention_flash_autotuned_variants_vs_pytorch_fp16",
         args={
             "batch_size": 4,
             "num_heads": 8,
-            "head_dim": 96,
+            "head_dim": 128,
             "dtype": torch.float16,
         },
     )
@@ -130,31 +147,33 @@ def benchmark_causal_attention(
     K = torch.randn(shape, device=DEVICE, dtype=dtype)
     V = torch.randn(shape, device=DEVICE, dtype=dtype)
 
-    def flash():
-        return flash_attention_forward(Q, K, V, is_causal=True, TK_trick=False)
-
-    def flash_tk():
-        return flash_attention_forward(Q, K, V, is_causal=True, TK_trick=True)
+    def flash_autotuned():
+        return flash_attention_forward(Q, K, V, is_causal=True, TK_trick=False, autotune=True)
 
     def flash_tk_autotuned():
         return flash_attention_forward(Q, K, V, is_causal=True, TK_trick=True, autotune=True)
+
+    def flash_stages_autotuned():
+        return flash_attention_forward(Q, K, V, is_causal=True, stages=True, autotune=True)
 
     def pytorch():
         return torch.nn.functional.scaled_dot_product_attention(Q, K, V, is_causal=True)
 
     # Check causal outputs and complete autotuning before timing.
     pytorch_output = pytorch()
-    for implementation in (flash, flash_tk, flash_tk_autotuned):
+    for implementation in (flash_autotuned, flash_tk_autotuned, flash_stages_autotuned):
         flash_output, _ = implementation()
         torch.testing.assert_close(flash_output, pytorch_output, rtol=2e-2, atol=2e-2)
 
-    if provider == "flash":
-        ms = triton.testing.do_bench(flash)
-    elif provider == "flash_tk":
-        ms = triton.testing.do_bench(flash_tk)
-    elif provider == "flash_tk_autotuned":
+    if provider == "flash_autotuned":
         print(f"N={sequence_length}: {flash_attention_forward_kernel_autotuned.best_config}")
+        ms = triton.testing.do_bench(flash_autotuned)
+    elif provider == "flash_tk_autotuned":
+        print(f"N={sequence_length}: {flash_attention_forward_kernel_tk_trick_autotuned.best_config}")
         ms = triton.testing.do_bench(flash_tk_autotuned)
+    elif provider == "flash_stages_autotuned":
+        print(f"N={sequence_length}: {flash_attention_forward_stages_autotuned.best_config}")
+        ms = triton.testing.do_bench(flash_stages_autotuned)
     elif provider == "pytorch":
         ms = triton.testing.do_bench(pytorch)
     else:
@@ -172,8 +191,9 @@ def plot_attention_results(result, is_causal=False):
     provider_colors = {
         "Standard": "tab:blue",
         "Triton Flash": "tab:orange",
-        "Triton Flash + TK trick": "tab:purple",
-        "Triton Flash + TK + autotuning": "tab:blue",
+        "flash_attention_forward_kernel + autotuned": "tab:orange",
+        "flash_attention_forward_kernel_tk_trick + autotuned": "tab:purple",
+        "flash_attention_forward_stages + autotuned": "tab:cyan",
         "PyTorch Official": "tab:green",
     }
 
