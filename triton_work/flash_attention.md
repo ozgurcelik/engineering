@@ -10,11 +10,11 @@ $$
 
 so matrix multiplications and a softmax.
 
-There are 3 common attention mechanisms:
+There are three common attention variants distinguished by how query heads share key-value heads:
 
 1. Multi-head attention
 2. Multi-query attention
-3. Grouped Query attention
+3. Grouped-query attention
 
 There is also single-head attention, which uses a single set of $Q$, $K$, and $V$ projections for the entire sequence.
 Modern Transformer LLMs generally use multi-head variants because multiple heads provide greater representational diversity.
@@ -22,14 +22,14 @@ Modern Transformer LLMs generally use multi-head variants because multiple heads
 In multi-head attention, each head is basically a separate attention mechanism.
 So each query head gets its own key and value matrices.
 
-For the multi-query attention, we have a single key and value matrix shared for all the heads.
+In multi-query attention, we have a single key and value matrix shared by all the heads.
 
-Grouped Query attention is a middle ground between the two. We have multiple key and value matrices, but each one is used for multiple heads.
+Grouped-query attention is a middle ground between the two. We have multiple key and value matrices, but each one is used for multiple heads.
 So, for example, if we have 8 heads, we can have 2 key and value matrices, each used for 4 heads.
 
 | Variant | Query heads | Key/value heads | Main advantage | Main disadvantage |
 |---|---:|---:|---|---|
-| Single-head attention | 1 | 1 | Simple and inexpensive | Limited representational diversity |
+| Single-head attention | 1 | 1 | Simple | Limited representational diversity |
 | MHA | h | h | Each head can learn different relationships | Large KV cache; slower decoding |
 | GQA | h | Several | Strong quality/efficiency balance | Slightly less flexible than MHA |
 | MQA | h | 1 shared pair | Very small KV cache; fast generation | Can reduce quality |
@@ -45,10 +45,10 @@ We will use the following notation:
 - $d_{model}$: model dimension
 - $H_q$: number of query heads
 - $H_{kv}$: number of key-value heads
-- $d_h$: dimension of the query head
+- $d_h$: dimension of each query/key head
 
-and normally $d_h = d_{model} / H_q$.
-For a decoder LLM, the self attention uses the same input $X \in \mathbb{R}^{B \times L \times d_{model}}$ for all the heads, so we have $Q = XW_q$, $K = XW_k$, and $V = XW_v$.
+and, in a common Transformer configuration, $d_h = d_{model} / H_q$.
+For a decoder LLM, self-attention uses the same input $X \in \mathbb{R}^{B \times L \times d_{model}}$ for all the heads, so we have $Q = XW_q$, $K = XW_k$, and $V = XW_v$.
 
 For the packed $W_q, W_k, W_v$ matrices (where packed means that separate projection matrices for all heads are concatenated into one larger matrix), we have
 
@@ -79,7 +79,7 @@ K,V\in\mathbb{R}^{B\times H_{kv}\times L\times d_h}
 $$
 In this simplified comparison, the relevant difference among MHA, GQA, and MQA is $H_{kv}$ and how the query heads map to those key-value heads.
 
-Let's look at how packing works for a single head. 
+Let's look at how the per-head projection matrices are packed.
 Packing concatenates the separate projection matrices for all heads along their output-column dimension:
 $$
 W_Q=
@@ -140,7 +140,7 @@ So, in summary
 | $K$ | $[B,H_q,L,d_h]$ | $[B,H_{kv},L,d_h]$ | $[B,1,L,d_h]$ |
 | $V$ | $[B,H_q,L,d_h]$ | $[B,H_{kv},L,d_h]$ | $[B,1,L,d_h]$ |
 
-In our case, we will be focusing on the MHA case.
+In our case, we will focus on MHA. The Triton implementation below supports only MHA, so $H_q = H_{kv}$; it does not implement the query-head-to-key-value-head mapping required by GQA or MQA.
 
 ## Naive attention implementation
 
@@ -169,9 +169,11 @@ def pytorch_attention(Q: Float[Tensor, " ... Lq d"],
     return torch.nn.functional.scaled_dot_product_attention(Q, K, V, attn_mask=mask)
 ```
 
-When we compare the non-causal naive attention implementation with the PyTorch official implementation with batch_size=4, num_heads=8, head_dim=128, dtype=torch.float16 on L4 GPU, we get the following results:
+When we compare the non-causal naive attention implementation with PyTorch SDPA using batch_size=4, num_heads=8, head_dim=128, dtype=torch.float16 on an L4 GPU, we get the following results:
 
-![Naive attention implementation vs PyTorch official implementation](figures/flash_attention_naive_vs_pytorch.png)
+![Naive attention implementation vs PyTorch SDPA](figures/flash_attention_naive_vs_pytorch.png)
+
+PyTorch's `scaled_dot_product_attention` is a dispatcher and may select an optimized fused CUDA backend, so it is an optimized comparison rather than a naive reference implementation. For reproducible benchmark results, the PyTorch, Triton, CUDA, and GPU versions should be recorded alongside the measurements.
 
 The main problem with the naive implementation is the amount of data transferred to and from GPU high-bandwidth memory (HBM).
 $Q$, $K$, and $V$ already reside in HBM. A conventional implementation reads $Q$ and $K$, computes $QK^T$, and writes the full score matrix back to HBM.
@@ -183,21 +185,27 @@ The two $L \times L$ intermediate matrices create substantial HBM traffic, and F
 The overarching goal is to fuse the main steps of attention into a single kernel.
 In a conventional implementation, the operations are performed separately and the $O(L^2)$ intermediates $S$ and $P$ are materialized in HBM and reread by later operations.
 With fusion, only small tiles of $S$ and $P$ exist temporarily in registers or on-chip SRAM; the complete matrices never need to be written to HBM.
+FlashAttention still computes exact attention with $O(L^2d)$ arithmetic; its advantage is that it avoids materializing the $O(L^2)$ score and probability matrices in HBM.
 
 Now, we will first try to understand how the flash attention implementation works conceptually.
 For the sake of simplicity, we will focus on a single head with no batch dimension and $d_h = d_k = d$.
 So, we have $Q, K, V \in \mathbb{R}^{L \times d}$.
 
-Let's call the $\frac{QK^T}{\sqrt{d}}$ matrix as the scores matrix, $S \in \mathbb{R}^{L \times L}$, $P = \text{softmax}(S) \in \mathbb{R}^{L \times L}$, and $O = PV \in \mathbb{R}^{L \times d}$.
+Let's call $\frac{QK^T}{\sqrt{d}}$ the score matrix, $S \in \mathbb{R}^{L \times L}$, let $P = \text{softmax}(S) \in \mathbb{R}^{L \times L}$, and let $O = PV \in \mathbb{R}^{L \times d}$.
 
 In this case, $S_{i,j} = \frac{1}{\sqrt{d}} \sum_{r=1}^{d} Q_{i,r} K_{j, r}$, so a row $i$ of $Q$ is multiplied by the row $j$ of $K$.
-Then, $P_{i,j} = softmax(S_{i,j}) = \frac{e^{S_{i,j}}}{\sum_{l=1}^{L} e^{S_{i,l}}}$ is the softmax of the scores matrix.
+Then,
+$$
+P_{i,j} = [\operatorname{softmax}(S_{i,:})]_j
+= \frac{e^{S_{i,j}}}{\sum_{\ell=1}^{L} e^{S_{i,\ell}}},
+$$
+because softmax is applied independently to each row of the score matrix.
 This means that to compute a row of $P$, we only need the corresponding row of $Q$ but all the rows of $K$.
-Continuing on, $O_{i,j} = \sum_{l=1}^{L} P_{i,l} V_{l,j}$, so a row $i$ of $O$ depends on the corresponding row of $P$ and entire $V$.
+Continuing on, $O_{i,j} = \sum_{l=1}^{L} P_{i,l} V_{l,j}$, so row $i$ of $O$ depends on the corresponding row of $P$ and the entire $V$ matrix.
 What this tells us is that every row of $O$ needs only the corresponding row from the $Q$ matrix.
-It then intuitively makes sense that we iterate over the rows of $Q$ (in batches) in outer loop and $K$ and $V$ in inner loop.
+It then intuitively makes sense to iterate over the rows of $Q$ (in tiles) in the outer loop and over $K$ and $V$ tiles in the inner loop.
 
-The entire $K$ and $V$ matrices are stored in HBM, but they generally do not fit in the much smaller on-chip SRAM or registers used by a kernel.
+The entire $K$ and $V$ matrices are stored in HBM. For the sequence lengths FlashAttention targets, they generally cannot be kept in the much smaller per-program on-chip storage used by the kernel.
 We therefore load and process them in tiles of rows.
 
 <picture>
@@ -212,8 +220,8 @@ Similarly, we can split $K, V$ into $T_k = \left\lceil \frac{L}{B_k} \right\rcei
 Now, for any $Q_i$, assume we start with $K^{(1)}$ and $V^{(1)}$ in memory.
 We can easily compute the $S_i^{1} = \frac{1}{\sqrt{d}} Q_i K^{(1)^T} \in \mathbb{R}^{B_q \times B_k}$ matrix.
 But how can we then compute the softmax of it?
-The problem is the softmax is dependent on the entire row of $S$, so all $L$ elements of the row, but we only have the $B_k$ columns of that row in memory at any given time.
-There, the online softmax algorithm comes to the rescue.
+The problem is that softmax depends on the entire row of $S$—all $L$ elements—but we only have $B_k$ columns of that row in memory at any given time.
+Here, the online softmax algorithm comes to the rescue.
 
 ### Online softmax algorithm
 
@@ -321,7 +329,7 @@ The full algorithm is as follows:
 
 ![Flash Attention Forward Pass](figures/flash_attention_forward.png)
 
-The logsum is there because it will be used in the backwards pass.
+We save $L_i = m_i + \log l_i$, the row-wise log-sum-exp of the scores. The backward pass uses it to reconstruct probability tiles without saving or materializing the complete $S$ or $P$ matrices.
 
 ## Triton Implementation
 
@@ -330,11 +338,11 @@ Now, let's look at the Triton implementation of the flash attention forward pass
 ```python
 @triton.jit
 def flash_attention_forward_kernel(
-    Q_ptr, #[B, Hq, Lq, D]
-    K_ptr, #[B, Hk, Lk, D]
-    V_ptr, #[B, Hk, Lk, D]
-    O_ptr, #[B, Hq, Lq, D]
-    L_ptr, #[B, Hq, Lq]
+    Q_ptr, #[B, H, Lq, D]
+    K_ptr, #[B, H, Lk, D]
+    V_ptr, #[B, H, Lk, D]
+    O_ptr, #[B, H, Lq, D]
+    L_ptr, #[B, H, Lq]
     stride_qb: tl.constexpr, stride_qh: tl.constexpr, stride_qq: tl.constexpr, stride_qd: tl.constexpr,
     stride_kb: tl.constexpr, stride_kh: tl.constexpr, stride_kk: tl.constexpr, stride_kd: tl.constexpr,
     stride_vb: tl.constexpr, stride_vh: tl.constexpr, stride_vk: tl.constexpr, stride_vd: tl.constexpr,
@@ -408,12 +416,9 @@ def flash_attention_forward_kernel(
         Kj = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero") # (K_TILE_SIZE, D)
         Vj = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero") # (K_TILE_SIZE, D)
         Sij = tl.dot(Qi, Kj.T) * scale # (Q_TILE_SIZE, K_TILE_SIZE)
-        # Due to padding, some parts of the Sij matrix will be 0
-        # But, this would mess up the softmax operation,
-        # so we need to identify the padded elements and set the corresponding elements of Sij to -inf
-        # now, the padding from the 0th dimension of Q is irrelevant since softmax is apllied along for each row separately, so any extra rows in S will be ignored down the line anyways
-        # the padding along the 1st dimension of Q and K is also irrelevant since we will be multiplying all the elements along the D dimension of Q and K, so padded parts will be adding 0 to summation
-        # But we need to take care of the padding along the 0th dimension of K, since padded parts there will be adding columns filled with 0s to the Sij matrix, which then messes up the denominator of softmax
+        # Padded feature coordinates contribute zeros to the dot products, and
+        # padded query rows are not stored. Padded key rows, however, create
+        # invalid softmax columns, so their scores must be set to -inf.
         k_offsets = j * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE) # (K_TILE_SIZE,)
         Sij = tl.where(k_offsets[None, :] < N_KEYS, Sij, -float('inf'))
         if is_causal:
@@ -436,7 +441,7 @@ def flash_attention_forward_kernel(
     tl.store(L_block_ptr, Li, boundary_check=(0,))
 ```
 
-This implementation strictly follows the algorithm we described above with the only difference being added causal masking.
+This implementation strictly follows the algorithm described above, with the addition of causal masking. It supports aligned self-attention: query and key positions share the same index origin, and the causal path assumes $N_{queries} = N_{keys}$. The condition below does not by itself implement the position offset needed for cached decoding or arbitrary unequal query and key lengths.
 But, as we are doing the causal masking, we realize that a query tile can never attend to key tiles that lie completely to its right. The baseline still visits those tiles, loads $K_j$ and $V_j$, computes $S_{ij}$, and then masks every score to $-\infty$.
 
 We can avoid that work by making the number of key tiles depend on the current query tile:
@@ -448,7 +453,7 @@ T_k(i) = \min\left(
 \right)
 $$
 
-There is a second saving inside that shortened loop. A key tile lying completely to the left of the query tile is fully visible, so it can go straight from `tl.dot` to the online-softmax update without constructing a causal mask. Only a key tile that overlaps the causal boundary enters the masking branch.
+There is a second saving inside that shortened loop. A key tile lying completely to the left of the query tile is fully visible, so it can go straight from `tl.dot` to the online-softmax update without constructing a causal mask. Only boundary key tiles that overlap the query tile's causal range enter the masking branch. There is exactly one such tile when $B_q = B_k$ and the tiles are aligned; unequal tile sizes can produce more than one.
 
 <picture>
   <source srcset="figures/flash_attention_tk_trick.webp" type="image/webp">
@@ -545,6 +550,6 @@ Looking at the benchmark results for causal attention:
 
 ![Flash Attention Forward Pass Causal](figures/flash_attention_forward_causal.png)
 
-We see that the staged kernel performs very similar to the official pytorch implementation.
+We see that the staged kernel performs very similarly to PyTorch SDPA in this benchmark.
 At small sequence lengths, fixed kernel-launch and scheduling overheads dominate, and there is relatively little work for the causal optimizations to skip.
 As the sequence length increases, the amount of avoided work grows and the performance gains become visible.
