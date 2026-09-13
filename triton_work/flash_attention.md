@@ -203,10 +203,8 @@ So, we will process them in batches of rows as well.
 
 <picture>
   <source srcset="figures/flash_attention_tiled_flow.webp" type="image/webp">
-  <img src="figures/flash_attention_tiled_flow.gif" width="500" alt="FlashAttention tiled matrix flow: a query tile stays fixed while key and value tiles stream through and accumulate the corresponding output rows">
+  <img src="figures/flash_attention_tiled_flow.gif" width="800" alt="Complete numerical FlashAttention tiled example with populated Q, K, and V matrices; progressively computed score and probability blocks; running row maximum m, softmax denominator l, output numerator, and final normalized output">
 </picture>
-
-## TODO: Add m and l to the animation
 
 Let's say we have tiles of sizes $B_q$ and $B_k$ for the $Q$ and $K, V$ matrices respectively.
 We can then split $Q$ into $T_q = \left\lceil \frac{L}{B_q} \right\rceil$ tiles $Q_1, \ldots, Q_{T_q}$ of size $B_q \times d$.
