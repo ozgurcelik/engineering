@@ -16,8 +16,8 @@ There are 3 common attention mechanisms:
 2. Multi-query attention
 3. Grouped Query attention
 
-There is also single head attention, which is just a single $Q, K, V$ matrix for the entire sequence.
-But it is not used in practice due to lower representation power.
+There is also single-head attention, which uses a single set of $Q$, $K$, and $V$ projections for the entire sequence.
+Modern Transformer LLMs generally use multi-head variants because multiple heads provide greater representational diversity.
 
 In multi-head attention, each head is basically a separate attention mechanism.
 So each query head gets its own key and value matrices.
@@ -34,9 +34,9 @@ So, for example, if we have 8 heads, we can have 2 key and value matrices, each 
 | GQA | h | Several | Strong quality/efficiency balance | Slightly less flexible than MHA |
 | MQA | h | 1 shared pair | Very small KV cache; fast generation | Can reduce quality |
 
-Since for each key-value head, we need to store different KV cache, the size of the KV cache is directly proportional to the number of key-value heads.
-And during the decoding process, moving around and updating the KV cache is a substantial overhead.
-Because of this, MQA with a single key and value matrix is faster in decoding than the MHA.
+Since each key-value head requires its own entries in the KV cache, the size of the cache is directly proportional to the number of key-value heads.
+During autoregressive decoding, repeatedly reading the existing KV cache from HBM can be a substantial memory-bandwidth cost; appending the new key and value entries is typically a smaller part of that cost.
+MQA therefore reduces both the KV-cache footprint and the amount of memory traffic, which can improve decoding throughput compared with MHA.
 
 Now, let's look at the dimensions of the matrices a bit more closely.
 We will use the following notation:
@@ -77,7 +77,7 @@ $$
 $$
 K,V\in\mathbb{R}^{B\times H_{kv}\times L\times d_h}
 $$
-The only architectural difference among MHA, GQA, and MQA is $H_{kv}$.
+In this simplified comparison, the relevant difference among MHA, GQA, and MQA is $H_{kv}$ and how the query heads map to those key-value heads.
 
 Let's look at how packing works for a single head. 
 Packing concatenates the separate projection matrices for all heads along their output-column dimension:
@@ -145,10 +145,10 @@ In our case, we will be focusing on the MHA case.
 ## Naive attention implementation
 
 ```python
-def naive_attention(Q: Float[Tensor, " ... L d_h"],
-                    K: Float[Tensor, " ... L d_k"],
-                    V: Float[Tensor, " ... L d_k"],
-                    mask: Bool[Tensor, " ... L L"] | None = None) -> Float[Tensor, " ... L d_k"]:
+def naive_attention(Q: Float[Tensor, " ... Lq d"],
+                    K: Float[Tensor, " ... Lk d"],
+                    V: Float[Tensor, " ... Lk dv"],
+                    mask: Bool[Tensor, " ... Lq Lk"] | None = None) -> Float[Tensor, " ... Lq dv"]:
     """
     Naive attention implementation.
     """
@@ -159,31 +159,30 @@ def naive_attention(Q: Float[Tensor, " ... L d_h"],
     weights = torch.softmax(scores, dim=-1)
     return einsum(weights, V, "... query key, ... key d -> ... query d")
 
-def pytorch_attention(Q: Float[Tensor, " ... L d_h"],
-                      K: Float[Tensor, " ... L d_k"],
-                      V: Float[Tensor, " ... L d_k"],
-                      mask: Bool[Tensor, " ... L L"] | None = None) -> Float[Tensor, " ... L d_k"]:
+def pytorch_attention(Q: Float[Tensor, " ... Lq d"],
+                      K: Float[Tensor, " ... Lk d"],
+                      V: Float[Tensor, " ... Lk dv"],
+                      mask: Bool[Tensor, " ... Lq Lk"] | None = None) -> Float[Tensor, " ... Lq dv"]:
     """
     PyTorch attention implementation.
     """
     return torch.nn.functional.scaled_dot_product_attention(Q, K, V, attn_mask=mask)
 ```
 
-When we compare the non-causal naive attention implementation with the PyTorch official implementation with batch_size=4, num_heads=8, head_dim=96, dtype=torch.float16 on L4 GPU, we get the following results:
+When we compare the non-causal naive attention implementation with the PyTorch official implementation with batch_size=4, num_heads=8, head_dim=128, dtype=torch.float16 on L4 GPU, we get the following results:
 
 ![Naive attention implementation vs PyTorch official implementation](figures/flash_attention_naive_vs_pytorch.png)
 
-Now the main problem with the naive implementation is that it is not efficient.
-We compute the $QK^T$ matrix by reading the $Q$ and $K$ into memory and then save the result to memory.
-Then read that result to compute softmax and then save it to memory.
-And then read that new result to do the matrix multiplication with the $V$ matrix and return it.
-This is a lot of memory reads and writes, and the goal of the flash attention is to minimize this overhead.
+The main problem with the naive implementation is the amount of data transferred to and from GPU high-bandwidth memory (HBM).
+$Q$, $K$, and $V$ already reside in HBM. A conventional implementation reads $Q$ and $K$, computes $QK^T$, and writes the full score matrix back to HBM.
+The softmax operation reads that matrix and writes the full probability matrix, which must then be read again for the multiplication with $V$.
+The two $L \times L$ intermediate matrices create substantial HBM traffic, and FlashAttention aims to avoid materializing them there.
 
 ## Flash Attention Implementation
 
-Overarching goal is to fuse the three steps of attention into a single kernel.
-The naive implementation is three kernel launches and the intermediates $S$ and $P$ are O(N^2), so they get fully materialized in HBM and reread by the next launch.
-Fusing means $S_{ij}$ and $P_{ij}$ stay in registers / SRAM and never touch HBM.
+The overarching goal is to fuse the main steps of attention into a single kernel.
+In a conventional implementation, the operations are performed separately and the $O(L^2)$ intermediates $S$ and $P$ are materialized in HBM and reread by later operations.
+With fusion, only small tiles of $S$ and $P$ exist temporarily in registers or on-chip SRAM; the complete matrices never need to be written to HBM.
 
 Now, we will first try to understand how the flash attention implementation works conceptually.
 For the sake of simplicity, we will focus on a single head with no batch dimension and $d_h = d_k = d$.
@@ -198,8 +197,8 @@ Continuing on, $O_{i,j} = \sum_{l=1}^{L} P_{i,l} V_{l,j}$, so a row $i$ of $O$ d
 What this tells us is that every row of $O$ needs only the corresponding row from the $Q$ matrix.
 It then intuitively makes sense that we iterate over the rows of $Q$ (in batches) in outer loop and $K$ and $V$ in inner loop.
 
-Now, we can't load the entire $K$ and $V$ matrices into memory at once.
-So, we will process them in batches of rows as well.
+The entire $K$ and $V$ matrices are stored in HBM, but they generally do not fit in the much smaller on-chip SRAM or registers used by a kernel.
+We therefore load and process them in tiles of rows.
 
 <picture>
   <source srcset="figures/flash_attention_tiled_flow.webp" type="image/webp">
@@ -254,28 +253,70 @@ def online_softmax(x):
     return [exp(xi - m) / l for xi in x]
 ```
 
-Now, going back to our problem, assume that we are at tile $i$ for the $Q$ and tile $j$ for the $K$ and $V$.
-We also have $l_i^{j-1} \in \mathbb{R}^{B_q \times B_k}$ and $m_i^{j-1} \in \mathbb{R}^{B_q}$ along with $O_i^{j-1} \in \mathbb{R}^{B_q \times d}$ from the previous step.
-Here, $l$ is the running proxy for the denominator of the softmax just like we had in the online softmax algorithm, and $m$ is the running maximum value in the row.
-For the $Q_i$ and $K^{(j)}, V^{(j)}$ tiles, we can compute the $S_i^{j} = \frac{1}{\sqrt{d}} Q_i K^{(j)^T} \in \mathbb{R}^{B_q \times B_k}$ matrix.
-We have $B_q$ rows, and since each row is independent of the others, we compute the $m_i^{j} = max(m_i^{j-1}, rowmax(S_i^{j})) \in \mathbb{R}^{B_q}$ vector.
-Then, $\tilde{P}_i^{j} = e^{S_i^{j} - m_i^{j}} \in \mathbb{R}^{B_q \times B_k}$ matrix.
-Now, we need to compute the $l_i^{j} \in \mathbb{R}^{B_q}$ vector.
-Looking at the online softmax algorithm, and keeping in mind we are not looking at a single element, rather a batch of columns in each row, we can see that the recurrence relation for $l_i^{j}$ is:
+Now, going back to our problem, assume that we are processing query tile $i$ and have already processed key-value tiles $1, \ldots, j-1$.
+For every row in the query tile, we maintain three pieces of state:
 
 $$
-l_i^{j} = l_i^{j-1} \cdot e^{m_i^{j-1} - m_i^{j}} + rowsum(\tilde{P}_i^{j})
+m_i^{j-1} = \max_{k\text{ in processed tiles}} S_{i,k}
+\in \mathbb{R}^{B_q},
 $$
 
-Now, for a batch of rows in the $O$ matrix, we can compute the partial results for each tile of $K$ and $V$ in the inner loop and update the old results as we accumulate them.
+$$
+l_i^{j-1} = \sum_{k\text{ in processed tiles}} e^{S_{i,k} - m_i^{j-1}}
+\in \mathbb{R}^{B_q},
+$$
+
+and an unnormalized output accumulator
 
 $$
-O_i^{j} = diag(e^{m_i^{j-1} - m_i^{j}}) O_i^{j-1} + \tilde{P}_i^{j} V_i^{j-1}
+\widehat{O}_i^{j-1}
+= \sum_{k\text{ in processed tiles}} e^{S_{i,k} - m_i^{j-1}} V_k
+\in \mathbb{R}^{B_q \times d}.
 $$
 
-Here, note that the $O_i^{j}$ is the numerator of the final result.
-Once the inner loop is done, we will update it as $O_i = diag(l_i^{T_k})^ {-1} O_i^{T_k}$.
-So, basically we will divide the result by the summed exponential coming from the softmax computation.
+These are invariants: after every key-value tile, $m$ is the maximum processed score, $l$ is the softmax denominator expressed relative to that maximum, and $\widehat{O}$ is the correspondingly scaled output numerator.
+
+For the next tiles $K^{(j)}$ and $V^{(j)}$, we first compute
+
+$$
+S_i^{j} = \frac{1}{\sqrt{d}} Q_i K^{(j)^T}
+\in \mathbb{R}^{B_q \times B_k}.
+$$
+
+Because the $B_q$ rows are independent, the new running maximum and the exponentiated score tile are
+
+$$
+m_i^{j} = \max\left(m_i^{j-1}, \operatorname{rowmax}(S_i^{j})\right)
+\in \mathbb{R}^{B_q},
+$$
+
+$$
+\widetilde{P}_i^{j} = e^{S_i^{j} - m_i^{j}}
+\in \mathbb{R}^{B_q \times B_k}.
+$$
+
+Re-centering the previously accumulated terms around the new maximum gives the denominator update:
+
+$$
+l_i^{j} = l_i^{j-1} \cdot e^{m_i^{j-1} - m_i^{j}} + \operatorname{rowsum}(\widetilde{P}_i^{j})
+$$
+
+The output numerator must be re-centered by the same factor before adding the contribution from the current value tile:
+
+$$
+\widehat{O}_i^{j}
+= \operatorname{diag}\left(e^{m_i^{j-1} - m_i^{j}}\right)\widehat{O}_i^{j-1}
++ \widetilde{P}_i^{j} V^{(j)}
+$$
+
+Once the inner loop is done, we normalize the accumulated numerator by the final denominator:
+
+$$
+O_i = \operatorname{diag}\left(l_i^{T_k}\right)^{-1}\widehat{O}_i^{T_k}.
+$$
+
+Equivalently, each row of $\widehat{O}_i^{T_k}$ is divided by the corresponding element of $l_i^{T_k}$.
+In the algorithm diagram below, $O_i^{(j)}$ denotes the same unnormalized accumulator that we have written as $\widehat{O}_i^{j}$ here.
 The full algorithm is as follows:
 
 ![Flash Attention Forward Pass](figures/flash_attention_forward.png)
@@ -498,12 +539,12 @@ But, we can do even better by explicitly stating the different stages of the alg
     ... # previous code
 ```
 
-The staged kernel does not reduce the mathematical work relative to the Tk-trick kernel. It separates the common unmasked region and exceptional masked region into statically specialized loops, allowing Triton to generate and software-pipeline a much cleaner inner loop. The single-loop version’s runtime conditional inhibits those compiler optimizations, and independent autotuning may further amplify the difference.
+The staged kernel visits the same score tiles as the Tk-trick kernel. It separates the common unmasked region and exceptional masked region into statically specialized loops, which likely gives Triton a cleaner inner loop to specialize and software-pipeline. The single-loop version's runtime conditional may inhibit some compiler optimizations, while independent autotuning can also contribute to the measured difference.
 
 Looking at the benchmark results for causal attention:
 
 ![Flash Attention Forward Pass Causal](figures/flash_attention_forward_causal.png)
 
 We see that the staged kernel performs very similar to the official pytorch implementation.
-As we predicted, the Tk-trick and stages do not have an advantage over the baseline kernel for small sequence lengths since any gain from not masking key tiles is completely overshadowed by the additional overhead of the conditional branching.
-But, as the sequence length increases, the performance gains become visible.
+At small sequence lengths, fixed kernel-launch and scheduling overheads dominate, and there is relatively little work for the causal optimizations to skip.
+As the sequence length increases, the amount of avoided work grows and the performance gains become visible.
