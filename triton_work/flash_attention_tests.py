@@ -7,6 +7,8 @@ import triton.testing
 
 from flash_attention import (
     flash_attention_forward,
+    flash_attention_forward_gqa,
+    flash_attention_forward_gqa_autotuned,
     flash_attention_forward_kernel_autotuned,
     flash_attention_forward_kernel_tk_trick_autotuned,
     flash_attention_forward_stages_autotuned,
@@ -186,7 +188,7 @@ def benchmark_causal_attention(
     return flops * 1e-12 / (ms * 1e-3)
 
 
-def plot_attention_results(result, is_causal=False):
+def plot_attention_results(result, is_causal=False, x_name="sequence_length", xlabel="Sequence Length"):
     """Plot benchmark results as grouped bars with values above each bar."""
     provider_colors = {
         "Standard": "tab:blue",
@@ -194,13 +196,15 @@ def plot_attention_results(result, is_causal=False):
         "flash_attention_forward_kernel + autotuned": "tab:orange",
         "flash_attention_forward_kernel_tk_trick + autotuned": "tab:purple",
         "flash_attention_forward_stages + autotuned": "tab:cyan",
+        "Triton Flash GQA": "tab:orange",
+        "Triton Flash GQA + autotuned": "tab:purple",
         "PyTorch Official": "tab:green",
     }
 
     plt.close("all")
-    sequence_lengths = result["sequence_length"].astype(int)
-    providers = [column for column in result.columns if column != "sequence_length"]
-    x_positions = np.arange(len(sequence_lengths))
+    x_vals = result[x_name].astype(int)
+    providers = [column for column in result.columns if column != x_name]
+    x_positions = np.arange(len(x_vals))
     bar_width = 0.8 / len(providers)
 
     fig, ax = plt.subplots(figsize=(14, 7))
@@ -218,15 +222,140 @@ def plot_attention_results(result, is_causal=False):
     provider_names = " vs ".join(providers)
     attention_name = "Causal attention" if is_causal else "Attention"
     ax.set_title(f"{attention_name} TFLOPs/sec: {provider_names} (FP16)")
-    ax.set_xlabel("Sequence Length")
+    ax.set_xlabel(xlabel)
     ax.set_ylabel("TFLOPs/sec")
-    ax.set_xticks(x_positions, sequence_lengths)
+    ax.set_xticks(x_positions, x_vals)
     ax.grid(axis="y", linestyle="--", alpha=0.5)
     ax.margins(y=0.1)
     ax.legend()
     fig.tight_layout()
 
     plt.show()
+
+
+# %%
+# GQA correctness: native Triton GQA vs PyTorch SDPA with enable_gqa.
+gqa_batch_size = 2
+gqa_num_q_heads = 16
+gqa_sequence_length = 64
+gqa_head_dim = 32
+
+for gqa_num_kv_heads in (1, 2, 4, 8, 16):
+    Q_gqa = torch.randn(
+        gqa_batch_size, gqa_num_q_heads, gqa_sequence_length, gqa_head_dim,
+        device=DEVICE, dtype=torch.bfloat16,
+    )
+    K_gqa = torch.randn(
+        gqa_batch_size, gqa_num_kv_heads, gqa_sequence_length, gqa_head_dim,
+        device=DEVICE, dtype=torch.bfloat16,
+    )
+    V_gqa = torch.randn(
+        gqa_batch_size, gqa_num_kv_heads, gqa_sequence_length, gqa_head_dim,
+        device=DEVICE, dtype=torch.bfloat16,
+    )
+
+    for is_causal in (False, True):
+        flash_gqa_output, _ = flash_attention_forward_gqa(
+            Q_gqa, K_gqa, V_gqa, is_causal=is_causal,
+        )
+        pytorch_gqa_output = torch.nn.functional.scaled_dot_product_attention(
+            Q_gqa, K_gqa, V_gqa, is_causal=is_causal, enable_gqa=True,
+        )
+        max_abs = (flash_gqa_output - pytorch_gqa_output).abs().max().item()
+        print(
+            f"GQA Hq={gqa_num_q_heads} Hk={gqa_num_kv_heads} "
+            f"causal={is_causal}: max abs diff={max_abs:.3e}"
+        )
+        torch.testing.assert_close(
+            flash_gqa_output, pytorch_gqa_output, rtol=2e-2, atol=2e-2,
+        )
+
+print("GQA correctness checks passed.")
+
+
+# %%
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["num_kv_heads"],
+        x_vals=[1, 2, 4, 8, 16],
+        line_arg="provider",
+        line_vals=["flash_gqa", "flash_gqa_autotuned", "pytorch"],
+        line_names=[
+            "Triton Flash GQA",
+            "Triton Flash GQA + autotuned",
+            "PyTorch Official",
+        ],
+        styles=[("orange", "-"), ("purple", "-"), ("green", "-")],
+        xlabel="KV heads",
+        ylabel="TFLOPs/sec",
+        y_log=False,
+        plot_name="gqa_attention_flash_vs_pytorch_fp16_n8192",
+        args={
+            "batch_size": 4,
+            "num_q_heads": 16,
+            "sequence_length": 8192,
+            "head_dim": 128,
+            "dtype": torch.float16,
+            "is_causal": True,
+        },
+    )
+)
+def benchmark_gqa_attention(
+    num_kv_heads,
+    provider,
+    batch_size,
+    num_q_heads,
+    sequence_length,
+    head_dim,
+    dtype,
+    is_causal,
+):
+    Q = torch.randn(
+        batch_size, num_q_heads, sequence_length, head_dim,
+        device=DEVICE, dtype=dtype,
+    )
+    K = torch.randn(
+        batch_size, num_kv_heads, sequence_length, head_dim,
+        device=DEVICE, dtype=dtype,
+    )
+    V = torch.randn(
+        batch_size, num_kv_heads, sequence_length, head_dim,
+        device=DEVICE, dtype=dtype,
+    )
+
+    def flash_gqa():
+        return flash_attention_forward_gqa(Q, K, V, is_causal=is_causal)
+
+    def flash_gqa_autotuned():
+        return flash_attention_forward_gqa(Q, K, V, is_causal=is_causal, autotune=True)
+
+    def pytorch():
+        return torch.nn.functional.scaled_dot_product_attention(
+            Q, K, V, is_causal=is_causal, enable_gqa=True,
+        )
+
+    # Correctness check and autotune warm-up before timing.
+    pytorch_output = pytorch()
+    for implementation in (flash_gqa, flash_gqa_autotuned):
+        flash_output, _ = implementation()
+        torch.testing.assert_close(flash_output, pytorch_output, rtol=2e-2, atol=2e-2)
+
+    if provider == "flash_gqa":
+        ms = triton.testing.do_bench(flash_gqa)
+    elif provider == "flash_gqa_autotuned":
+        print(f"Hk={num_kv_heads}: {flash_attention_forward_gqa_autotuned.best_config}")
+        ms = triton.testing.do_bench(flash_gqa_autotuned)
+    elif provider == "pytorch":
+        ms = triton.testing.do_bench(pytorch)
+    else:
+        raise ValueError(f"Unknown provider: {provider}")
+
+    # Useful causal FLOPs still scale with query heads, not KV heads.
+    causal_pairs = sequence_length * (sequence_length + 1) // 2
+    flops = 4 * batch_size * num_q_heads * causal_pairs * head_dim
+    return flops * 1e-12 / (ms * 1e-3)
+
+
 # %%
 
 benchmark_results = benchmark_attention.run(print_data=True, return_df=True)
@@ -235,5 +364,15 @@ plot_attention_results(benchmark_results)
 
 causal_benchmark_results = benchmark_causal_attention.run(print_data=True, return_df=True)
 plot_attention_results(causal_benchmark_results, is_causal=True)
+
+# %%
+
+gqa_benchmark_results = benchmark_gqa_attention.run(print_data=True, return_df=True)
+plot_attention_results(
+    gqa_benchmark_results,
+    is_causal=True,
+    x_name="num_kv_heads",
+    xlabel="KV Heads (Hq=16, N=8192)",
+)
 
 # %%
